@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# 테스트/도구 캐시
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 파이프라인 산출물
+out/
+data/
+ocr_models/
+*.overlay.png
+
+# 내부 자료는 절대 커밋하지 않는다
+samples/
+private/
+*.pdf
