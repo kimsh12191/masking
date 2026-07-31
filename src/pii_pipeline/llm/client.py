@@ -24,7 +24,7 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 
 def root_key_of(schema: dict[str, Any]) -> str | None:
-    """스키마의 최상위 배열 키를 찾는다 (``regions`` / ``missed``).
+    """스키마의 최상위 배열 키를 찾는다 (``findings``).
 
     복구할 때 "항목만 나열된 응답"을 어느 키로 감쌀지 알아야 한다.
     호출부가 따로 알려주지 않아도 되도록 스키마에서 끌어낸다.
@@ -115,18 +115,22 @@ class LlmConfig:
         api_key: 더미 값이어도 무관 (vLLM 은 검증하지 않음).
         temperature: 0 고정 권장.
         max_tokens: 출력 상한.
-            **512 는 부족하다.** 한 항목이 pass-1 은 약 20토큰, pass-2 는
-            ``reason`` 까지 포함해 40~60토큰이다. 밀집한 신청서(주민등록등본,
-            대출신청서)는 탐지가 25건을 쉽게 넘기므로 512 에서는 JSON 이
-            중간에 잘린다. 잘리면 그 페이지의 LLM 탐지가 **전량** 날아간다.
+            **512 는 부족하다.** 한 항목이 ``text``/``field``/``bbox_norm`` 까지
+            포함해 50~70토큰이다. 타일 하나에서 20건이 나오면 1400토큰이고,
+            잘리면 그 타일의 탐지가 **전량** 날아간다 (JSON 이 불완전해짐).
         max_tokens_on_truncation: 출력이 잘렸을 때 재시도에 쓸 상한.
             ``temperature=0`` + 같은 입력이면 재시도해도 **똑같은 지점에서
             똑같이 잘린다.** 잘림은 상한을 올려야만 벗어날 수 있다.
         timeout: 초 단위 요청 타임아웃.
         guided_backend: guided decoding 백엔드.
         enable_thinking: Qwen3 계열 추론 모드. **반드시 False.**
-        image_max_side: pass-2 로 보낼 이미지의 긴 변 길이.
-            너무 줄이면 작은 글씨를 못 읽어 pass-2 의 존재 의미가 사라진다.
+        image_max_side: VLM 으로 보낼 이미지의 긴 변 길이.
+            **타일링과 함께 봐야 하는 값이다.** A4 를 ``target_long_side=2480``
+            으로 전처리하면 1748x2480 이고, 그대로 보내면 여기서 0.73배로
+            줄어 주민등록번호 숫자가 10px 대로 떨어진다 — 읽을 수 없다.
+            ``DetectConfig.tiles=3`` 이면 타일 하나가 1748x약985 라서 긴 변이
+            1748 이고 **축소가 아예 일어나지 않는다.** 타일 수를 줄이려면
+            이 값을 함께 올려야 한다.
         max_retries: 스키마 위반/네트워크 오류 재시도 횟수.
     """
 
@@ -139,7 +143,7 @@ class LlmConfig:
     timeout: float = 60.0
     guided_backend: str = "xgrammar"
     enable_thinking: bool = False
-    image_max_side: int = 1800
+    image_max_side: int = 2000
     max_retries: int = 2
     extra_body: dict[str, Any] = field(default_factory=dict)
 
@@ -215,7 +219,7 @@ class LlmClient:
             system: 시스템 프롬프트 (고정 → prefix caching).
             user: user 메시지 텍스트.
             schema: guided decoding 용 JSON Schema.
-            image: 있으면 멀티모달 요청으로 보낸다 (pass-2).
+            image: 있으면 멀티모달 요청으로 보낸다.
 
         Returns:
             ``(파싱된 dict, 메타정보)``. 실패 시 dict 는 빈 값이고 메타에

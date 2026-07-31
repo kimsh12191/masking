@@ -49,7 +49,7 @@ class TestDefaults:
         config = load_config()
         assert config.source_path is None
         assert config.pipeline.llm.model == "Qwen/Qwen3.5-9B"
-        assert config.pipeline.enable_pass2 is True
+        assert config.pipeline.detect.tiles == 3
         assert config.output.write_image is True
 
     def test_thinking_is_off_by_default(self, isolated: Path) -> None:
@@ -105,7 +105,10 @@ class TestFileApplication:
             isolated / "c.yaml",
             "llm:\n  model: local/qwen\n  image_max_side: 1600\n"
             "ocr:\n  lang: en\n  use_gpu: false\n"
-            "pipeline:\n  enable_pass2: false\n  target_long_side: 1600\n"
+            "detect:\n  tiles: 4\n"
+            "locate:\n  upscale: 1.0\n"
+            "verify:\n  drop_field_labels: false\n"
+            "pipeline:\n  target_long_side: 1600\n"
             "output:\n  out_dir: result\n  write_image: false\n",
         )
         c = load_config(path)
@@ -113,7 +116,9 @@ class TestFileApplication:
         assert c.pipeline.llm.image_max_side == 1600
         assert c.pipeline.ocr.lang == "en"
         assert c.pipeline.ocr.use_gpu is False
-        assert c.pipeline.enable_pass2 is False
+        assert c.pipeline.detect.tiles == 4
+        assert c.pipeline.locate.upscale == 1.0
+        assert c.pipeline.verify.drop_field_labels is False
         assert c.pipeline.target_long_side == 1600
         assert c.output.out_dir == "result"
         assert c.output.write_image is False
@@ -123,7 +128,7 @@ class TestFileApplication:
         c = load_config(path)
         assert c.pipeline.llm.model == "only/this"
         assert c.pipeline.llm.base_url == "http://127.0.0.1:8000/v1"  # 기본값 유지
-        assert c.pipeline.enable_pass2 is True
+        assert c.pipeline.detect.tiles == 3
 
     def test_records_source_path(self, isolated: Path) -> None:
         path = write_yaml(isolated / "c.yaml", "llm:\n  model: x/y\n")
@@ -216,7 +221,7 @@ class TestShippedConfig:
         config = load_config(REPO_ROOT / "config" / "default.yaml", use_env=False)
         assert config.pipeline.llm.model == "Qwen/Qwen3.5-9B"
         assert config.pipeline.llm.enable_thinking is False
-        assert config.pipeline.enable_pass2 is True
+        assert config.pipeline.detect.tiles == 3
 
     def test_covers_every_section(self) -> None:
         import yaml
@@ -236,16 +241,21 @@ class TestDescribe:
     def test_shows_no_config_file(self, isolated: Path) -> None:
         assert "기본값 사용" in describe(load_config())
 
-    def test_shows_pass2_state(self, isolated: Path) -> None:
-        config = load_config()
-        assert "pass2       ON" in describe(config)
-        config.pipeline.enable_pass2 = False
-        assert "pass2       OFF" in describe(config)
+    def test_shows_tile_count(self, isolated: Path) -> None:
+        assert "타일 3개" in describe(load_config())
 
-    def test_marks_blind_mode(self, isolated: Path) -> None:
+    def test_checks_the_tile_and_image_side_combination(self, isolated: Path) -> None:
+        """둘의 조합이 VLM 이 보는 글자 크기를 결정한다. 한쪽만 바꾸면 헤맨다."""
         config = load_config()
-        config.pipeline.pass2_blind = True
-        assert "blind" in describe(config)
+        assert "축소 없음" in describe(config)
+
+        config.pipeline.detect.tiles = 1  # 2480px 을 통째로 -> 2000 으로 축소된다
+        assert "축소 발생" in describe(config)
+
+    def test_shows_locate_and_verify_settings(self, isolated: Path) -> None:
+        text = describe(load_config())
+        assert "업샘플" in text
+        assert "체크섬 교정" in text
 
 
 class TestOutputConfigDefaults:
@@ -272,12 +282,12 @@ class TestCliOverrides:
     def test_unspecified_flags_leave_config_untouched(self, isolated: Path) -> None:
         path = write_yaml(
             isolated / "c.yaml",
-            "llm:\n  model: from/file\npipeline:\n  enable_pass2: false\n",
+            "llm:\n  model: from/file\ndetect:\n  tiles: 4\n",
         )
         config = load_config(path)
         apply_cli_overrides(config, parse(["x.png"]))
         assert config.pipeline.llm.model == "from/file"
-        assert config.pipeline.enable_pass2 is False
+        assert config.pipeline.detect.tiles == 4
 
     def test_cli_overrides_file(self, isolated: Path) -> None:
         path = write_yaml(isolated / "c.yaml", "llm:\n  model: from/file\n")
@@ -291,17 +301,28 @@ class TestCliOverrides:
         apply_cli_overrides(config, parse(["x.png", "--model", "from/cli"]))
         assert config.pipeline.llm.model == "from/cli"
 
-    def test_no_pass2_turns_it_off(self, isolated: Path) -> None:
+    def test_tiles_override(self, isolated: Path) -> None:
         config = load_config()
-        apply_cli_overrides(config, parse(["x.png", "--no-pass2"]))
-        assert config.pipeline.enable_pass2 is False
+        apply_cli_overrides(config, parse(["x.png", "--tiles", "5"]))
+        assert config.pipeline.detect.tiles == 5
 
-    def test_pass2_can_be_turned_on_over_file_false(self, isolated: Path) -> None:
-        """설정 파일이 false 여도 CLI 로 다시 켤 수 있어야 한다."""
-        path = write_yaml(isolated / "c.yaml", "pipeline:\n  enable_pass2: false\n")
+    def test_locate_overrides(self, isolated: Path) -> None:
+        config = load_config()
+        apply_cli_overrides(
+            config,
+            parse(["x.png", "--crop-pad", "0.5", "--crop-upscale", "1.0",
+                   "--similarity", "1.0"]),
+        )
+        assert config.pipeline.locate.pad_ratio == 0.5
+        assert config.pipeline.locate.upscale == 1.0
+        assert config.pipeline.locate.similarity == 1.0
+
+    def test_upscale_one_still_overrides(self, isolated: Path) -> None:
+        """1.0 은 '업샘플 끄기'라는 뜻이고 '미지정'이 아니다."""
+        path = write_yaml(isolated / "c.yaml", "locate:\n  upscale: 3.0\n")
         config = load_config(path)
-        apply_cli_overrides(config, parse(["x.png", "--pass2"]))
-        assert config.pipeline.enable_pass2 is True
+        apply_cli_overrides(config, parse(["x.png", "--crop-upscale", "1.0"]))
+        assert config.pipeline.locate.upscale == 1.0
 
     def test_no_image_turns_off_image_output(self, isolated: Path) -> None:
         config = load_config()
@@ -343,7 +364,8 @@ class TestCliOverrides:
         args = parse(["x.png"])
         for name in (
             "out", "image", "font", "show_ocr_boxes", "include_ocr",
-            "pass2", "pass2_blind", "deskew", "long_side",
+            "deskew", "long_side", "tiles", "tile_overlap", "hint",
+            "crop_pad", "crop_upscale", "similarity",
             "det_dir", "rec_dir", "cls_dir", "gpu_id",
             "base_url", "model", "image_max_side",
         ):
@@ -353,6 +375,6 @@ class TestCliOverrides:
 class TestAppConfigDefaults:
     def test_constructible_without_arguments(self) -> None:
         config = AppConfig()
-        assert config.pipeline.enable_pass2 is True
+        assert config.pipeline.detect.tiles == 3
         assert config.output.out_dir == "out"
         assert config.source_path is None

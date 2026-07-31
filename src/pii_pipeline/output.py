@@ -118,12 +118,18 @@ def format_summary(result: PageResult, written: dict[str, Path] | None = None) -
         for key in ("image", "json"):
             if key in written:
                 lines.append(f"  {key:6s}    {written[key]}")
+    # 지표 세 줄이 이 파이프라인의 성적표다. 단계가 두 개뿐이라 각 지표가
+    # 어느 단계의 성능인지 1:1 로 대응한다.
     lines += [
-        f"  OCR 박스  {stats['n_ocr_boxes']}",
-        f"  탐지 영역 {stats['n_regions']}  (검토필요 {stats['n_needs_review']})",
-        f"  출처별    {_json.dumps(stats['by_source'], ensure_ascii=False)}",
-        f"  유형별    {_json.dumps(stats['by_type'], ensure_ascii=False)}",
-        f"  소요시간  {_json.dumps({k: round(v, 2) for k, v in result.timings.items()})}",
+        f"  ② VLM 탐지    {stats['n_findings']}건",
+        f"  ③ 좌표 확정   {stats['localized_rate']:.0%}"
+        f"  (영역 {stats['n_regions']}건, 크롭 OCR 박스 {stats['n_ocr_boxes']}개)",
+        f"  ④ 불일치      {stats['n_disagreement']}건"
+        f"  체크섬실패 {stats['n_checksum_failed']}건"
+        f"  검토필요 {stats['n_needs_review']}건",
+        f"  좌표출처      {_json.dumps(stats['by_source'], ensure_ascii=False)}",
+        f"  유형별        {_json.dumps(stats['by_type'], ensure_ascii=False)}",
+        f"  소요시간      {_json.dumps({k: round(v, 2) for k, v in result.timings.items()})}",
     ]
     lines += [f"  ! {w}" for w in result.warnings]
     return "\n".join(lines)

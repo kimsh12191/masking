@@ -1,20 +1,12 @@
-"""LLM 계층."""
+"""LLM 계층. 프롬프트는 하나뿐이다 (VLM 전사)."""
 
 from .client import LlmClient, LlmConfig
-from .prompts import (
-    SYSTEM_PASS1,
-    SYSTEM_PASS2,
-    build_pass1_user,
-    build_pass2_user,
-    render_box_list,
-)
+from .prompts import SYSTEM_VLM, USER_VLM, build_user
 
 __all__ = [
     "LlmClient",
     "LlmConfig",
-    "SYSTEM_PASS1",
-    "SYSTEM_PASS2",
-    "build_pass1_user",
-    "build_pass2_user",
-    "render_box_list",
+    "SYSTEM_VLM",
+    "USER_VLM",
+    "build_user",
 ]

@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 
 from pii_pipeline.output import IMAGE_SUFFIX, JSON_SUFFIX, format_summary, save_result
-from pii_pipeline.schema import OcrBox, OcrStatus, PageResult, PiiRegion, Source
+from pii_pipeline.schema import (
+    Agreement,
+    OcrBox,
+    OcrStatus,
+    PageResult,
+    PiiRegion,
+    Source,
+    VlmFinding,
+)
 
 pytest.importorskip("PIL", reason="Pillow 미설치 환경에서는 건너뛴다")
 
@@ -27,19 +35,23 @@ def sample_result(with_image: bool = True) -> PageResult:
         width=PAGE_W,
         height=PAGE_H,
         ocr_boxes=[OcrBox(index=0, bbox=(20, 20, 180, 50), text="성명")],
+        findings=[
+            VlmFinding(text="홍길동", type="NAME", bbox_norm=(0.5, 0.04, 0.9, 0.1)),
+            VlmFinding(text="", type="SIGNATURE", bbox_norm=(0.5, 0.6, 0.95, 0.74)),
+        ],
         regions=[
             PiiRegion(
                 id="r001", type="NAME", bbox=(200, 20, 360, 50),
-                source=Source.LLM_PASS1, confidence=0.93, text="홍길동",
-                member_index=[1],
+                source=Source.OCR_REFINED, confidence=0.93, text="홍길동",
+                vlm_text="홍길동", member_index=[0], agreement=Agreement.EXACT,
             ),
             PiiRegion(
                 id="r002", type="SIGNATURE", bbox=(200, 300, 380, 370),
-                source=Source.VLM_GROUNDING, confidence=0.7,
+                source=Source.VLM_COARSE, confidence=0.7,
                 coarse=True, needs_review=True, ocr_status=OcrStatus.FAILED,
             ),
         ],
-        timings={"ocr": 1.234, "total": 5.678},
+        timings={"detect": 1.234, "locate": 2.1, "total": 5.678},
         image=blank_image() if with_image else None,
     )
 
@@ -188,17 +200,22 @@ class TestFormatSummary:
         written = save_result(result, tmp_path)
         text = format_summary(result, written)
         assert "doc_001" in text
-        assert "탐지 영역 2" in text
         assert "검토필요 1" in text
         assert str(written["image"]) in text
 
     def test_works_without_written_paths(self) -> None:
+        assert "doc_001" in format_summary(sample_result())
+
+    def test_shows_the_three_stage_metrics(self) -> None:
+        """단계가 두 개뿐이라 각 지표가 어느 단계의 성능인지 1:1 로 대응한다."""
         text = format_summary(sample_result())
-        assert "탐지 영역 2" in text
+        assert "② VLM 탐지    2건" in text
+        assert "③ 좌표 확정   50%" in text
+        assert "④ 불일치      1건" in text
 
     def test_lists_warnings(self) -> None:
         result = sample_result()
-        result.warnings.append("pass2 실패: connection refused")
+        result.warnings.append("VLM 타일 0 실패: connection refused")
         assert "connection refused" in format_summary(result)
 
 

@@ -1,18 +1,22 @@
-"""라벨 스키마 고정 테스트.
+"""라벨 스키마 및 출력 계약 고정 테스트.
 
-라벨을 늘리거나 줄일 때 프롬프트·guided-decoding 스키마·규칙 레이어가
-함께 움직이는지 확인한다.
+라벨을 늘리거나 줄일 때 프롬프트 형식표와 guided-decoding 스키마가 함께
+움직이는지 확인한다.
 """
 
 from __future__ import annotations
 
-from pii_pipeline.rules.detectors import ACCOUNT_PATTERN, PATTERNS
+from pii_pipeline.llm.prompts import SYSTEM_VLM
 from pii_pipeline.schema import (
-    CONTEXT_LABELS,
-    PASS1_SCHEMA,
-    PASS2_SCHEMA,
     PII_LABELS,
-    RULE_LABELS,
+    TEXTLESS_LABELS,
+    VLM_SCHEMA,
+    Agreement,
+    OcrStatus,
+    PageResult,
+    PiiRegion,
+    Source,
+    VlmFinding,
 )
 
 #: 사용자가 확정한 탐지 대상. 순서까지 고정한다.
@@ -26,104 +30,124 @@ EXPECTED_LABELS = (
 )
 
 
+def region(**kw) -> PiiRegion:
+    base = dict(
+        id="r001", type="NAME", bbox=(10, 10, 100, 40),
+        source=Source.OCR_REFINED, confidence=0.9,
+    )
+    base.update(kw)
+    return PiiRegion(**base)  # type: ignore[arg-type]
+
+
 class TestLabelSet:
     def test_exact_labels_and_order(self) -> None:
         assert PII_LABELS == EXPECTED_LABELS
 
-    def test_count(self) -> None:
-        assert len(PII_LABELS) == 18
-
     def test_no_duplicates(self) -> None:
         assert len(set(PII_LABELS)) == len(PII_LABELS)
 
-    def test_core_nine_present(self) -> None:
-        core = {
-            "NAME", "RRN", "ADDRESS", "EMAIL", "IP",
-            "ACCOUNT_NO", "CARD_NO", "PHONE", "PASSPORT",
-        }
-        assert core <= set(PII_LABELS)
+    def test_textless_is_subset(self) -> None:
+        assert set(PII_LABELS) >= TEXTLESS_LABELS
+
+    def test_prompt_lists_every_label(self) -> None:
+        """모델이 쓸 수 없는 라벨이 스키마에만 있으면 guided decoding 이 막는다."""
+        for label in PII_LABELS:
+            assert label in SYSTEM_VLM, label
 
 
-class TestRuleContextSplit:
-    def test_rule_labels_are_subset(self) -> None:
-        assert set(PII_LABELS) >= RULE_LABELS
+class TestVlmSchema:
+    def test_enum_matches_labels(self) -> None:
+        item = VLM_SCHEMA["properties"]["findings"]["items"]
+        assert item["properties"]["type"]["enum"] == list(PII_LABELS)
 
-    def test_context_is_the_complement(self) -> None:
-        assert set(CONTEXT_LABELS) == set(PII_LABELS) - RULE_LABELS
+    def test_requires_text_before_bbox(self) -> None:
+        """생성 순서가 곧 조건화 순서다. 값을 먼저 확정해야 한다."""
+        keys = list(VLM_SCHEMA["properties"]["findings"]["items"]["properties"])
+        assert keys.index("text") < keys.index("bbox_norm")
+        assert keys.index("type") < keys.index("bbox_norm")
 
-    def test_split_is_disjoint_and_total(self) -> None:
-        assert not (set(CONTEXT_LABELS) & RULE_LABELS)
-        assert set(CONTEXT_LABELS) | RULE_LABELS == set(PII_LABELS)
+    def test_all_fields_required(self) -> None:
+        item = VLM_SCHEMA["properties"]["findings"]["items"]
+        assert set(item["required"]) == {"text", "type", "field", "bbox_norm", "conf"}
 
-    def test_context_labels_keep_declaration_order(self) -> None:
-        assert list(CONTEXT_LABELS) == [
-            lbl for lbl in PII_LABELS if lbl not in RULE_LABELS
-        ]
+    def test_bbox_is_four_normalized_numbers(self) -> None:
+        bbox = VLM_SCHEMA["properties"]["findings"]["items"]["properties"]["bbox_norm"]
+        assert bbox["minItems"] == bbox["maxItems"] == 4
+        assert bbox["items"]["minimum"] == 0
+        assert bbox["items"]["maximum"] == 1
 
-    def test_expected_rule_labels(self) -> None:
-        assert {
-            "RRN", "FOREIGN_ID", "PASSPORT", "DRIVER_LICENSE",
-            "BIZ_NO", "CORP_NO", "CARD_NO", "PHONE", "EMAIL", "IP", "ACCOUNT_NO",
-        } == RULE_LABELS
-
-    def test_expected_context_labels(self) -> None:
-        assert set(CONTEXT_LABELS) == {
-            "NAME", "ADDRESS", "BIRTH", "ORG", "TITLE", "SIGNATURE", "OTHER",
-        }
+    def test_closed_object(self) -> None:
+        assert VLM_SCHEMA["additionalProperties"] is False
+        assert VLM_SCHEMA["properties"]["findings"]["items"]["additionalProperties"] is False
 
 
-class TestRuleLayerCoverage:
-    """``RULE_LABELS`` 로 선언한 라벨은 실제 탐지 경로가 있어야 한다."""
-
-    #: 자체 정규식 없이 다른 경로로 산출되는 라벨
-    INDIRECT = {
-        # 13자리 RRN 패턴에서 체크섬 + 성별코드로 분기된다 (_classify_13digit)
-        "FOREIGN_ID": "RRN 패턴 + _classify_13digit 분기",
-        "CORP_NO": "RRN 패턴 + _classify_13digit 분기",
-        # 문맥 키워드 기반 별도 경로 (ACCOUNT_PATTERN)
-        "ACCOUNT_NO": "ACCOUNT_PATTERN + 문맥 키워드",
-    }
-
-    def test_every_rule_label_has_a_detection_path(self) -> None:
-        covered = {label for label, _ in PATTERNS} | set(self.INDIRECT)
-        missing = RULE_LABELS - covered
-        assert not missing, f"탐지 경로가 없는 규칙 라벨: {sorted(missing)}"
-
-    def test_thirteen_digit_dispatch_returns_all_three_labels(self) -> None:
-        """RRN / FOREIGN_ID / CORP_NO 가 한 패턴에서 갈라져 나온다."""
-        from pii_pipeline.rules.detectors import _classify_13digit
-
-        assert _classify_13digit("9012311234563") == ("RRN", True)
-        assert _classify_13digit("9506155234561")[0] == "FOREIGN_ID"
-        assert _classify_13digit("1101112345670") == ("CORP_NO", True)
-
-    def test_thirteen_digit_dispatch_keeps_unverified_as_rrn_candidate(self) -> None:
-        """체크섬 실패는 폐기하지 않고 RRN 후보로 남긴다 (recall 우선)."""
-        from pii_pipeline.rules.detectors import _classify_13digit
-
-        assert _classify_13digit("9012311234564") == ("RRN", False)
-
-    def test_no_pattern_for_unknown_label(self) -> None:
-        for label, _ in PATTERNS:
-            assert label in PII_LABELS, f"스키마에 없는 라벨의 패턴: {label}"
-
-    def test_account_pattern_exists(self) -> None:
-        assert ACCOUNT_PATTERN.pattern
-
-    def test_ip_has_two_patterns(self) -> None:
-        """IPv4 와 IPv6 를 따로 다룬다."""
-        assert sum(1 for label, _ in PATTERNS if label == "IP") == 2
-
-    def test_ip_patterns_come_first(self) -> None:
-        """IP 는 구조 검증을 통과하면 다른 숫자 패턴보다 먼저 구간을 선점한다."""
-        assert [label for label, _ in PATTERNS][:2] == ["IP", "IP"]
+class TestSourceEnum:
+    def test_only_two_coordinate_paths(self) -> None:
+        """색과 판단이 두 갈래로 끝나야 검수자가 결정을 빨리 내린다."""
+        assert {s.value for s in Source} == {"ocr_refined", "vlm_coarse"}
 
 
-class TestGuidedSchemas:
-    def test_pass1_enum_matches_context_labels(self) -> None:
-        enum = PASS1_SCHEMA["properties"]["regions"]["items"]["properties"]["type"]["enum"]
-        assert enum == list(CONTEXT_LABELS)
+class TestVlmFinding:
+    def test_to_dict_rounds_bbox(self) -> None:
+        f = VlmFinding(text="홍길동", type="NAME", bbox_norm=(0.123456, 0.2, 0.3, 0.4))
+        assert f.to_dict()["bbox_norm"] == [0.1235, 0.2, 0.3, 0.4]
 
-    def test_pass2_enum_matches_all_labels(self) -> None:
-        enum = PASS2_SCHEMA["properties"]["missed"]["items"]["properties"]["type"]["enum"]
-        assert enum == list(PII_LABELS)
+
+class TestPiiRegionSerialization:
+    def test_enums_become_strings(self) -> None:
+        d = region(ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.SIMILAR).to_dict()
+        assert d["source"] == "ocr_refined"
+        assert d["ocr_status"] == "low_conf"
+        assert d["agreement"] == "similar"
+
+    def test_bboxes_become_lists(self) -> None:
+        d = region(member_boxes=[(1, 2, 3, 4)]).to_dict()
+        assert d["bbox"] == [10, 10, 100, 40]
+        assert d["member_boxes"] == [[1, 2, 3, 4]]
+
+    def test_carries_both_engines_text(self) -> None:
+        """어느 엔진이 무엇을 읽었는지가 남아야 진단이 된다."""
+        d = region(text="홍길둥", vlm_text="홍길동").to_dict()
+        assert (d["text"], d["vlm_text"]) == ("홍길둥", "홍길동")
+
+
+class TestPageResultStats:
+    def _page(self) -> PageResult:
+        return PageResult(
+            image_path="x.png", width=100, height=100,
+            findings=[
+                VlmFinding(text="a", type="NAME"),
+                VlmFinding(text="b", type="RRN"),
+                VlmFinding(text="c", type="SIGNATURE"),
+            ],
+            regions=[
+                region(type="NAME", agreement=Agreement.EXACT),
+                region(type="RRN", agreement=Agreement.EXACT, checksum="failed"),
+                region(
+                    type="SIGNATURE", source=Source.VLM_COARSE, coarse=True,
+                    agreement=Agreement.NONE, needs_review=True,
+                ),
+            ],
+        )
+
+    def test_three_headline_metrics(self) -> None:
+        stats = self._page().stats()
+        assert stats["n_findings"] == 3
+        assert stats["localized_rate"] == round(2 / 3, 3)
+        assert stats["n_disagreement"] == 1
+        assert stats["n_checksum_failed"] == 1
+
+    def test_localized_rate_is_zero_when_empty(self) -> None:
+        empty = PageResult(image_path="x.png", width=1, height=1)
+        assert empty.stats()["localized_rate"] == 0.0
+
+    def test_findings_only_in_debug_json(self) -> None:
+        """기본 JSON 은 다운스트림용이라 진단 데이터를 싣지 않는다."""
+        page = self._page()
+        assert "findings" not in page.to_dict()
+        assert "findings" in page.to_dict(include_ocr=True)
+
+    def test_json_is_utf8_readable(self) -> None:
+        page = self._page()
+        page.regions[0].text = "홍길동"
+        assert "홍길동" in page.to_json()

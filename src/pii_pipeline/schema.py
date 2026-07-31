@@ -2,15 +2,30 @@
 
 이 모듈은 파이프라인 전체가 공유하는 자료구조를 정의한다.
 다운스트림(마스킹/치환 모듈, 학습데이터 빌더)은 ``PageResult`` 만 알면 된다.
+
+파이프라인은 두 단계다. 자료구조도 그 두 단계를 그대로 반영한다.
+
+    ① VLM      이미지를 보고 "무엇이 개인정보인가" 를 판단한다  ->  VlmFinding
+    ② 크롭 OCR 그 위치를 크롭해 "정확히 어디인가" 를 확정한다   ->  PiiRegion
+
+**판단과 좌표를 한 모델에게 동시에 요구하지 않는다.** 의미 판단은 VLM 이,
+기하 확정은 OCR 이 한다. 그래서 ``VlmFinding.bbox_norm`` 은 처음부터 "대략"
+이라고 이름과 문서에 못박아 두고, 정밀 좌표는 ``PiiRegion.bbox`` 에만 있다.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from dataclasses import field as _dc_field
 from enum import Enum
 from typing import Any
+
+# ``field`` 를 별칭으로 가져오는 이유: 아래 ``VlmFinding``/``PiiRegion`` 에
+# ``field`` 라는 **속성**이 있다 (VLM 이 돌려주는 필드명 힌트. JSON 키도 같다).
+# 클래스 본문에서 ``field: str = ""`` 를 만나는 순간 모듈 전역의
+# ``dataclasses.field`` 가 가려져서, 그 아래 줄의 ``field(default_factory=list)``
+# 가 ``None(...)`` 호출이 되어 임포트 시점에 죽는다.
 
 # --------------------------------------------------------------------------
 # 라벨 스키마 (닫힌 집합)
@@ -18,9 +33,9 @@ from typing import Any
 
 #: 탐지 대상 개인정보 라벨 (18종).
 #:
-#: 여기를 고치면 프롬프트와 guided-decoding 스키마가 자동으로 따라간다.
-#: 항목을 늘릴 때 정형 식별자라면 ``RULE_LABELS`` 에도 추가하고
-#: ``rules/detectors.py`` 에 패턴을 넣어야 한다.
+#: 여기를 고치면 프롬프트의 형식표와 guided-decoding 스키마가 자동으로 따라간다.
+#: 정형 식별자를 추가할 때 체크섬이 있으면 ``rules/checksums.py`` 의
+#: ``VALIDATORS`` 에도 넣어라 — 탐지가 아니라 **검증**에 쓰인다.
 PII_LABELS: tuple[str, ...] = (
     # ── 핵심 9종 ────────────────────────────────────────────────
     "NAME",            # 이름
@@ -44,38 +59,18 @@ PII_LABELS: tuple[str, ...] = (
     "OTHER",           # 위에 없는 개인식별정보
 )
 
-#: 규칙 레이어(정규식+체크섬)로 확정 가능한 라벨.
-#: LLM 은 이 라벨들을 다시 판단하지 않는다.
-RULE_LABELS: frozenset[str] = frozenset(
-    {
-        "RRN",
-        "FOREIGN_ID",
-        "PASSPORT",
-        "DRIVER_LICENSE",
-        "BIZ_NO",
-        "CORP_NO",
-        "CARD_NO",
-        "PHONE",
-        "EMAIL",
-        "IP",
-        "ACCOUNT_NO",
-    }
-)
-
-# LLM/VLM 이 문맥으로 판단해야 하는 라벨.
-CONTEXT_LABELS: tuple[str, ...] = tuple(
-    lbl for lbl in PII_LABELS if lbl not in RULE_LABELS
-)
+#: 텍스트가 없을 수 있는 라벨. VLM 이 ``text`` 를 빈 문자열로 줘도 버리지 않는다.
+#: 서명·인영은 읽을 글자가 없고 좌표만 의미가 있다.
+TEXTLESS_LABELS: frozenset[str] = frozenset({"SIGNATURE"})
 
 
 class Source(str, Enum):
-    """탐지 출처. 학습데이터 구축 시 티어 필터링에 사용한다."""
+    """**좌표를 어떻게 얻었는가.** 탐지 판단은 전부 VLM 이므로 출처가 아니라
+    좌표 획득 경로를 구분한다 — 다운스트림이 신뢰할지 결정하는 기준이 이것이다.
+    """
 
-    RULE = "rule"                    # 정규식 + 체크섬 통과. 신뢰도 최상.
-    LLM_PASS1 = "llm_pass1"          # OCR 텍스트 기반 분류.
-    VLM_PASS2 = "vlm_pass2"          # 이미지 검수 pass 에서 회수. OCR 박스 좌표 있음.
-    VLM_GROUNDING = "vlm_grounding"  # OCR det 도 놓쳐 VLM 좌표를 그대로 쓴 경우. 좌표 부정확.
-    PROPAGATED = "propagated"        # 다른 박스에서 확정된 값과 같아서 전파된 경우.
+    OCR_REFINED = "ocr_refined"  # 크롭 OCR 이 좌표를 확정. 픽셀 단위로 정확하다.
+    VLM_COARSE = "vlm_coarse"    # 크롭 OCR 이 못 읽어 VLM 좌표를 그대로 씀. 부정확.
 
 
 class OcrStatus(str, Enum):
@@ -84,25 +79,76 @@ class OcrStatus(str, Enum):
     FAILED = "failed"      # det 는 됐으나 rec 실패 (손글씨/도장 등)
 
 
+class Agreement(str, Enum):
+    """VLM 이 읽은 값과 크롭 OCR 이 읽은 값이 얼마나 일치하는가.
+
+    **두 엔진의 독립 교차검증이다.** 같은 값을 서로 다른 모델이 읽어냈다면
+    그 값은 거의 확실하다. 어긋나면 어느 쪽이 틀렸는지는 알 수 없지만
+    "사람이 봐야 한다" 는 것은 확실하다.
+    """
+
+    EXACT = "exact"      # 정규화 후 완전일치. 양쪽이 같은 값을 읽었다.
+    SIMILAR = "similar"  # 유사. 한쪽의 오독으로 보인다.
+    NONE = "none"        # 크롭 OCR 이 VLM 의 값을 못 찾았다.
+
+
 # --------------------------------------------------------------------------
-# OCR 박스
+# ① VLM 단계 산출물
 # --------------------------------------------------------------------------
 
-BBox = tuple[int, int, int, int]  # (x1, y1, x2, y2) 축정렬, 원본 픽셀 좌표
+BBox = tuple[int, int, int, int]  # (x1, y1, x2, y2) 축정렬, 페이지 픽셀 좌표
+
+
+@dataclass
+class VlmFinding:
+    """VLM 이 이미지에서 직접 읽어낸 개인정보 1건.
+
+    Attributes:
+        text: 문서에 **적힌 그대로**의 값. 회피 표기라면 회피 표기가 담긴다
+            (감사에서 "문서에 실제로 뭐라고 적혀 있었나" 를 되짚어야 한다).
+            ``TEXTLESS_LABELS`` 라벨은 빈 문자열일 수 있다.
+        type: ``PII_LABELS`` 중 하나.
+        field: 필드명/맥락 힌트 ("가족사항 자녀 성명" 등). 사람 검수용이고,
+            같은 값이 여러 곳에 나올 때 구분에도 쓴다.
+        bbox_norm: **대략의** 위치 (0.0~1.0 정규화). 이 값으로 크롭만 뜬다.
+            최종 좌표로 쓰지 마라 — 그게 ``Source.VLM_COARSE`` 다.
+        conf: VLM 자기 확신도.
+        tile: 어느 타일에서 나왔는지 (0-기반). 단일 호출이면 0.
+    """
+
+    text: str
+    type: str
+    field: str = ""
+    bbox_norm: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+    conf: float = 0.0
+    tile: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["bbox_norm"] = [round(v, 4) for v in self.bbox_norm]
+        return d
+
+
+# --------------------------------------------------------------------------
+# ② 크롭 OCR 단계 산출물
+# --------------------------------------------------------------------------
 
 
 @dataclass
 class OcrBox:
-    """OCR 검출 단위. rec 실패 박스도 버리지 않고 여기에 담는다."""
+    """크롭 OCR 이 검출한 텍스트 줄 1개. 좌표는 **페이지 기준으로 환산된 뒤**다.
+
+    rec 실패 박스도 버리지 않는다 — "여기 글자는 있는데 못 읽었다" 는 정보가
+    손글씨·도장 영역을 판별하는 근거이기 때문이다.
+    """
 
     index: int
     bbox: BBox
     text: str
     status: OcrStatus = OcrStatus.OK
     rec_conf: float = 0.0
-    det_conf: float = 0.0
-    quad: list[tuple[int, int]] | None = None
-    row: int = -1  # 행 클러스터링 결과 (읽기 순서용)
+    #: 어느 크롭에서 나왔는지 (``VlmFinding`` 순번). 디버깅용.
+    crop_id: int = -1
 
     @property
     def width(self) -> int:
@@ -112,50 +158,29 @@ class OcrBox:
     def height(self) -> int:
         return self.bbox[3] - self.bbox[1]
 
-    @property
-    def cx(self) -> float:
-        return (self.bbox[0] + self.bbox[2]) / 2.0
-
-    @property
-    def cy(self) -> float:
-        return (self.bbox[1] + self.bbox[3]) / 2.0
-
-    def norm_xy(self, page_w: int, page_h: int) -> tuple[float, float]:
-        """프롬프트에 넣을 정규화 좌상단 좌표."""
-        if page_w <= 0 or page_h <= 0:
-            return (0.0, 0.0)
-        return (round(self.bbox[0] / page_w, 3), round(self.bbox[1] / page_h, 3))
-
-    def norm_bbox(self, page_w: int, page_h: int) -> tuple[float, float, float, float]:
-        """프롬프트에 넣을 정규화 박스 전체 좌표 ``(x1,y1,x2,y2)``.
-
-        좌상단만 주면 모델이 박스의 **폭을 알 수 없어** 인접 여부를 판단할 수
-        없다 (긴 주소 박스의 오른쪽 끝이 어디인지 모른다). 그룹화 규칙을
-        지키게 하려면 범위를 줘야 한다.
-        """
-        if page_w <= 0 or page_h <= 0:
-            return (0.0, 0.0, 0.0, 0.0)
-        return (
-            round(self.bbox[0] / page_w, 3),
-            round(self.bbox[1] / page_h, 3),
-            round(self.bbox[2] / page_w, 3),
-            round(self.bbox[3] / page_h, 3),
-        )
-
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
+        d["bbox"] = list(self.bbox)
         return d
-
-
-# --------------------------------------------------------------------------
-# 탐지 결과
-# --------------------------------------------------------------------------
 
 
 @dataclass
 class PiiRegion:
-    """개인정보 영역 하나. 다운스트림 마스킹 모듈이 소비하는 단위."""
+    """개인정보 영역 하나. 다운스트림 마스킹 모듈이 소비하는 단위.
+
+    Attributes:
+        bbox: **최종 좌표.** ``source`` 가 ``OCR_REFINED`` 면 픽셀 단위로 정확하고,
+            ``VLM_COARSE`` 면 근사치다 (``coarse=True``, ``needs_review=True``).
+        text: 크롭 OCR 이 읽은 값. 못 읽었으면 ``None``.
+        vlm_text: VLM 이 읽은 값. ``text`` 와 비교한 결과가 ``agreement`` 다.
+        char_span: ``text`` 내 문자 오프셋. 부분 마스킹(``901231-1******``)을
+            구현할 다운스트림이 쓴다. ``bbox`` 는 항상 박스 전체 영역이다.
+        verified: 체크섬 검증을 **통과**했다. 체크섬이 없는 라벨은 항상 ``False``
+            이므로 "검증 실패" 와 구분하려면 ``checksum`` 을 함께 보라.
+        checksum: ``"ok"`` / ``"failed"`` / ``None``(해당 라벨에 체크섬 없음).
+        agreement: VLM 값과 OCR 값의 일치 정도.
+    """
 
     id: str
     type: str
@@ -163,25 +188,33 @@ class PiiRegion:
     source: Source
     confidence: float
     text: str | None = None
-    member_boxes: list[BBox] = field(default_factory=list)
-    member_index: list[int] = field(default_factory=list)
-    #: 규칙 레이어 탐지 시, 박스 텍스트 내 문자 오프셋.
-    #: 부분 마스킹(예: ``901231-1******``)을 구현할 다운스트림이 사용한다.
-    #: ``bbox`` 는 항상 박스 전체 영역임에 유의.
+    vlm_text: str | None = None
+    field: str | None = None
+    member_boxes: list[BBox] = _dc_field(default_factory=list)
+    member_index: list[int] = _dc_field(default_factory=list)
     char_span: tuple[int, int] | None = None
     ocr_status: OcrStatus = OcrStatus.OK
-    coarse: bool = False         # 좌표가 근사치인가 (VLM grounding)
+    coarse: bool = False         # 좌표가 근사치인가
     needs_review: bool = False   # 사람 검토 필요
     low_confidence: bool = False
-    reason: str | None = None    # pass2 가 남긴 근거 문구
+    verified: bool = False
+    checksum: str | None = None
+    agreement: Agreement = Agreement.NONE
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["source"] = self.source.value
         d["ocr_status"] = self.ocr_status.value
+        d["agreement"] = self.agreement.value
         d["bbox"] = list(self.bbox)
         d["member_boxes"] = [list(b) for b in self.member_boxes]
         return d
+
+
+# --------------------------------------------------------------------------
+# 페이지 결과
+# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -193,17 +226,19 @@ class PageResult:
     height: int
     #: 다중 페이지 문서(PDF)의 1-기반 페이지 번호. 단일 이미지면 ``None``.
     page_no: int | None = None
-    regions: list[PiiRegion] = field(default_factory=list)
-    ocr_boxes: list[OcrBox] = field(default_factory=list)
-    timings: dict[str, float] = field(default_factory=dict)
-    raw_llm: dict[str, Any] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
+    regions: list[PiiRegion] = _dc_field(default_factory=list)
+    #: VLM 이 뱉은 원본 판단 목록. **recall 측정의 분모다** — 좌표를 못 잡아
+    #: 버려진 건이 있어도 여기에는 남는다.
+    findings: list[VlmFinding] = _dc_field(default_factory=list)
+    #: 크롭 OCR 이 검출한 박스 전체 (페이지 좌표). 디버깅/오버레이용.
+    ocr_boxes: list[OcrBox] = _dc_field(default_factory=list)
+    timings: dict[str, float] = _dc_field(default_factory=dict)
+    raw_llm: dict[str, Any] = _dc_field(default_factory=dict)
+    warnings: list[str] = _dc_field(default_factory=list)
 
     #: 전처리된 페이지 이미지 (BGR numpy). 박스 오버레이를 그릴 때만 쓴다.
-    #: **직렬화되지 않으며 일시적이다.** 결과 좌표는 이 이미지 기준이므로
-    #: 오버레이를 다시 그리려면 같은 전처리 설정으로 재처리해야 한다.
-    #: 배치 처리 시 메모리를 잡아먹으므로 저장 후 ``release_image()`` 로 해제한다.
-    image: Any = field(default=None, repr=False, compare=False)
+    #: **직렬화되지 않으며 일시적이다.** 결과 좌표는 이 이미지 기준이다.
+    image: Any = _dc_field(default=None, repr=False, compare=False)
 
     def release_image(self) -> None:
         """전처리 이미지 참조를 해제한다 (배치 처리 메모리 관리용)."""
@@ -220,19 +255,38 @@ class PageResult:
             "stats": self.stats(),
         }
         if include_ocr:
+            out["findings"] = [f.to_dict() for f in self.findings]
             out["ocr_boxes"] = [b.to_dict() for b in self.ocr_boxes]
             out["raw_llm"] = self.raw_llm
         return out
 
     def stats(self) -> dict[str, Any]:
+        """진단 지표.
+
+        지표를 세 개로 좁힌 것은 의도한 것이다. 단계가 두 개뿐이므로 오차를
+        어느 단계에 귀속시킬 수 있어야 한다.
+
+            n_findings      ① VLM 이 몇 건을 찾았나        (recall 의 분자)
+            localized_rate  ② 그 중 몇 %가 좌표를 확정했나 (기하 성능)
+            n_disagreement  ⑤ 두 엔진이 다르게 읽은 건수   (신뢰도)
+        """
         by_source: dict[str, int] = {}
         by_type: dict[str, int] = {}
         for r in self.regions:
             by_source[r.source.value] = by_source.get(r.source.value, 0) + 1
             by_type[r.type] = by_type.get(r.type, 0) + 1
+
+        n_refined = by_source.get(Source.OCR_REFINED.value, 0)
+        n_regions = len(self.regions)
         return {
+            "n_findings": len(self.findings),
+            "n_regions": n_regions,
             "n_ocr_boxes": len(self.ocr_boxes),
-            "n_regions": len(self.regions),
+            "localized_rate": round(n_refined / n_regions, 3) if n_regions else 0.0,
+            "n_disagreement": sum(
+                1 for r in self.regions if r.agreement is not Agreement.EXACT
+            ),
+            "n_checksum_failed": sum(1 for r in self.regions if r.checksum == "failed"),
             "n_needs_review": sum(1 for r in self.regions if r.needs_review),
             "by_source": by_source,
             "by_type": by_type,
@@ -245,85 +299,44 @@ class PageResult:
 
 
 # --------------------------------------------------------------------------
-# LLM guided-decoding 스키마
+# VLM guided-decoding 스키마
 # --------------------------------------------------------------------------
 
-
-def _region_item_schema(label_enum: Sequence[str], with_reason: bool) -> dict[str, Any]:
-    props: dict[str, Any] = {
-        "idx": {
-            "type": "array",
-            "items": {"type": "integer", "minimum": 0},
-            "minItems": 1,
-            "maxItems": 12,
-        },
-        "type": {"type": "string", "enum": list(label_enum)},
-        "conf": {"type": "number", "minimum": 0, "maximum": 1},
-    }
-    required = ["idx", "type", "conf"]
-    if with_reason:
-        props["reason"] = {"type": "string", "maxLength": 120}
-        required.append("reason")
-    return {
-        "type": "object",
-        "properties": props,
-        "required": required,
-        "additionalProperties": False,
-    }
-
-
-#: pass-1 (OCR 텍스트만) 출력 스키마
-PASS1_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "regions": {
-            "type": "array",
-            "maxItems": 128,
-            "items": _region_item_schema(CONTEXT_LABELS, with_reason=False),
-        }
-    },
-    "required": ["regions"],
-    "additionalProperties": False,
-}
-
-#: pass-2 (이미지 검수) 출력 스키마.
-#: ``idx`` 는 OCR 박스 번호. det 도 놓친 영역은 ``bbox_norm`` 으로 받는다.
+#: VLM 단계 출력 스키마.
 #:
-#: ``idx`` 와 ``bbox_norm`` 은 둘 다 optional 이다 — 항목마다 하나만 채우기
-#: 때문이다. 다만 **둘 다 비면 좌표를 알 수 없어 그 탐지는 버려진다**
-#: (``merge.regions_from_pass2``). JSON Schema 로 "정확히 하나"를 강제하려면
-#: ``anyOf`` 가 필요한데 guided-decoding 백엔드 지원이 불확실하므로,
-#: ``idx`` 에 ``minItems`` 를 걸어 빈 배열만 막고 나머지는 프롬프트로 지시한다.
-PASS2_SCHEMA: dict[str, Any] = {
+#: **속성 순서가 의미를 갖는다.** guided decoding 은 스키마 순서대로 토큰을
+#: 생성하므로, 모델은 ``text`` -> ``type`` -> ``field`` -> ``bbox_norm`` 순으로
+#: 답한다. 즉 "무엇을 읽었는지" 를 먼저 확정하고 그 다음에 "어디인지" 를 답한다.
+#: 좌표를 먼저 내게 하면 값이 좌표에 끌려간다 (읽기보다 좌표 찍기가 어려우므로
+#: 좌표를 먼저 고정하면 그 근처에서 값을 짜맞춘다).
+#:
+#: ``maxItems`` 는 타일당 상한이다. 페이지를 타일로 쪼개 호출하므로 한 번에
+#: 32건을 넘길 일이 없고, 넘긴다면 타일을 더 쪼개야 한다는 신호다.
+VLM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "missed": {
+        "findings": {
             "type": "array",
-            "maxItems": 64,
+            "maxItems": 32,
             "items": {
                 "type": "object",
                 "properties": {
-                    "idx": {
-                        "type": "array",
-                        "items": {"type": "integer", "minimum": 0},
-                        "minItems": 1,
-                        "maxItems": 12,
-                    },
+                    "text": {"type": "string", "maxLength": 120},
+                    "type": {"type": "string", "enum": list(PII_LABELS)},
+                    "field": {"type": "string", "maxLength": 40},
                     "bbox_norm": {
                         "type": "array",
                         "items": {"type": "number", "minimum": 0, "maximum": 1},
                         "minItems": 4,
                         "maxItems": 4,
                     },
-                    "type": {"type": "string", "enum": list(PII_LABELS)},
                     "conf": {"type": "number", "minimum": 0, "maximum": 1},
-                    "reason": {"type": "string", "maxLength": 120},
                 },
-                "required": ["type", "conf", "reason"],
+                "required": ["text", "type", "field", "bbox_norm", "conf"],
                 "additionalProperties": False,
             },
         }
     },
-    "required": ["missed"],
+    "required": ["findings"],
     "additionalProperties": False,
 }
