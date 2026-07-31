@@ -99,6 +99,34 @@ class TestPass2User:
         assert "(없음)" in user
 
 
+class TestOutputFormatIsStated:
+    """두 pass 모두 **감싸는 객체**를 명시해야 한다.
+
+    현장 사고: pass2 프롬프트에 항목 형식만 있고 ``{"missed":[...]}`` 래퍼가
+    없어서 모델이 항목을 한 줄에 하나씩(JSONL) 뱉었다. ``json.loads`` 가
+    ``Extra data: line 2 column 1`` 로 죽어 pass2 결과가 전 페이지 전량
+    날아갔다. 스키마(guided decoding)에 의존하지 말 것 — 서버 설정에 따라
+    실제로 강제되지 않는다.
+    """
+
+    def test_pass1_states_wrapper_object(self) -> None:
+        assert "출력 형식" in SYSTEM_PASS1
+        assert '{"regions":[' in SYSTEM_PASS1
+
+    def test_pass2_states_wrapper_object(self) -> None:
+        assert "출력 형식" in SYSTEM_PASS2
+        assert '{"missed":[' in SYSTEM_PASS2
+
+    def test_pass2_forbids_one_item_per_line(self) -> None:
+        assert "하나의 `missed` 배열 안에" in SYSTEM_PASS2
+        assert "한 줄에 하나씩 나열하지 마라" in SYSTEM_PASS2
+
+    def test_pass2_example_nests_items_in_wrapper(self) -> None:
+        """항목 예시만 보여주면 모델이 그 모양 그대로 출력한다."""
+        example = SYSTEM_PASS2.split("`missed` 배열에 담는 항목 형식")[-1]
+        assert '{"missed":[' in example
+
+
 class TestSystemPrompts:
     def test_pass1_lists_only_context_labels(self) -> None:
         """pass1 은 규칙 레이어가 처리하는 라벨을 판단하지 않는다."""

@@ -13,10 +13,96 @@ import base64
 import io
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+#: ```json ... ``` 코드블록 껍데기.
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
+
+def root_key_of(schema: dict[str, Any]) -> str | None:
+    """스키마의 최상위 배열 키를 찾는다 (``regions`` / ``missed``).
+
+    복구할 때 "항목만 나열된 응답"을 어느 키로 감쌀지 알아야 한다.
+    호출부가 따로 알려주지 않아도 되도록 스키마에서 끌어낸다.
+    """
+    required = schema.get("required") or []
+    if len(required) == 1:
+        return str(required[0])
+    props = list((schema.get("properties") or {}).keys())
+    return str(props[0]) if len(props) == 1 else None
+
+
+def salvage_json(raw: str, root_key: str | None) -> dict[str, Any] | None:
+    """규격을 벗어난 응답에서 쓸 수 있는 것을 건져낸다.
+
+    guided decoding 이 실제로 걸리지 않은 서버에서는 모델이 형식을 흘린다.
+    실제로 관측된 형태는 세 가지다.
+
+    1. 항목을 한 줄에 하나씩 (JSONL) — ``{"idx":...}\\n{"idx":...}``
+       → ``json.loads`` 가 ``Extra data: line 2 column 1`` 로 죽는다.
+    2. 배열만 — ``[{"idx":...}, ...]``
+    3. 코드블록·설명 문구가 앞뒤로 붙음.
+
+    한 페이지의 pass 결과를 통째로 버리는 것보다 건져내는 쪽이 낫다.
+    다만 **추측으로 값을 만들지는 않는다.** 파싱 가능한 객체만 모은다.
+
+    Args:
+        raw: 모델 원문.
+        root_key: 감싸는 키. ``None`` 이면 첫 객체만 반환한다.
+
+    Returns:
+        복구한 dict, 건질 게 없으면 ``None``.
+    """
+    text = _FENCE_RE.sub("", raw.strip())
+
+    # ② 배열만 온 경우
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and root_key:
+            # 항목은 dict 만 남긴다. 다운스트림은 dict 를 가정한다.
+            return {root_key: [o for o in parsed if isinstance(o, dict)]}
+        return None
+
+    # ①③ 객체가 여러 개 연달아 오거나 뒤에 잡음이 붙은 경우
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(text) or text[pos] != "{":
+            break  # JSON 이 아닌 텍스트가 나오면 거기서 멈춘다
+        try:
+            obj, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            objects.append(obj)
+
+    if not objects:
+        return None
+    if root_key is None:
+        return objects[0]
+
+    # 감싼 객체가 (여러 개라도) 온 경우 — 배열을 이어붙인다
+    wrapped = [o for o in objects if isinstance(o.get(root_key), list)]
+    if wrapped:
+        merged: list[Any] = []
+        for obj in wrapped:
+            merged.extend(o for o in obj[root_key] if isinstance(o, dict))
+        return {root_key: merged}
+
+    # 항목만 나열된 경우 — 우리가 감싸준다
+    return {root_key: objects}
 
 
 @dataclass
@@ -134,6 +220,8 @@ class LlmClient:
         Returns:
             ``(파싱된 dict, 메타정보)``. 실패 시 dict 는 빈 값이고 메타에
             ``error`` 가 담긴다 — 예외를 던지지 않는다 (배치 처리 중단 방지).
+            형식만 어긋난 응답을 ``salvage_json`` 으로 건져낸 경우 메타에
+            ``salvaged`` 가 남는다 (프롬프트·guided decoding 점검 신호).
         """
         content: Any = user
         if image is not None:
@@ -163,6 +251,7 @@ class LlmClient:
 
         last_error: str | None = None
         max_tokens = self.config.max_tokens
+        root_key = root_key_of(schema)
         for attempt in range(self.config.max_retries + 1):
             try:
                 resp = self.client.chat.completions.create(
@@ -196,7 +285,22 @@ class LlmClient:
                         max_tokens = self.config.max_tokens_on_truncation
                         log.warning("max_tokens 를 %d 로 올려 재시도합니다", max_tokens)
                     continue
-                return json.loads(raw), meta
+                try:
+                    return json.loads(raw), meta
+                except json.JSONDecodeError as exc:
+                    # 재시도해도 temperature=0 이면 같은 응답이 온다. 형식만
+                    # 어긋난 것이라면 건져내는 편이 페이지를 버리는 것보다 낫다.
+                    recovered = salvage_json(raw, root_key)
+                    if recovered is None:
+                        raise
+                    meta["salvaged"] = str(exc)
+                    log.warning(
+                        "JSON 형식 이탈을 복구했습니다 (%s) — 프롬프트/guided "
+                        "decoding 설정을 점검하십시오. 원문 앞부분: %.120s",
+                        exc,
+                        raw,
+                    )
+                    return recovered, meta
             except json.JSONDecodeError as exc:
                 last_error = f"JSON 파싱 실패: {exc}"
                 log.warning("%s (attempt %d)", last_error, attempt)
