@@ -13,6 +13,7 @@ from pii_pipeline.propagate import (
     PropagateConfig,
     normalize,
     propagate_regions,
+    seed_candidates,
     seed_value,
 )
 from pii_pipeline.schema import OcrBox, OcrStatus, PiiRegion, Source
@@ -72,6 +73,31 @@ class TestSeedValue:
     def test_strips_stacked_labels(self) -> None:
         assert seed_value("신청인 성명: 홍길동") == "홍길동"
 
+    def test_strips_label_without_delimiter(self) -> None:
+        """OCR 이 라벨과 값을 한 박스로 묶으면 공백조차 없다."""
+        assert seed_value("신청인홍길동") == "홍길동"
+        assert seed_value("성명홍길동") == "홍길동"
+
+    def test_strips_bracketed_prefix_label(self) -> None:
+        assert seed_value("(신청인)홍길동") == "홍길동"
+
+    def test_strips_suffix_label(self) -> None:
+        """한국 서식은 라벨이 뒤에 붙는 경우가 흔하다.
+
+        떼지 않으면 씨앗이 "홍길동귀하" 가 되어 문서의 다른 "홍길동" 과
+        매칭되지 않고, 그 값의 전파가 전부 죽는다.
+        """
+        assert seed_value("홍길동 귀하") == "홍길동"
+        assert seed_value("홍길동(인)") == "홍길동"
+        assert seed_value("홍길동 (서명)") == "홍길동"
+        assert seed_value("홍길동님") == "홍길동"
+        assert seed_value("홍길동 신청인") == "홍길동"
+
+    def test_candidates_keep_the_original(self) -> None:
+        """라벨을 뗀 값이 맞다고 확정할 수 없으므로 원문도 후보로 남긴다."""
+        assert seed_candidates("홍길동 귀하") == ["홍길동 귀하", "홍길동"]
+        assert seed_candidates("홍길동") == ["홍길동"]
+
 
 class TestPropagation:
     def test_same_name_elsewhere_is_recovered(self) -> None:
@@ -89,6 +115,44 @@ class TestPropagation:
         assert 3 in recovered          # "확인자 홍길동"
         assert 1 not in recovered      # 씨앗 자기 자신은 다시 만들지 않는다
         assert all(r.source is Source.PROPAGATED for r in out)
+
+    def test_label_and_value_in_one_box_is_recovered(self) -> None:
+        """이름이 라벨과 한 박스에 붙어 있어도 마스킹 대상이다.
+
+        "신청인홍길동" 은 OCR 이 라벨과 값을 공백 없이 묶은 흔한 형태다.
+        한 곳에서 이름이 확정됐으면 이 박스도 당연히 덮여야 한다.
+        """
+        boxes = make_boxes([["성명", "홍길동"], ["신청인홍길동", "x"]])
+        out = propagate_regions(
+            [region("NAME", "홍길동", 1, boxes)], boxes, PAGE_W, PAGE_H
+        )
+        hit = next(r for r in out if r.member_index == [2])
+        start, end = hit.char_span
+        assert boxes[2].text[start:end] == "홍길동"
+
+    def test_seed_from_suffix_labeled_box_still_propagates(self) -> None:
+        """씨앗 쪽에 라벨이 붙어 있어도 나머지 위치를 회수해야 한다.
+
+        회귀 방지: 접두 라벨만 떼던 시절에는 씨앗이 "홍길동귀하" 가 되어
+        문서의 다른 "홍길동" 이 **전부** 안 잡혔다.
+        """
+        boxes = make_boxes([["홍길동 귀하"], ["홍길동"], ["신청인홍길동"]])
+        out = propagate_regions(
+            [region("NAME", "홍길동 귀하", 0, boxes)], boxes, PAGE_W, PAGE_H
+        )
+        assert {r.member_index[0] for r in out} == {1, 2}
+
+    def test_over_stripped_short_seed_does_not_sweep_the_page(self) -> None:
+        """접미 라벨을 떼다 너무 짧아진 후보가 문서를 쓸어버리면 안 된다.
+
+        "대한상호" 의 "상호" 는 필드 라벨이라 떼면 "대한" 이 남는데, ORG 최소
+        길이(3)에 걸려 후보에서 탈락한다. 원문 후보는 그대로 살아 있다.
+        """
+        boxes = make_boxes([["대한상호"], ["대한민국"], ["대한상호저축"], ["주식회사 대한"]])
+        out = propagate_regions(
+            [region("ORG", "대한상호", 0, boxes)], boxes, PAGE_W, PAGE_H
+        )
+        assert {r.member_index[0] for r in out} == {2}
 
     def test_partial_containment_sets_char_span(self) -> None:
         """부분 마스킹을 구현할 다운스트림이 쓸 오프셋이 맞아야 한다."""

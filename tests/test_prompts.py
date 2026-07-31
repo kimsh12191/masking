@@ -150,6 +150,17 @@ class TestSystemPrompts:
         assert "담당자: 조민석" in SYSTEM_PASS1
         assert "그 박스를 포함" in SYSTEM_PASS1
 
+    def test_both_passes_cover_label_glued_to_value(self) -> None:
+        """OCR 이 라벨과 값을 묶으면 구분자가 아예 없다 ("신청인홍길동").
+
+        구분자가 있는 예시만 주면 모델이 "라벨이 붙은 값" 으로 인식하지 못하고
+        박스를 건너뛴다. 뒤에 붙는 경칭("귀하", "(인)")도 같은 문제다.
+        """
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "신청인홍길동" in prompt
+            assert "홍길동 귀하" in prompt
+            assert "홍길동(인)" in prompt
+
     def test_pass1_excludes_label_only_boxes(self) -> None:
         assert "라벨만 있고 값이 없는 박스" in SYSTEM_PASS1
 

@@ -60,17 +60,34 @@ __all__ = [
     "PropagateConfig",
     "normalize",
     "propagate_regions",
+    "seed_candidates",
     "seed_value",
 ]
 
 #: 정규화 시 제거할 문자. 구분자·공백·괄호는 OCR 마다 달라지므로 무시한다.
 _STRIP_RE = re.compile(r"[\s\-–—_./\\,·:;()\[\]{}'\"|]+")
 
-#: 값 앞에 붙은 필드 라벨을 떼는 패턴 (긴 라벨을 먼저 시도해야 한다).
+#: 필드 라벨 후보 (긴 라벨을 먼저 시도해야 한다 — "휴대폰번호" 가 "휴대폰" 보다 먼저).
+_LABEL_ALT = "|".join(
+    re.escape(w) for w in sorted(FIELD_LABEL_WORDS, key=len, reverse=True)
+)
+
+#: 값 **앞**에 붙은 필드 라벨을 떼는 패턴. 괄호에 싸인 라벨도 받는다
+#: (``"(신청인)강동혁"``). 구분자가 없는 경우도 받는다 (``"신청인강동혁"`` —
+#: OCR 이 라벨과 값을 한 박스로 묶으면 공백조차 없다).
 _LABEL_PREFIX_RE = re.compile(
-    r"^\s*(?:"
-    + "|".join(re.escape(w) for w in sorted(FIELD_LABEL_WORDS, key=len, reverse=True))
-    + r")\s*[:：\-]?\s*"
+    r"^\s*[(\[]?\s*(?:" + _LABEL_ALT + r")\s*[)\]]?\s*[:：\-]?\s*"
+)
+
+#: 값 **뒤**에 붙은 필드 라벨·경칭을 떼는 패턴.
+#:
+#: 한국 서식은 라벨이 뒤에 오는 경우가 흔하다 — ``"강동혁 귀하"``,
+#: ``"강동혁(인)"``, ``"강동혁 (서명)"``, ``"강동혁님"``. 이걸 떼지 않으면
+#: 씨앗이 ``"강동혁귀하"`` 가 되어 문서의 다른 ``"강동혁"`` 과 매칭되지 않고,
+#: **그 값의 전파가 전부 죽는다.**
+_LABEL_SUFFIX_RE = re.compile(
+    r"(?:\s*[(\[]?\s*(?:" + _LABEL_ALT + r"|님|씨)\s*[)\]]?\s*)$"
+    r"|(?:\s*[(\[]\s*(?:인|자필|친필|무인|대리)\s*[)\]]\s*)$"
 )
 
 #: 라벨별 최소 길이 (정규화 후). 짧은 값은 문서 곳곳에 우연히 들어 있다.
@@ -201,17 +218,47 @@ def normalize(text: str) -> str:
     return _normalize_with_map(text).text
 
 
-def seed_value(text: str) -> str:
-    """탐지 텍스트에서 전파 씨앗으로 쓸 **값 부분**만 남긴다.
-
-    ``"담당자: 조민석"`` -> ``"조민석"``. 필드 라벨을 남겨두면 "담당자" 라는
-    글자만 있는 박스까지 전파되어 서식 라벨이 전부 마스킹된다.
-    """
+def _strip_repeatedly(text: str, *patterns: re.Pattern[str]) -> str:
+    """패턴들이 더 이상 안 걸릴 때까지 반복해서 뗀다 (``"신청인 성명: 홍길동"``)."""
     prev = None
     out = text.strip()
     while out and out != prev:
         prev = out
-        out = _LABEL_PREFIX_RE.sub("", out, count=1).strip()
+        for pattern in patterns:
+            out = pattern.sub("", out, count=1).strip()
+    return out
+
+
+def seed_value(text: str) -> str:
+    """탐지 텍스트에서 전파 씨앗으로 쓸 **값 부분**만 남긴다.
+
+    ``"담당자: 조민석"`` -> ``"조민석"``, ``"강동혁 귀하"`` -> ``"강동혁"``.
+    필드 라벨을 남겨두면 두 방향으로 다 손해다.
+
+      * 앞 라벨을 남기면 "담당자" 라는 글자만 있는 박스까지 전파되어 서식
+        라벨이 전부 마스킹된다.
+      * 뒤 라벨을 남기면 씨앗이 ``"강동혁귀하"`` 가 되어 문서의 다른
+        ``"강동혁"`` 과 매칭되지 않는다 — **그 값의 전파가 전부 죽는다.**
+    """
+    return _strip_repeatedly(text, _LABEL_PREFIX_RE, _LABEL_SUFFIX_RE)
+
+
+def seed_candidates(text: str) -> list[str]:
+    """씨앗 후보를 모두 낸다 (긴 것부터, 중복 제거).
+
+    라벨을 뗀 값이 맞는지 확정할 수 없으므로 **원문도 후보로 남긴다.**
+    같은 라벨이 두 곳에 똑같이 붙어 있으면(``"강동혁 귀하"`` 가 두 군데)
+    원문끼리 매칭되는 것이 옳고, 한쪽만 라벨이 붙었으면 뗀 값이 옳다.
+
+    잘못된 후보는 손해가 없다 — 최소 길이·필드 라벨 검사에서 걸러지고,
+    남더라도 문서에서 매칭되지 않으면 아무 일도 일어나지 않는다.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in (text.strip(), seed_value(text)):
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
     return out
 
 
@@ -319,26 +366,26 @@ def _collect_seeds(
                 if not raw:
                     continue
 
-        value = seed_value(raw)
-        norm = _normalize_with_map(value)
-        if len(norm.text) < PROPAGATE_MIN_LEN.get(region.type, 99):
-            continue
-        if is_field_label(value):
-            continue
+        for value in seed_candidates(raw):
+            norm = _normalize_with_map(value)
+            if len(norm.text) < PROPAGATE_MIN_LEN.get(region.type, 99):
+                continue
+            if is_field_label(value):
+                continue
 
-        key = (region.type, norm.text)
-        if key in seen:
-            continue
-        seen.add(key)
-        seeds.append(
-            _Seed(
-                label=region.type,
-                value=norm.text,
-                confidence=region.confidence,
-                origin=value,
-                normalized=norm.changed,
+            key = (region.type, norm.text)
+            if key in seen:
+                continue
+            seen.add(key)
+            seeds.append(
+                _Seed(
+                    label=region.type,
+                    value=norm.text,
+                    confidence=region.confidence,
+                    origin=value,
+                    normalized=norm.changed,
+                )
             )
-        )
 
     # 긴 값을 먼저 쓴다 — 긴 값이 더 특이하고, 짧은 값에 먹히지 않는다.
     seeds.sort(key=lambda s: (-len(s.value), s.label, s.value))
