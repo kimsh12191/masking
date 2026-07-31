@@ -19,6 +19,11 @@ data/
 ocr_models/
 *.overlay.png
 
+# 로컬 설정 오버라이드 (환경 고유 경로/엔드포인트).
+# 템플릿인 config/default.yaml 은 커밋한다.
+/config.yaml
+/config.yml
+
 # 내부 자료는 절대 커밋하지 않는다
 samples/
 private/

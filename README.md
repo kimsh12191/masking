@@ -26,12 +26,18 @@
 git clone <repo> && cd masking
 git checkout claude/personal-info-masking-pipeline-erken9
 
-pip install pytest Pillow
+pip install pytest Pillow PyYAML
 python -m pytest
 ```
 
-→ **313건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·파이프라인
-배선이 모두 정상이다.
+→ **377건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·설정 로딩·
+파이프라인 배선이 모두 정상이다.
+
+설정만 확인해보려면:
+
+```bash
+python scripts/run.py --print-config
+```
 
 합성 서식 이미지도 이 상태에서 만들어볼 수 있다 (정답 JSON 포함).
 
@@ -132,7 +138,72 @@ python scripts/run.py data/synth/*.png -o out_full/
 
 ---
 
-## 4. 주요 옵션
+## 4. 설정
+
+모델명·엔드포인트·OCR 경로 등은 **`config/default.yaml`** 에 있다. 코드를 고칠 필요 없다.
+
+```yaml
+llm:
+  model: Qwen/Qwen3.5-9B                 # vLLM 기동 시 지정한 것과 일치해야 함
+  base_url: http://127.0.0.1:8000/v1
+  enable_thinking: false                 # 켜면 지연시간 예산이 날아간다
+  image_max_side: 1800                   # 1500 이상 유지
+
+ocr:
+  lang: korean
+  det_model_dir: null                    # 폐쇄망에서는 필수
+  rec_model_dir: null
+
+pipeline:
+  enable_pass2: true
+
+output:
+  out_dir: out
+  write_image: true
+```
+
+적용 순서 — **뒤가 앞을 덮는다.**
+
+```
+코드 기본값  →  config.yaml  →  환경변수(PII_*)  →  CLI 플래그
+```
+
+```bash
+# 현재 적용된 설정만 확인
+python scripts/run.py --print-config
+
+# 설정 파일 지정
+python scripts/run.py sample.png --config config/prod.yaml
+
+# 일회성 변경 (파일은 그대로)
+python scripts/run.py sample.png --model /opt/models/qwen35-9b --no-pass2
+```
+
+파일 탐색 순서: `--config` > `$PII_CONFIG` > `./config.yaml` > `./config/default.yaml`
+
+환경 고유값만 환경변수로 빼도 된다:
+
+```bash
+export PII_LLM_MODEL=/opt/models/qwen35-9b
+export PII_LLM_BASE_URL=http://10.0.0.5:8000/v1
+export PII_OCR_DET_DIR=/opt/ocr_models/det
+export PII_OCR_REC_DIR=/opt/ocr_models/rec
+```
+
+> **오타난 설정 키는 조용히 무시되지 않고 실행이 즉시 실패한다.**
+> 폐쇄망에서 설정이 반영되지 않은 채 도는 것이 가장 찾기 어려운 실패다.
+>
+> ```
+> 설정 오류: 설정 섹션 'llm' 에 알 수 없는 키가 있습니다: modle
+>   사용 가능한 키: api_key, base_url, enable_thinking, ..., model, ...
+> ```
+
+환경별로 다른 설정을 쓸 때는 루트에 `config.yaml` 을 두면 자동으로 잡힌다
+(`.gitignore` 에 있으므로 커밋되지 않는다). `config/default.yaml` 은 템플릿이다.
+
+---
+
+## 5. 주요 옵션
 
 ```bash
 python scripts/run.py --help
@@ -140,6 +211,8 @@ python scripts/run.py --help
 
 | 옵션 | 용도 |
 |---|---|
+| `--print-config` | 적용된 설정을 출력하고 종료 |
+| `--config` | 설정 파일 경로 |
 | `--no-image` | 박스 표시 이미지 생략, JSON 만 저장 |
 | `--font` | 한글 폰트 경로 (없어도 라벨은 ASCII 라 표시됨) |
 | `--show-ocr-boxes` | OCR 박스 전체를 회색으로 표시 (디버깅) |
@@ -152,15 +225,27 @@ python scripts/run.py --help
 라이브러리로:
 
 ```python
-from pii_pipeline import PiiPipeline, PipelineConfig, save_result
+from pii_pipeline import PiiPipeline, load_config, save_result
 
-pipeline = PiiPipeline(PipelineConfig())     # 배치 처리 시 인스턴스는 하나만
+config = load_config()                       # config.yaml + 환경변수 적용
+pipeline = PiiPipeline(config.pipeline)      # 배치 처리 시 인스턴스는 하나만
 
 result = pipeline.run("document.png")
-save_result(result, "out/")                  # boxes.png + json 저장
+save_result(result, config.output.out_dir)   # boxes.png + json 저장
 
 for r in result.regions:
     print(r.type, r.bbox, r.source.value, r.confidence)
+```
+
+설정 파일 없이 코드로만 구성해도 된다:
+
+```python
+from pii_pipeline import PiiPipeline, PipelineConfig
+from pii_pipeline.llm.client import LlmConfig
+
+pipeline = PiiPipeline(PipelineConfig(
+    llm=LlmConfig(model="/opt/models/qwen35-9b", base_url="http://10.0.0.5:8000/v1"),
+))
 ```
 
 여러 장을 한 번에 (한 장씩 즉시 저장하고 이미지 메모리를 해제한다):
@@ -171,7 +256,7 @@ pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
 
 ---
 
-## 5. 출력 형식
+## 6. 출력 형식
 
 `{이름}.json`:
 
@@ -207,7 +292,7 @@ pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
 
 ---
 
-## 6. 아직 검증 안 된 부분
+## 7. 아직 검증 안 된 부분
 
 GPU 없는 환경에서 만들었으므로 다음 두 개는 **첫 실행 시 깨질 가능성이 있다.**
 

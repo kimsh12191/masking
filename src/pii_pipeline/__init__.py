@@ -13,6 +13,7 @@
 4. **recall 우선.** 애매하면 포함시킨다. 제외 규칙은 ``exclusions.py`` 에 추가한다.
 """
 
+from .config import AppConfig, OutputConfig, load_config
 from .output import save_result
 from .pipeline import PiiPipeline, PipelineConfig
 from .schema import (
@@ -29,6 +30,9 @@ from .schema import (
 __all__ = [
     "PiiPipeline",
     "PipelineConfig",
+    "AppConfig",
+    "OutputConfig",
+    "load_config",
     "save_result",
     "PageResult",
     "PiiRegion",
