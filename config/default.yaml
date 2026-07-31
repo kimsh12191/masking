@@ -102,23 +102,24 @@ pipeline:
 propagate:
   enabled: true
 
-  # OCR 혼동문자(O↔0, l↔1, S↔5 ...)를 접어서 비교한다. 숫자 비율이 높은 값
-  # (번호류)에만 적용된다 — 이름·영문에 적용하면 "Bob" 이 "806" 이 된다.
-  fold_confusables: true
-
+  # 비교는 회피 표기를 접은 형태로 한다 (normalize.py). 한글 수사·호모글리프·
+  # 전각·비가시문자는 여기서 흡수되므로 별도 설정이 없다.
+  #
   # 유사도 매칭 임계값. 1.0 이면 유사도 매칭을 끈다.
-  # 한글 오독처럼 혼동문자표로 못 잡는 것을 받는 경로다.
+  # 정규화로 접을 수 없는 것(한글 오독 등)을 받는 경로다.
   # 주의: 0.9 이상은 사실상 완전일치다 — 11자 값에서 한 글자만 틀려도
-  # SequenceMatcher 비율이 0.909 로 떨어진다. 그래서 번호류는 유사도가 아니라
-  # 위의 fold_confusables 로 처리한다.
+  # SequenceMatcher 비율이 0.909 로 떨어진다. 번호류의 회피 표기는 유사도가
+  # 아니라 normalize.py 의 정규화가 담당한다.
   min_similarity: 0.85
 
   # 씨앗 개수 상한 (연산량 제한). 잘리면 warning 을 남긴다.
   max_seeds: 64
 
-  # 전파할 라벨. null 이면 기본 집합 (propagate.PROPAGATE_MIN_LEN).
-  # ORG/TITLE 은 기본 제외 — "하나은행", "과장" 같은 값이 서식 전체에 깔려
-  # 있어 전파하면 문서 전체가 마스킹된다. SIGNATURE 는 텍스트가 없다.
+  # 전파할 라벨. null 이면 SIGNATURE 를 뺀 전체 (텍스트가 없어 전파 불가).
+  # ORG/TITLE 도 기본 포함이다 — 마스킹을 넓게 잡는 방침이므로 기관명·직위도
+  # 등장하는 모든 위치를 덮는다. 서식 전체에 깔린 은행명이 전부 잡히는 것은
+  # 의도한 동작이다. 과검이 문제가 되면 여기서 좁혀라. 예:
+  #   propagate_labels: [NAME, RRN, PHONE, ADDRESS, ACCOUNT_NO, CARD_NO, EMAIL]
   propagate_labels: null
 
 # ---------------------------------------------------------------------------

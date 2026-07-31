@@ -168,10 +168,22 @@ def regions_from_rules(
                 ocr_status=box.status,
                 needs_review=hit.needs_review,
                 low_confidence=not hit.checksum_ok,
-                reason="체크섬 통과" if hit.checksum_ok else "패턴 일치, 체크섬 미통과",
+                reason=_rule_reason(hit),
             )
         )
     return regions
+
+
+def _rule_reason(hit: RuleHit) -> str:
+    """규칙 탐지 근거 문구.
+
+    회피 표기를 접어서 잡았다면 그 사실을 남긴다 — 감사에서 "문서에는 뭐라고
+    적혀 있었나" 를 되짚을 수 있어야 하고, 검수 우선순위도 달라진다.
+    """
+    base = "체크섬 통과" if hit.checksum_ok else "패턴 일치, 체크섬 미통과"
+    if hit.normalized:
+        return f"{base} (회피 표기 정규화: '{hit.text}' -> '{hit.canonical}')"
+    return base
 
 
 def confirmed_map(hits: list[RuleHit]) -> dict[int, str]:

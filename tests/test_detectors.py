@@ -248,3 +248,126 @@ class TestMultiplePiiInOneBox:
     def test_two_items_in_one_box(self) -> None:
         boxes = make_boxes([["연락처 010-1234-5678 이메일 a@b.com"]])
         assert labels(boxes) == {"PHONE", "EMAIL"}
+
+
+class TestEvasionPatterns:
+    """마스킹 회피 표기.
+
+    필터를 피하려고 일부러 다르게 적은 값도 잡아야 한다. 각 정규식에 변형을
+    덧붙이면 조합 폭발이 나므로 ``normalize.canonicalize`` 로 접은 뒤 매칭한다.
+    """
+
+    def test_hangul_numerals_mixed_with_digits(self) -> None:
+        boxes = make_boxes([["연락처", "공일공-일이삼사-오육칠팔"]])
+        hits = detect(boxes)
+        assert any(h.label == "PHONE" for h in hits)
+
+    def test_hangul_numerals_in_rrn(self) -> None:
+        boxes = make_boxes([["주민등록번호", "901231-1이3사5육3"]])
+        assert any(h.label == "RRN" for h in detect(boxes))
+
+    def test_homoglyph_letters_in_rrn(self) -> None:
+        boxes = make_boxes([["주민등록번호", "9O1231-1234563"]])
+        hits = [h for h in detect(boxes) if h.label == "RRN"]
+        assert hits
+        assert hits[0].checksum_ok is True   # 정규화 후 체크섬이 통과한다
+
+    def test_homoglyph_letters_in_phone(self) -> None:
+        boxes = make_boxes([["휴대전화", "0lO-1234-5678"]])
+        assert any(h.label == "PHONE" for h in detect(boxes))
+
+    def test_fullwidth_phone(self) -> None:
+        boxes = make_boxes([["휴대전화", "０１０－１２３４－５６７８"]])
+        assert any(h.label == "PHONE" for h in detect(boxes))
+
+    def test_zero_width_space_inside_rrn(self) -> None:
+        boxes = make_boxes([["주민등록번호", "901231​-1234563"]])
+        assert any(h.label == "RRN" for h in detect(boxes))
+
+    def test_unicode_hyphen_variants(self) -> None:
+        for hyphen in ("‐", "‑", "–", "−", "－"):
+            boxes = make_boxes([["주민등록번호", f"901231{hyphen}1234563"]])
+            assert any(h.label == "RRN" for h in detect(boxes)), hyphen
+
+    def test_obfuscated_email(self) -> None:
+        for raw in (
+            "hong(at)hana(dot)com",
+            "hong[at]hana[dot]com",
+            "hong골뱅이hana.co.kr",
+        ):
+            boxes = make_boxes([["이메일", raw]])
+            assert any(h.label == "EMAIL" for h in detect(boxes)), raw
+
+    def test_span_points_at_the_original_text(self) -> None:
+        """마스킹은 원본에 적용된다 — span 은 정규형이 아니라 원문 기준이어야 한다."""
+        boxes = make_boxes([["연락처", "공일공-일이삼사-오육칠팔"]])
+        hit = next(h for h in detect(boxes) if h.label == "PHONE")
+        original = boxes[hit.box_index].text
+        assert original[hit.span[0] : hit.span[1]] == "공일공-일이삼사-오육칠팔"
+
+    def test_normalized_flag_and_canonical_are_recorded(self) -> None:
+        """감사 추적 — 문서에 실제로 뭐가 적혀 있었는지 남아야 한다."""
+        boxes = make_boxes([["주민등록번호", "9O1231-1234563"]])
+        hit = next(h for h in detect(boxes) if h.label == "RRN")
+        assert hit.normalized is True
+        assert hit.text == "9O1231-1234563"       # 원문
+        assert hit.canonical == "901231-1234563"  # 정규형
+
+    def test_plain_values_are_not_marked_normalized(self) -> None:
+        boxes = make_boxes([["주민등록번호", "901231-1234563"]])
+        hit = next(h for h in detect(boxes) if h.label == "RRN")
+        assert hit.normalized is False
+
+
+class TestNormalizationDoesNotBreakNormalValues:
+    """정규형 스캔은 **추가 경로**다. 정상 값을 망가뜨리면 안 된다."""
+
+    def test_passport_letter_prefix_survives(self) -> None:
+        """S12345678 의 S 가 5 로 접히면 PASSPORT 패턴이 깨진다."""
+        for prefix in ("M", "S", "R", "O", "D"):
+            boxes = make_boxes([["여권번호", f"{prefix}12345678"]])
+            assert "PASSPORT" in labels(boxes), prefix
+
+    def test_address_with_gu_is_not_folded(self) -> None:
+        boxes = make_boxes([["주소", "서울특별시 강남구 테헤란로 123"]])
+        assert "PHONE" not in labels(boxes)
+
+    def test_institution_name_produces_no_number_hits(self) -> None:
+        boxes = make_boxes([["하나은행 강남지점", "리스크관리부"]])
+        assert detect(boxes) == []
+
+    def test_each_value_is_reported_once(self) -> None:
+        """원문·정규형 두 경로가 같은 값을 두 번 보고하면 안 된다."""
+        boxes = make_boxes([["주민등록번호", "901231-1234563"]])
+        assert len([h for h in detect(boxes) if h.label == "RRN"]) == 1
+
+
+class TestOverlapResolutionPrefersStrongerEvidence:
+    """겹치는 후보는 경로가 아니라 근거의 강도로 정리한다.
+
+    "원문 경로가 항상 이긴다" 로 하면 원문의 약한 후보가 정규형의 강한 후보를
+    밀어낸다.
+    """
+
+    def test_checksum_passing_rrn_beats_keyword_only_account(self) -> None:
+        """실제로 겪은 사례.
+
+        "9O1231-1234563" 은
+          원문   -> ACCOUNT_NO "1231-1234563" (체크섬 없음, 근처 "은행" 키워드)
+          정규형 -> RRN        "901231-1234563" (체크섬 통과)
+        주민등록번호가 계좌번호 후보에 가려지면 안 된다.
+        """
+        boxes = make_boxes(
+            [["주민등록번호", "9O1231-1234563"], ["거래은행", "하나은행"]]
+        )
+        found = {h.label for h in detect(boxes)}
+        assert "RRN" in found
+        assert "ACCOUNT_NO" not in found
+
+    def test_overlapping_candidates_are_not_double_reported(self) -> None:
+        boxes = make_boxes([["주민등록번호", "9O1231-1234563"]])
+        hits = detect(boxes)
+        spans = [h.span for h in hits]
+        for i, a in enumerate(spans):
+            for b in spans[i + 1 :]:
+                assert not (a[0] < b[1] and b[0] < a[1]), f"겹침: {a} {b}"

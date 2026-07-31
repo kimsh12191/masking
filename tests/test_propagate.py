@@ -2,7 +2,7 @@
 
 핵심 요구: 한 곳에서 개인정보로 확정된 값은 문서의 나머지 위치에서도
 일괄 회수돼야 한다. 동시에 과검 보호 장치(최소 길이, 필드 라벨 제거,
-ORG/TITLE 제외)가 실제로 동작해야 한다.
+라벨 좁히기)가 실제로 동작해야 한다.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from pii_pipeline.merge import ClaimLedger
 from pii_pipeline.ocr.layout import assign_reading_order
 from pii_pipeline.propagate import (
     PropagateConfig,
-    fold_confusables,
     normalize,
     propagate_regions,
     seed_value,
@@ -117,27 +116,52 @@ class TestPropagation:
     def test_ocr_confusable_typo_is_matched_and_flagged(self) -> None:
         """OCR 오독(0↔O, 1↔l)을 흡수하되 사람 검토 대상으로 남긴다.
 
-        유사도 임계값으로는 이걸 잡을 수 없다 — 11자 값에서 한 글자만 틀려도
+        유사도 임계값만으로는 이걸 잡을 수 없다 — 11자 값에서 한 글자만 틀려도
         ``SequenceMatcher`` 비율이 0.909 로 떨어지기 때문에, 임계값을 그 위에
-        두면 아무것도 안 걸리고 아래로 내리면 전혀 다른 번호가 걸린다.
+        두면 아무것도 안 걸리고 아래로 내리면 전혀 다른 번호가 걸린다. 그래서
+        혼동문자는 ``normalize`` 가 정규화로 처리한다.
         """
         boxes = make_boxes([["010-1234-5678"], ["0lO-1234-5678"]])
         seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE, conf=1.0)
         out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
         assert [r.member_index for r in out] == [[1]]
         assert out[0].needs_review is True
-        assert "혼동문자" in (out[0].reason or "")
+        assert "회피 표기 정규화" in (out[0].reason or "")
 
-    def test_confusable_folding_can_be_disabled(self) -> None:
-        boxes = make_boxes([["010-1234-5678"], ["0lO-1234-5678"]])
+    def test_hangul_numeral_evasion_propagates(self) -> None:
+        """"공1공-1234-5678" 도 같은 전화번호다."""
+        boxes = make_boxes([["010-1234-5678"], ["공1공-1234-5678"]])
+        seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE, conf=1.0)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
+        assert out[0].needs_review is True
+
+    def test_fullwidth_evasion_propagates(self) -> None:
+        boxes = make_boxes([["010-1234-5678"], ["０１０－１２３４－５６７８"]])
         seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE)
-        cfg = PropagateConfig(fold_confusables=False, min_similarity=1.0)
-        assert propagate_regions([seed], boxes, PAGE_W, PAGE_H, config=cfg) == []
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
 
-    def test_confusable_folding_does_not_apply_to_names(self) -> None:
-        """"Bob" 을 "8ob" 으로 접으면 전혀 다른 값이 같아진다."""
-        assert fold_confusables("Bob") == "Bob"
-        assert fold_confusables("0lO12345678") == "01012345678"
+    def test_zero_width_evasion_propagates(self) -> None:
+        boxes = make_boxes([["010-1234-5678"], ["010-1234\u200b-5678"]])
+        seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
+
+    def test_spaced_out_name_propagates(self) -> None:
+        """"홍 길 동" 은 구분자 제거만으로 잡힌다 (정규화 이전 단계)."""
+        boxes = make_boxes([["홍길동"], ["확인자 홍 길 동"]])
+        seed = region("NAME", "홍길동", 0, boxes)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
+
+    def test_exact_match_is_not_flagged_for_review(self) -> None:
+        """정규화가 필요 없었던 완전일치는 검토 대상이 아니다."""
+        boxes = make_boxes([["010-1234-5678"], ["010-1234-5678 (자택)"]])
+        seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE, conf=1.0)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert out[0].needs_review is False
+        assert (out[0].reason or "").endswith("동일")
 
     def test_folding_never_matches_a_genuinely_different_number(self) -> None:
         boxes = make_boxes([["010-1234-5678"], ["010-1234-9999"]])
@@ -209,20 +233,32 @@ class TestPrecisionGuards:
         seed = region("NAME", "김", 0, boxes)
         assert propagate_regions([seed], boxes, PAGE_W, PAGE_H) == []
 
-    def test_org_and_title_are_excluded_by_default(self) -> None:
-        """"하나은행"/"과장" 을 전파하면 서식 전체가 마스킹된다."""
+    def test_org_is_propagated_by_default(self) -> None:
+        """방침은 넓게 잡기다 — 기관명도 등장하는 모든 위치를 덮는다."""
         boxes = make_boxes(
-            [["하나은행 리스크관리부"], ["하나은행 강남지점"], ["하나은행"]]
+            [["하나은행 강남지점"], ["하나은행 강남지점 귀중"], ["기타 문구"]]
         )
+        seed = region("ORG", "하나은행 강남지점", 0, boxes)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
+
+    def test_seed_is_the_whole_value_not_its_tokens(self) -> None:
+        """알려진 한계 — 씨앗은 값 전체다. 값의 일부는 씨앗이 되지 않는다.
+
+        "하나은행 리스크관리부" 가 씨앗이면 "하나은행 강남지점" 은 걸리지 않는다
+        ("하나은행" 만 따로 씨앗이 되지는 않기 때문). 토큰 단위 씨앗을 만들면
+        회수는 늘지만 짧은 토큰("관리부")이 문서 전체를 덮어버린다.
+        """
+        boxes = make_boxes([["하나은행 리스크관리부"], ["하나은행 강남지점"]])
         seed = region("ORG", "하나은행 리스크관리부", 0, boxes)
         assert propagate_regions([seed], boxes, PAGE_W, PAGE_H) == []
 
-    def test_org_can_be_opted_in(self) -> None:
-        boxes = make_boxes([["삼성전자 반도체사업부"], ["삼성전자 반도체사업부"]])
-        seed = region("ORG", "삼성전자 반도체사업부", 0, boxes)
-        cfg = PropagateConfig(propagate_labels=("ORG",))
-        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H, config=cfg)
-        assert [r.member_index for r in out] == [[1]]
+    def test_labels_can_be_narrowed(self) -> None:
+        """과검이 문제가 되면 propagate_labels 로 좁힐 수 있다."""
+        boxes = make_boxes([["하나은행 리스크관리부"], ["하나은행 강남지점"]])
+        seed = region("ORG", "하나은행 리스크관리부", 0, boxes)
+        cfg = PropagateConfig(propagate_labels=("NAME", "RRN"))
+        assert propagate_regions([seed], boxes, PAGE_W, PAGE_H, config=cfg) == []
 
     def test_signature_is_never_propagated(self) -> None:
         boxes = make_boxes([["서명"], ["서명"]])
@@ -238,3 +274,40 @@ class TestPrecisionGuards:
             seeds, boxes, PAGE_W, PAGE_H, config=cfg, warnings=warnings
         )
         assert any("씨앗" in w for w in warnings)
+
+
+class TestSimilarityIsRestrictedToTextLabels:
+    """번호류에 유사도를 쓰면 다른 번호가 붙는다.
+
+    숫자는 문자열로서 중복성이 없다. 한 글자 다른 번호는 "오독된 같은 번호" 가
+    아니라 그냥 다른 번호다. 번호류의 회피 표기는 정규화가 결정론적으로 접으므로
+    유사도가 필요하지도 않다.
+    """
+
+    def test_passport_does_not_fuzzy_match_a_phone_number(self) -> None:
+        """실제로 겪은 오탐 — 정규화 후 "S12345678" vs "012345678" = 0.89."""
+        boxes = make_boxes([["S12345678"], ["010-1234-5678"]])
+        seed = region("PASSPORT", "S12345678", 0, boxes, source=Source.RULE)
+        assert propagate_regions([seed], boxes, PAGE_W, PAGE_H) == []
+
+    def test_phone_does_not_fuzzy_match_a_different_phone(self) -> None:
+        boxes = make_boxes([["010-1234-5678"], ["010-1234-5679"]])
+        seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE)
+        assert propagate_regions([seed], boxes, PAGE_W, PAGE_H) == []
+
+    def test_rrn_does_not_fuzzy_match(self) -> None:
+        boxes = make_boxes([["901231-1234563"], ["901231-1234564"]])
+        seed = region("RRN", "901231-1234563", 0, boxes, source=Source.RULE)
+        assert propagate_regions([seed], boxes, PAGE_W, PAGE_H) == []
+
+    def test_number_labels_still_match_exactly_after_normalization(self) -> None:
+        """유사도를 막아도 회피 표기는 정규화 경로로 잡힌다."""
+        boxes = make_boxes([["010-1234-5678"], ["공1공-1234-5678"]])
+        seed = region("PHONE", "010-1234-5678", 0, boxes, source=Source.RULE)
+        out = propagate_regions([seed], boxes, PAGE_W, PAGE_H)
+        assert [r.member_index for r in out] == [[1]]
+
+    def test_text_labels_keep_similarity(self) -> None:
+        boxes = make_boxes([["서울특별시 강남구 테헤란로"], ["서울특별시 강남구 테헤린로"]])
+        seed = region("ADDRESS", "서울특별시 강남구 테헤란로", 0, boxes)
+        assert len(propagate_regions([seed], boxes, PAGE_W, PAGE_H)) == 1

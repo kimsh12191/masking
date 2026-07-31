@@ -21,20 +21,21 @@
       매칭되지 않는다.
     - **앞에 붙은 필드 라벨**: ``"담당자: 조민석"`` -> ``"조민석"``.
 
-매칭은 세 단계로 하고 앞이 성공하면 멈춘다:
+비교는 **회피 표기를 접은 형태**로 한다 (``normalize.canonicalize``).
+``"공1공-1234-5678"`` 이 ``"010-1234-5678"`` 과 같은 값으로 잡히고, 전각·
+비가시문자·호모글리프도 같은 값이 된다. 그 위에서 두 단계로 매칭한다.
 
   1. 완전일치 포함 (구분자·공백 무시)
-  2. **OCR 혼동문자 접기** (``O``↔``0``, ``l``↔``1``) 후 완전일치.
-     숫자 비율이 높은 값에만 적용한다.
-  3. 유사도 매칭. 한글 오독처럼 혼동표로 못 잡는 것을 받는다.
+  2. 유사도 매칭. 한글 오독처럼 정규화로 못 접는 것을 받는다.
+     **``SIMILARITY_LABELS`` 에 있는 라벨만** 이 단계를 쓴다 — 번호류는 한 글자
+     달라지면 다른 값이므로 유사도로 이어붙이면 안 된다.
 
 정밀도 보호 장치:
 
   * 라벨별 **최소 길이**. 짧은 문자열은 문서 곳곳에 우연히 들어 있다.
   * 필드 라벨만 있는 박스는 **씨앗도 대상도 되지 않는다**.
-  * ``ORG``/``TITLE`` 은 기본 제외. "하나은행", "과장" 같은 값이 문서 전체에
-    깔려 있어 전파하면 서식 전체가 마스킹된다.
-  * 완전일치가 아닌 경로(접기·유사도)로 붙은 것은 ``needs_review`` 로 표시한다.
+  * 원문 그대로 같지 않은 것(정규화를 거친 것, 유사도로 붙은 것)은
+    ``needs_review`` 로 표시하고 conf 를 낮춘다.
 
 전파 범위는 **페이지 1장**이다. 다중 페이지 문서에서 페이지를 넘나드는 전파는
 ``PageResult`` 를 모아 처리하는 상위 단계의 일이다 (현재 미구현).
@@ -47,6 +48,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from .merge import DEFAULT_PAD, LOW_CONF_THRESHOLD, ClaimLedger, as_ledger
+from .normalize import canonicalize
 from .ocr.layout import pad_bbox
 from .rules.detectors import FIELD_LABEL_WORDS, is_field_label
 from .schema import OcrBox, OcrStatus, PiiRegion, Source
@@ -54,8 +56,8 @@ from .schema import OcrBox, OcrStatus, PiiRegion, Source
 __all__ = [
     "DEFAULT_PROPAGATE_LABELS",
     "PROPAGATE_MIN_LEN",
+    "SIMILARITY_LABELS",
     "PropagateConfig",
-    "fold_confusables",
     "normalize",
     "propagate_regions",
     "seed_value",
@@ -88,45 +90,32 @@ PROPAGATE_MIN_LEN: dict[str, int] = {
     "IP": 7,
     "ACCOUNT_NO": 8,
     "OTHER": 5,
-    # 기본 전파 대상은 아니지만 opt-in 할 수 있으므로 길이는 정의해 둔다
-    "ORG": 4,
-    "TITLE": 4,
+    "ORG": 3,
+    "TITLE": 2,
     "SIGNATURE": 99,  # 텍스트가 없다. 사실상 전파 불가.
 }
 
 #: 라벨 목록을 지정하지 않았을 때 전파할 라벨.
 #:
-#: ``ORG``/``TITLE`` 은 제외한다 — "하나은행", "과장" 같은 값이 서식 전체에
-#: 깔려 있어 전파하면 문서 전체가 마스킹된다. ``SIGNATURE`` 는 텍스트가 없다.
+#: ``ORG``/``TITLE`` 도 포함한다 — 마스킹 범위를 넓게 잡는 방침이므로 기관명·
+#: 직위도 등장하는 모든 위치를 덮어야 한다. 서식 전체에 깔린 은행명이 전부
+#: 잡히는 것은 의도한 동작이다. 좁히려면 ``propagate_labels`` 로 지정하라.
+#: ``SIGNATURE`` 만 제외한다 — 텍스트가 없어 전파할 값 자체가 없다.
 DEFAULT_PROPAGATE_LABELS: tuple[str, ...] = tuple(
-    label
-    for label in PROPAGATE_MIN_LEN
-    if label not in ("ORG", "TITLE", "SIGNATURE")
+    label for label in PROPAGATE_MIN_LEN if label != "SIGNATURE"
 )
 
-#: OCR 이 실제로 혼동하는 글자 -> 숫자 정규형.
+#: 유사도 매칭을 **허용하는** 라벨.
 #:
-#: 일반 유사도 임계값으로는 이걸 잡을 수 없다. 11자리 전화번호에 오독이
-#: **한 글자만** 있어도 ``SequenceMatcher`` 비율은 0.909 로 떨어지므로,
-#: 임계값을 0.9 근처에 두면 아무것도 안 걸리고 0.8 로 내리면 전혀 다른 번호가
-#: 걸린다. 혼동쌍을 명시적으로 접는 편이 훨씬 정확하다.
-_CONFUSABLES = str.maketrans(
-    {
-        "O": "0", "o": "0", "D": "0", "Q": "0",
-        "l": "1", "I": "1", "i": "1", "|": "1",
-        "Z": "2", "z": "2",
-        "S": "5", "s": "5",
-        "b": "6", "G": "6",
-        "T": "7",
-        "B": "8",
-        "g": "9", "q": "9",
-    }
-)
-
-#: 혼동문자 접기를 적용할 숫자 비율 하한.
+#: 번호류에는 유사도를 쓰지 않는다. 숫자는 문자열로서 중복성이 없어서, 한 글자
+#: 다른 번호는 "오독된 같은 번호" 가 아니라 **그냥 다른 번호**다. 실제로 겪은
+#: 오탐: 여권번호 ``S12345678`` 이 전화번호 ``010-1234-5678`` 과 유사도 0.89 로
+#: 붙었다 (정규화 후 ``S12345678`` vs ``012345678``).
 #:
-#: 식별자(번호)에만 적용한다. 이름·주소에 적용하면 "Bob" 과 "8ob" 이 같아진다.
-_FOLD_DIGIT_RATIO = 0.6
+#: 번호류의 회피 표기는 ``normalize.canonicalize`` 가 결정론적으로 접으므로
+#: 유사도가 필요 없다. 유사도는 한글 OCR 오독처럼 **글자에 중복성이 있어
+#: 사람이 봐도 같은 값이라고 판단할 수 있는** 경우에만 쓴다.
+SIMILARITY_LABELS: frozenset[str] = frozenset({"NAME", "ADDRESS", "ORG", "TITLE"})
 
 #: 유사도 매칭을 시도할 최소 길이. 짧은 문자열의 유사도는 노이즈다.
 _SIM_MIN_LEN = 5
@@ -141,10 +130,8 @@ class PropagateConfig:
 
     Attributes:
         enabled: 전파 수행 여부.
-        fold_confusables: OCR 혼동문자(``O``↔``0``, ``l``↔``1``)를 접어서
-            비교할지. 숫자 비율이 높은 값에만 적용된다.
         min_similarity: 유사도 매칭 임계값 (0.0~1.0). ``1.0`` 이면 유사도
-            매칭을 끈다. 이름·주소처럼 혼동문자 접기로 안 되는 값에 쓴다.
+            매칭을 끈다. ``SIMILARITY_LABELS`` 라벨에만 적용된다.
             **0.9 이상으로 올리면 사실상 완전일치만 남는다** — 11자 값에서
             한 글자만 틀려도 비율이 0.909 다.
         max_seeds: 씨앗 개수 상한. 박스가 많은 페이지에서 연산량을 제한한다.
@@ -154,7 +141,6 @@ class PropagateConfig:
     """
 
     enabled: bool = True
-    fold_confusables: bool = True
     min_similarity: float = 0.85
     max_seeds: int = 64
     propagate_labels: tuple[str, ...] | None = None
@@ -165,25 +151,54 @@ class PropagateConfig:
 # --------------------------------------------------------------------------
 
 
-def _normalize_with_map(text: str) -> tuple[str, list[int]]:
-    """정규화 문자열과 ``정규화 위치 -> 원문 위치`` 매핑을 함께 만든다.
+@dataclass
+class _Norm:
+    """비교용 정규 문자열 + 원문 오프셋 매핑.
+
+    Attributes:
+        text: 비교에 쓰는 문자열.
+        starts: ``text[i]`` 가 유래한 원문 시작 오프셋.
+        ends: ``text[i]`` 가 유래한 원문 끝 오프셋 (배타적).
+        changed: 원문을 접어야 이 형태가 나왔는가. ``True`` 면 전파 결과를
+            ``needs_review`` 로 표시한다 — 회피 표기를 접어서 붙인 것이므로
+            사람이 확인해야 한다.
+    """
+
+    text: str
+    starts: list[int]
+    ends: list[int]
+    changed: bool
+
+    def span(self, start: int, end: int) -> tuple[int, int]:
+        return (self.starts[start], self.ends[end - 1])
+
+
+def _normalize_with_map(text: str) -> _Norm:
+    """회피 표기를 접고 구분자를 제거한 비교용 형태를 만든다.
+
+    ``normalize.canonicalize`` 로 회피 표기(한글 수사, 호모글리프, 전각,
+    비가시문자)를 먼저 접고, 그 위에서 구분자·공백을 제거한다. 이러면
+    ``"공1공-1234-5678"`` 이 ``"010-1234-5678"`` 과 같은 값으로 매칭된다.
 
     매핑이 있어야 매칭 결과를 원문 오프셋(``char_span``)으로 돌려놓을 수 있고,
     다운스트림이 부분 마스킹을 구현할 수 있다.
     """
+    canon = canonicalize(text)
     chars: list[str] = []
-    positions: list[int] = []
-    for i, ch in enumerate(text):
+    starts: list[int] = []
+    ends: list[int] = []
+    for i, ch in enumerate(canon.text):
         if _STRIP_RE.match(ch):
             continue
         chars.append(ch)
-        positions.append(i)
-    return "".join(chars), positions
+        starts.append(canon.starts[i])
+        ends.append(canon.ends[i])
+    return _Norm("".join(chars), starts, ends, canon.changed)
 
 
 def normalize(text: str) -> str:
-    """구분자·공백을 제거한 비교용 문자열."""
-    return _normalize_with_map(text)[0]
+    """회피 표기를 접고 구분자·공백을 제거한 비교용 문자열."""
+    return _normalize_with_map(text).text
 
 
 def seed_value(text: str) -> str:
@@ -203,26 +218,6 @@ def seed_value(text: str) -> str:
 # --------------------------------------------------------------------------
 # 매칭
 # --------------------------------------------------------------------------
-
-
-def _digit_ratio(text: str) -> float:
-    if not text:
-        return 0.0
-    return sum(ch.isdigit() for ch in text) / len(text)
-
-
-def fold_confusables(text: str) -> str:
-    """OCR 혼동문자를 숫자 정규형으로 접는다.
-
-    숫자 비율이 낮은 값(이름·주소·영문)에는 적용하지 않는다 — "Bob" 을 접으면
-    "806" 이 되어 전혀 다른 값과 같아진다.
-
-    비율은 **접기 전 원문**으로 판정해야 한다. 접은 결과로 판정하면 글자가
-    숫자로 바뀌면서 비율이 올라가 모든 영문 단어가 통과한다.
-    """
-    if _digit_ratio(text) < _FOLD_DIGIT_RATIO:
-        return text
-    return text.translate(_CONFUSABLES)
 
 
 def _find_exact(needle: str, haystack: str) -> tuple[int, int] | None:
@@ -268,6 +263,7 @@ class _Seed:
     value: str          # 정규화된 값
     confidence: float
     origin: str         # 로그용 원문
+    normalized: bool = False  # 회피 표기를 접어야 이 값이 나왔는가
 
 
 def _spans_by_box(regions: list[PiiRegion]) -> dict[int, list[tuple[int, int]]]:
@@ -324,22 +320,23 @@ def _collect_seeds(
                     continue
 
         value = seed_value(raw)
-        norm = normalize(value)
-        if len(norm) < PROPAGATE_MIN_LEN.get(region.type, 99):
+        norm = _normalize_with_map(value)
+        if len(norm.text) < PROPAGATE_MIN_LEN.get(region.type, 99):
             continue
         if is_field_label(value):
             continue
 
-        key = (region.type, norm)
+        key = (region.type, norm.text)
         if key in seen:
             continue
         seen.add(key)
         seeds.append(
             _Seed(
                 label=region.type,
-                value=norm,
+                value=norm.text,
                 confidence=region.confidence,
                 origin=value,
+                normalized=norm.changed,
             )
         )
 
@@ -403,7 +400,7 @@ def propagate_regions(
         return []
 
     # 박스별 정규화 텍스트를 한 번만 계산한다
-    norm_cache: dict[int, tuple[str, list[int]]] = {}
+    norm_cache: dict[int, _Norm] = {}
     for box in boxes:
         if box.status is OcrStatus.FAILED or not box.text.strip():
             continue
@@ -414,42 +411,39 @@ def propagate_regions(
     out: list[PiiRegion] = []
 
     for seed in seeds:
-        for idx, (norm_text, positions) in norm_cache.items():
+        for idx, norm in norm_cache.items():
             if ledger.has(idx, seed.label):
                 continue
 
-            # ① 완전일치 -> ② 혼동문자 접기 -> ③ 유사도. 앞이 성공하면 멈춘다.
-            match_kind = "exact"
-            span_norm = _find_exact(seed.value, norm_text)
-
-            if span_norm is None and cfg.fold_confusables:
-                folded_seed = fold_confusables(seed.value)
-                folded_text = fold_confusables(norm_text)
-                # 접기가 실제로 뭔가를 바꿨을 때만 의미가 있다. 길이는 보존되므로
-                # 오프셋을 그대로 원문에 되돌릴 수 있다.
-                if folded_seed != seed.value or folded_text != norm_text:
-                    span_norm = _find_exact(folded_seed, folded_text)
-                    if span_norm is not None:
-                        match_kind = "folded"
-
+            # ① 완전일치 -> ② 유사도. 회피 표기 접기는 이미 정규화에서 끝났다.
+            # 유사도는 글자에 중복성이 있는 라벨에만 쓴다 (번호류는 한 글자만
+            # 달라도 다른 값이다).
+            span_norm = _find_exact(seed.value, norm.text)
             similarity = 1.0
             if span_norm is None:
-                found = _find_similar(seed.value, norm_text, cfg.min_similarity)
+                if seed.label not in SIMILARITY_LABELS:
+                    continue
+                found = _find_similar(seed.value, norm.text, cfg.min_similarity)
                 if found is None:
                     continue
                 span_norm = (found[0], found[1])
                 similarity = found[2]
-                match_kind = "similar"
+
+            # 회피 표기를 접어서 붙은 것이면 사람이 확인해야 한다. 원문 그대로
+            # 같았던 것과 같은 신뢰도로 취급할 수 없다.
+            folded = seed.normalized or norm.changed
+            if similarity < 1.0:
+                kind = f"유사(={similarity:.2f})"
+            elif folded:
+                kind = "동일 (회피 표기 정규화 후)"
+            else:
+                kind = "동일"
+            solid = similarity >= 1.0 and not folded
 
             box = boxes[idx]
-            char_span = (
-                positions[span_norm[0]],
-                positions[span_norm[1] - 1] + 1,
-            )
-            exact = match_kind == "exact"
             # 전파는 원본 탐지보다 한 단계 약한 근거다. 완전일치는 거의 확실하고,
             # 접힌 것/유사한 것은 사람이 확인해야 한다.
-            conf = min(seed.confidence, 0.95 if exact else 0.7)
+            conf = min(seed.confidence, 0.95 if solid else 0.7)
 
             out.append(
                 PiiRegion(
@@ -461,17 +455,13 @@ def propagate_regions(
                     text=box.text,
                     member_boxes=[box.bbox],
                     member_index=[box.index],
-                    char_span=char_span,
+                    char_span=norm.span(*span_norm),
                     ocr_status=box.status,
-                    needs_review=(not exact) or box.status is not OcrStatus.OK,
+                    needs_review=(not solid) or box.status is not OcrStatus.OK,
                     low_confidence=conf < LOW_CONF_THRESHOLD,
                     reason=(
-                        f"다른 위치에서 확정된 {seed.label} 값 '{seed.origin}' 과 "
-                        + {
-                            "exact": "동일",
-                            "folded": "동일 (OCR 혼동문자 보정 후)",
-                            "similar": f"유사(={similarity:.2f})",
-                        }[match_kind]
+                        f"다른 위치에서 확정된 {seed.label} 값 "
+                        f"'{seed.origin}' 과 {kind}"
                     ),
                 )
             )

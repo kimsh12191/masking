@@ -184,18 +184,28 @@ class TestSystemPrompts:
             assert "그 **타입만**" in prompt
             assert "다른 종류" in prompt
 
-    def test_both_passes_exclude_issuing_institution(self) -> None:
-        """은행명·지점명·부서명을 제외하지 않으면 서식 전체가 마스킹된다."""
+    def test_both_passes_include_issuing_institution(self) -> None:
+        """방침은 넓게 잡기다 — 은행명·지점명·부서명도 마스킹 대상이다."""
         for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
-            assert "기관 자체" in prompt
+            assert "기관 자체의 정보도 포함한다" in prompt
             assert "하나은행 강남지점" in prompt
-            # 단, 기관 직원이라도 사람 이름은 개인정보다
             assert "기관 직원이라도 NAME" in prompt
 
-    def test_both_passes_exclude_document_dates_from_birth(self) -> None:
+    def test_both_passes_include_all_dates(self) -> None:
         for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
-            assert "문서 자체의 날짜" in prompt
+            assert "모든 날짜" in prompt
             assert "만기일" in prompt
+
+    def test_both_passes_include_identifier_numbers(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "모든 식별번호" in prompt
+            assert "사번" in prompt
+
+    def test_only_non_identifying_values_are_excluded(self) -> None:
+        """제외 대상은 아무도 식별하지 않는 값뿐이어야 한다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "아무도 식별하지 않는 값" in prompt
+            assert "이자율" in prompt
 
     def test_both_passes_give_conf_calibration(self) -> None:
         """conf 앵커가 없으면 모델이 전부 0.9 로 채워 needs_review 가 무의미해진다."""
@@ -203,9 +213,50 @@ class TestSystemPrompts:
             assert "conf 기준" in prompt
             assert "0.5 미만" in prompt
 
-    def test_exclusions_outrank_recall_priority(self) -> None:
-        """"애매하면 포함" 과 "기관 정보 제외" 의 우선순위를 명시해야 한다."""
-        assert "우선한다" in SYSTEM_PASS1
+
+class TestEvasionGuidance:
+    """마스킹 회피 표기 지침.
+
+    규칙 레이어는 ``normalize.py`` 로 정규화해서 대응하지만, 규칙이 구조적으로
+    못 잡는 형태(가려진 이름, 벌려 쓴 숫자)는 LLM 이 최종 안전망이다.
+    """
+
+    def test_both_passes_warn_about_evasion(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "회피 표기를 놓치지 마라" in prompt
+
+    def test_hangul_numeral_evasion_is_shown(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "구1공8공4" in prompt
+            assert "공일공-일이삼사-오육칠팔" in prompt
+
+    def test_homoglyph_evasion_is_shown(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "0lO-1234-5678" in prompt
+            assert "9O1231-1234567" in prompt
+
+    def test_spacing_and_partial_masking_evasion_is_shown(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "홍 길 동" in prompt
+            assert "901231-1******" in prompt
+
+    def test_email_separator_evasion_is_shown(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "hong(at)hana(dot)com" in prompt
+            assert "골뱅이" in prompt
+
+    def test_partially_masked_values_are_still_pii(self) -> None:
+        """이미 가려져 있다고 건너뛰면 남은 부분으로 재식별된다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "일부만 가려진 값도 개인정보다" in prompt
+
+    def test_pass1_maps_evasion_to_available_labels(self) -> None:
+        """pass-1 의 라벨 집합에는 PHONE 이 없으므로 OTHER 로 보내야 한다."""
+        assert "번호류를 OTHER 로 보고하면 된다" in SYSTEM_PASS1
+
+    def test_pass2_maps_evasion_to_exact_labels(self) -> None:
+        """pass-2 는 전체 라벨을 쓸 수 있으므로 정확한 type 을 요구한다."""
+        assert "원래 값에 맞는 정확한 type" in SYSTEM_PASS2
 
     def test_pass1_defines_ocr_failed_behaviour(self) -> None:
         """<OCR_FAILED> 처리 지침이 없으면 동작이 정의되지 않는다."""
