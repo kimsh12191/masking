@@ -25,6 +25,21 @@ log = logging.getLogger(__name__)
 IMAGE_SUFFIX = ".boxes.png"
 JSON_SUFFIX = ".json"
 
+#: 다중 페이지 문서의 페이지 번호 자릿수 (``_p001``)
+PAGE_DIGITS = 3
+
+
+def default_stem(result: PageResult) -> str:
+    """결과에서 파일명 기준 이름을 만든다.
+
+    단일 이미지는 파일명 그대로, PDF 페이지는 ``{PDF이름}_p001`` 형태가 된다.
+    페이지 번호를 0 채움으로 넣어 파일 정렬 순서가 페이지 순서와 일치하게 한다.
+    """
+    stem = Path(result.image_path).stem
+    if result.page_no is None:
+        return stem
+    return f"{stem}_p{result.page_no:0{PAGE_DIGITS}d}"
+
 
 def save_result(
     result: PageResult,
@@ -41,7 +56,9 @@ def save_result(
     Args:
         result: 파이프라인 결과.
         out_dir: 출력 디렉터리 (없으면 생성).
-        stem: 파일명 기준 이름. 생략하면 입력 이미지 파일명을 쓴다.
+        stem: 파일명 기준 이름. 생략하면 입력 파일명을 쓰고,
+            ``result.page_no`` 가 있으면 ``_p001`` 을 덧붙인다
+            (PDF 1개 → ``doc_p001.json``, ``doc_p002.json`` …).
         write_image: 박스 표시 이미지를 남길지 여부.
         include_ocr: JSON 에 OCR 박스와 LLM 원시응답까지 포함할지 (디버깅용).
         font_path: 한글 폰트 경로. 없으면 라벨(ASCII)만 표시된다.
@@ -57,7 +74,7 @@ def save_result(
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    name = stem or Path(result.image_path).stem
+    name = stem or default_stem(result)
 
     written: dict[str, Path] = {}
 
@@ -93,7 +110,10 @@ def format_summary(result: PageResult, written: dict[str, Path] | None = None) -
     import json as _json
 
     stats = result.stats()
-    lines = [f"=== {result.image_path} ==="]
+    header = result.image_path
+    if result.page_no is not None:
+        header += f"  (p{result.page_no})"
+    lines = [f"=== {header} ==="]
     if written:
         for key in ("image", "json"):
             if key in written:

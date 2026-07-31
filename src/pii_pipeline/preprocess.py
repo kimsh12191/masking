@@ -58,7 +58,7 @@ def preprocess(
     target_long_side: int | None = 2480,
     deskew: bool = True,
 ) -> PreprocessResult:
-    """이미지를 읽어 OCR 에 적합한 형태로 정규화한다.
+    """이미지 파일을 읽어 OCR 에 적합한 형태로 정규화한다.
 
     Args:
         image_path: 입력 이미지 경로.
@@ -80,6 +80,34 @@ def preprocess(
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"이미지를 읽을 수 없습니다: {image_path}")
+
+    return preprocess_array(img, target_long_side=target_long_side, deskew=deskew)
+
+
+def preprocess_array(
+    img: Any,
+    target_long_side: int | None = 2480,
+    deskew: bool = True,
+) -> PreprocessResult:
+    """이미 메모리에 있는 이미지를 정규화한다.
+
+    PDF 페이지처럼 파일을 거치지 않는 입력에 쓴다.
+
+    Args:
+        img: BGR numpy 배열.
+        target_long_side: 긴 변 목표 길이. ``None`` 이면 축소하지 않는다.
+        deskew: 기울기 보정 여부.
+
+    Returns:
+        전처리 결과. 입력 배열은 변경하지 않는다.
+
+    Raises:
+        RuntimeError: opencv 미설치.
+    """
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - 환경 의존
+        raise RuntimeError("opencv-python 이 필요합니다.") from exc
 
     orig_h, orig_w = img.shape[:2]
     applied: list[str] = []

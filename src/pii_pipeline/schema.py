@@ -174,6 +174,8 @@ class PageResult:
     image_path: str
     width: int
     height: int
+    #: 다중 페이지 문서(PDF)의 1-기반 페이지 번호. 단일 이미지면 ``None``.
+    page_no: int | None = None
     regions: list[PiiRegion] = field(default_factory=list)
     ocr_boxes: list[OcrBox] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
@@ -193,6 +195,7 @@ class PageResult:
     def to_dict(self, include_ocr: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
             "image_path": self.image_path,
+            "page_no": self.page_no,
             "page": {"width": self.width, "height": self.height},
             "regions": [r.to_dict() for r in self.regions],
             "timings": {k: round(v, 3) for k, v in self.timings.items()},

@@ -1,14 +1,20 @@
 # 개인정보 영역 탐지 파이프라인
 
-금융 문서 이미지에서 **개인정보 영역의 좌표와 유형**을 찾는다.
+금융 문서에서 **개인정보 영역의 좌표와 유형**을 찾는다.
 마스킹/치환은 이 출력을 받는 별도 모듈에서 한다.
 
+입력은 **이미지 또는 PDF**, 출력은 페이지당 두 파일이다.
+
 ```
-입력                출력 (페이지당 2개)
-────────────  →  ─────────────────────────────────────────────
-문서 이미지        {이름}.boxes.png   박스 영역이 표시된 이미지
-                  {이름}.json        박스 위치 + 개인정보 유형
+이미지 1장   →  {이름}.boxes.png        {이름}.json
+PDF          →  {이름}_p001.boxes.png   {이름}_p001.json
+                {이름}_p002.boxes.png   {이름}_p002.json   ...
 ```
+
+| 파일 | 내용 |
+|---|---|
+| `.boxes.png` | 박스 영역이 표시된 이미지 (눈으로 검수) |
+| `.json` | 박스 위치 + 개인정보 유형 (다운스트림이 소비) |
 
 두 파일의 좌표계는 같다. `boxes.png` 위의 박스와 `json` 의 `bbox` 가 1:1로 대응한다.
 
@@ -26,12 +32,12 @@
 git clone <repo> && cd masking
 git checkout claude/personal-info-masking-pipeline-erken9
 
-pip install pytest Pillow PyYAML
+pip install pytest Pillow PyYAML numpy pypdfium2
 python -m pytest
 ```
 
-→ **499건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·설정 로딩·
-라벨 스키마·파이프라인 배선이 모두 정상이다.
+→ **592건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·설정 로딩·
+라벨 스키마·PDF 페이지 분해·파이프라인 배선이 모두 정상이다.
 
 설정만 확인해보려면:
 
@@ -98,13 +104,27 @@ vllm serve Qwen/Qwen3.5-9B \
 ### 실행
 
 ```bash
+# 이미지
 python scripts/run.py data/synth/*.png -o out/
+
+# PDF — 페이지별로 나온다
+python scripts/run.py 계약서.pdf -o out/
+
+# PDF 페이지 범위만
+python scripts/run.py 계약서.pdf -o out/ --pages 1-3,7
+
+# 이미지와 PDF 를 섞어도 된다
+python scripts/run.py data/*.png data/*.pdf -o out/
 ```
 
 ```
 out/
-├── synth_001.boxes.png    ← 박스 표시 이미지
-└── synth_001.json         ← 박스 위치 + 유형
+├── synth_001.boxes.png      ← 이미지 입력
+├── synth_001.json
+├── 계약서_p001.boxes.png     ← PDF 입력 (페이지별)
+├── 계약서_p001.json
+├── 계약서_p002.boxes.png
+└── 계약서_p002.json
 ```
 
 `boxes.png` 를 열어 **좌표가 맞는지 눈으로 확인**하는 게 가장 빠르다.
@@ -214,6 +234,8 @@ python scripts/run.py --help
 | `--print-config` | 적용된 설정을 출력하고 종료 |
 | `--config` | 설정 파일 경로 |
 | `--no-image` | 박스 표시 이미지 생략, JSON 만 저장 |
+| `--pages` | PDF 페이지 범위. `1-3,7` / `5-` |
+| `--pdf-password` | 암호화된 PDF 암호 (`PII_PDF_PASSWORD` 환경변수 권장) |
 | `--font` | 한글 폰트 경로 (없어도 라벨은 ASCII 라 표시됨) |
 | `--show-ocr-boxes` | OCR 박스 전체를 회색으로 표시 (디버깅) |
 | `--no-pass2` | 이미지 pass 끄기 (베이스라인) |
@@ -248,11 +270,18 @@ pipeline = PiiPipeline(PipelineConfig(
 ))
 ```
 
-여러 장을 한 번에 (한 장씩 즉시 저장하고 이미지 메모리를 해제한다):
+PDF 와 이미지를 섞어서 (한 장씩 즉시 저장하고 이미지 메모리를 해제한다):
 
 ```python
-pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
+# 확장자를 보고 알아서 처리한다. PDF 1개 -> 페이지별 결과 여러 개
+results = pipeline.run_any("계약서.pdf", out_dir="out/", pages="1-3")
+
+# 섞어서 일괄 처리 — 반환 개수가 입력 개수와 다를 수 있다
+results = pipeline.run_batch(["a.png", "b.pdf"], out_dir="out/")
 ```
+
+> PDF 페이지는 제너레이터로 한 장씩 렌더링한다. A4 300dpi 기준 장당 약 13MB
+> 이므로 `out_dir` 없이 큰 문서를 돌리면 메모리를 많이 쓴다.
 
 ---
 
@@ -262,6 +291,8 @@ pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
 
 ```json
 {
+  "image_path": "계약서.pdf",
+  "page_no": 2,
   "page": {"width": 1748, "height": 2480},
   "regions": [
     {
@@ -286,6 +317,8 @@ pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
 - `member_boxes` — 주소처럼 여러 박스에 걸친 항목의 구성 박스.
   통짜/조각별 마스킹을 선택할 수 있다.
 - `id` — 읽기 순서 기반 결정론적 부여. 재처리 시 같은 ID → 어노테이션 재연결 가능.
+- `page_no` — PDF 의 1-기반 페이지 번호. 단일 이미지 입력이면 `null`.
+  `image_path` 는 PDF 파일 경로를 그대로 유지한다.
 
 ---
 
@@ -358,7 +391,16 @@ GPU 없는 환경에서 만들었으므로 다음 두 개는 **첫 실행 시 �
 | PaddleOCR 연동 | `paddle_runner.py` 의 `parse()` 가 실제 반환 형태와 맞는지. **2.x 기준으로 작성됨** — 3.x 설치하면 손봐야 한다 |
 | vLLM 연동 | `guided_json` / `chat_template_kwargs` 가 실제로 먹는지 |
 
-로직·배선은 테스트로 검증됐다.
+로직·배선은 테스트로 검증됐다. PDF 렌더링은 실제 pypdfium2 로 검증했다.
+
+### 알려진 개선 여지 — 전자 PDF
+
+전자적으로 생성된 PDF(스캔이 아닌)는 **텍스트 레이어에 정확한 좌표가 이미
+들어 있다.** 그런 문서는 OCR 없이 좌표를 그대로 뽑는 게 완벽하고 훨씬 빠르다.
+현재는 스캔/전자를 구분하지 않고 전부 이미지로 렌더링해 OCR 을 태운다.
+
+금융 문서는 전자 생성 비중이 높으니 실측해보고 판단할 값이 있다.
+`src/pii_pipeline/pdf.py` 에 같은 내용을 주석으로 남겨뒀다.
 
 ---
 

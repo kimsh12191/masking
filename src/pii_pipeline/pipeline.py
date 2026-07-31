@@ -34,7 +34,8 @@ from .merge import (
     regions_from_rules,
 )
 from .ocr.paddle_runner import OcrConfig, PaddleOcrRunner
-from .preprocess import preprocess
+from .pdf import is_pdf, render_pages
+from .preprocess import preprocess, preprocess_array
 from .rules.detectors import detect as rule_detect
 from .schema import PASS1_SCHEMA, PASS2_SCHEMA, OcrBox, PageResult
 
@@ -85,11 +86,20 @@ class PiiPipeline:
         self.ocr = PaddleOcrRunner(self.config.ocr)
         self.llm = LlmClient(self.config.llm)
 
-    def run(self, image_path: str) -> PageResult:
-        """이미지 1장을 처리한다.
+    def run(
+        self,
+        image_path: str,
+        *,
+        image: Any | None = None,
+        page_no: int | None = None,
+    ) -> PageResult:
+        """페이지 1장을 처리한다.
 
         Args:
-            image_path: 입력 이미지 경로.
+            image_path: 입력 경로. ``image`` 를 함께 주면 파일을 읽지 않고
+                결과의 출처 표기로만 쓴다 (PDF 페이지 등).
+            image: 이미 메모리에 있는 BGR 배열. 주면 파일 읽기를 건너뛴다.
+            page_no: 다중 페이지 문서의 1-기반 페이지 번호.
 
         Returns:
             탐지된 영역과 진단 정보를 담은 ``PageResult``.
@@ -102,11 +112,18 @@ class PiiPipeline:
 
         # ── ① 전처리 ──────────────────────────────────────────────
         with _timed(timings, "preprocess"):
-            pre = preprocess(
-                image_path,
-                target_long_side=cfg.target_long_side,
-                deskew=cfg.deskew,
-            )
+            if image is not None:
+                pre = preprocess_array(
+                    image,
+                    target_long_side=cfg.target_long_side,
+                    deskew=cfg.deskew,
+                )
+            else:
+                pre = preprocess(
+                    image_path,
+                    target_long_side=cfg.target_long_side,
+                    deskew=cfg.deskew,
+                )
         page_w, page_h = pre.width, pre.height
 
         # ── ② OCR ────────────────────────────────────────────────
@@ -115,6 +132,7 @@ class PiiPipeline:
 
         result = PageResult(
             image_path=image_path,
+            page_no=page_no,
             width=page_w,
             height=page_h,
             ocr_boxes=boxes,
@@ -184,36 +202,58 @@ class PiiPipeline:
         )
         return result
 
-    def run_batch(
+    def run_pdf(
         self,
-        image_paths: list[str],
+        pdf_path: str,
         out_dir: str | None = None,
+        pages: str | None = None,
+        password: str | None = None,
         **save_kwargs: Any,
     ) -> list[PageResult]:
-        """여러 장을 순차 처리한다. 1장이 실패해도 나머지는 계속 처리한다.
+        """PDF 를 페이지별로 처리한다.
+
+        페이지를 한 장씩 렌더링해 처리하고, ``out_dir`` 을 주면 즉시 저장하고
+        이미지를 해제한다. 전체를 메모리에 모으지 않으므로 페이지가 많은 문서도
+        처리할 수 있다.
 
         Args:
-            image_paths: 입력 이미지 경로 목록.
-            out_dir: 지정하면 한 장씩 즉시 저장하고 전처리 이미지를 해제한다.
-                생략하면 모든 결과가 이미지를 물고 있으므로 (장당 ~13MB)
-                많은 페이지를 처리할 때 메모리를 주의해야 한다.
-            **save_kwargs: ``save_result()`` 로 전달 (write_image, font_path 등).
+            pdf_path: 입력 PDF 경로.
+            out_dir: 지정하면 페이지마다 즉시 저장한다
+                (``{PDF이름}_p001.boxes.png`` / ``{PDF이름}_p001.json``).
+                생략하면 모든 결과가 이미지를 물고 있어 메모리를 많이 쓴다.
+            pages: ``"1-3,7"`` 형식의 페이지 범위. ``None`` 이면 전체.
+            password: 암호화된 PDF 의 열기 암호.
+            **save_kwargs: ``save_result()`` 로 전달.
 
         Returns:
-            입력 순서와 같은 길이의 결과 목록. 실패한 페이지는 빈 결과 +
-            ``warnings`` 에 사유가 담긴다.
+            페이지 순서대로의 결과 목록. 한 페이지가 실패해도 나머지는 계속 처리하고,
+            실패한 페이지는 빈 결과 + ``warnings`` 로 남는다.
+
+        Raises:
+            RuntimeError: PDF 자체를 열 수 없을 때 (페이지 단위 실패와 구분한다).
+            ValueError: 페이지 범위 표기가 잘못되었을 때.
         """
         results: list[PageResult] = []
-        for path in image_paths:
+
+        for page in render_pages(
+            pdf_path,
+            target_long_side=self.config.target_long_side,
+            pages=pages,
+            password=password,
+        ):
             try:
-                result = self.run(path)
-            except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
-                log.exception("처리 실패: %s", path)
+                result = self.run(pdf_path, image=page.image, page_no=page.page_no)
+                result.warnings.append(
+                    f"PDF 렌더링: {page.width}x{page.height}px @ {page.dpi}dpi"
+                )
+            except Exception as exc:  # noqa: BLE001 - 페이지 하나로 문서 전체를 버리지 않는다
+                log.exception("PDF 페이지 처리 실패: %s p%d", pdf_path, page.page_no)
                 results.append(
                     PageResult(
-                        image_path=path,
-                        width=0,
-                        height=0,
+                        image_path=pdf_path,
+                        page_no=page.page_no,
+                        width=page.width,
+                        height=page.height,
                         warnings=[f"처리 실패: {type(exc).__name__}: {exc}"],
                     )
                 )
@@ -224,4 +264,70 @@ class PiiPipeline:
 
                 save_result(result, out_dir, release=True, **save_kwargs)
             results.append(result)
+
+        return results
+
+    def run_any(
+        self,
+        path: str,
+        out_dir: str | None = None,
+        **kwargs: Any,
+    ) -> list[PageResult]:
+        """확장자를 보고 이미지/PDF 를 알아서 처리한다.
+
+        Args:
+            path: 이미지 또는 PDF 경로.
+            out_dir: 지정하면 즉시 저장한다.
+            **kwargs: PDF 면 ``pages`` / ``password`` 도 받는다. 나머지는
+                ``save_result()`` 로 전달된다.
+
+        Returns:
+            결과 목록. 단일 이미지면 길이 1.
+        """
+        if is_pdf(path):
+            return self.run_pdf(path, out_dir=out_dir, **kwargs)
+
+        kwargs.pop("pages", None)
+        kwargs.pop("password", None)
+        result = self.run(path)
+        if out_dir is not None:
+            from .output import save_result
+
+            save_result(result, out_dir, release=True, **kwargs)
+        return [result]
+
+    def run_batch(
+        self,
+        image_paths: list[str],
+        out_dir: str | None = None,
+        **save_kwargs: Any,
+    ) -> list[PageResult]:
+        """이미지와 PDF 를 섞어서 순차 처리한다. 하나가 실패해도 계속 처리한다.
+
+        Args:
+            image_paths: 입력 경로 목록. 이미지와 PDF 를 섞어도 된다.
+            out_dir: 지정하면 한 장씩 즉시 저장하고 전처리 이미지를 해제한다.
+                생략하면 모든 결과가 이미지를 물고 있으므로 (장당 ~13MB)
+                많은 페이지를 처리할 때 메모리를 주의해야 한다.
+            **save_kwargs: ``save_result()`` 로 전달 (write_image, font_path 등).
+                PDF 용 ``pages`` / ``password`` 도 여기로 넘긴다.
+
+        Returns:
+            결과 목록. **입력 개수와 길이가 다를 수 있다** — PDF 1개가 여러
+            페이지 결과를 낸다. 실패한 항목은 빈 결과 + ``warnings`` 로 남는다.
+        """
+        results: list[PageResult] = []
+        for path in image_paths:
+            try:
+                results.extend(self.run_any(path, out_dir=out_dir, **save_kwargs))
+            except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
+                log.exception("처리 실패: %s", path)
+                results.append(
+                    PageResult(
+                        image_path=path,
+                        width=0,
+                        height=0,
+                        warnings=[f"처리 실패: {type(exc).__name__}: {exc}"],
+                    )
+                )
         return results

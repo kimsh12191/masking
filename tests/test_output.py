@@ -124,6 +124,64 @@ class TestSaveResult:
         assert first != second
 
 
+class TestDefaultStem:
+    def test_single_image_uses_filename(self) -> None:
+        from pii_pipeline.output import default_stem
+
+        assert default_stem(sample_result()) == "doc_001"
+
+    def test_pdf_page_gets_zero_padded_suffix(self) -> None:
+        from pii_pipeline.output import default_stem
+
+        result = sample_result()
+        result.image_path = "/data/계약서.pdf"
+        result.page_no = 7
+        assert default_stem(result) == "계약서_p007"
+
+    def test_padding_keeps_file_sort_order(self) -> None:
+        """파일 정렬 순서가 페이지 순서와 일치해야 한다."""
+        from pii_pipeline.output import default_stem
+
+        stems = []
+        for n in (2, 10, 1):
+            r = sample_result()
+            r.image_path = "/data/doc.pdf"
+            r.page_no = n
+            stems.append(default_stem(r))
+        assert sorted(stems) == ["doc_p001", "doc_p002", "doc_p010"]
+
+
+class TestPdfPageSaving:
+    def test_filenames_include_page_number(self, tmp_path: Path) -> None:
+        result = sample_result()
+        result.image_path = "/data/계약서.pdf"
+        result.page_no = 3
+        written = save_result(result, tmp_path)
+        assert written["json"].name == "계약서_p003.json"
+        assert written["image"].name == "계약서_p003.boxes.png"
+
+    def test_json_carries_page_number(self, tmp_path: Path) -> None:
+        result = sample_result()
+        result.image_path = "/data/doc.pdf"
+        result.page_no = 5
+        written = save_result(result, tmp_path)
+        assert json.loads(written["json"].read_text(encoding="utf-8"))["page_no"] == 5
+
+    def test_single_image_page_no_is_null(self, tmp_path: Path) -> None:
+        written = save_result(sample_result(), tmp_path)
+        assert json.loads(written["json"].read_text(encoding="utf-8"))["page_no"] is None
+
+    def test_pages_do_not_overwrite_each_other(self, tmp_path: Path) -> None:
+        for n in (1, 2, 3):
+            result = sample_result()
+            result.image_path = "/data/doc.pdf"
+            result.page_no = n
+            save_result(result, tmp_path)
+        assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+            "doc_p001.json", "doc_p002.json", "doc_p003.json",
+        ]
+
+
 class TestFormatSummary:
     def test_includes_paths_and_counts(self, tmp_path: Path) -> None:
         result = sample_result()

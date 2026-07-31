@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """파이프라인 실행 CLI.
 
-이미지를 입력하면 페이지당 두 파일을 남긴다.
+이미지 또는 PDF 를 입력하면 페이지당 두 파일을 남긴다.
 
-    {이름}.boxes.png   박스 영역이 표시된 이미지
-    {이름}.json        박스 위치 + 개인정보 유형
+    단일 이미지   {이름}.boxes.png       {이름}.json
+    PDF           {이름}_p001.boxes.png  {이름}_p001.json
+                  {이름}_p002.boxes.png  {이름}_p002.json  ...
 
 설정은 네 단계로 겹쳐 적용된다 (뒤가 앞을 덮는다):
 
@@ -18,8 +19,14 @@
     # 설정 파일 지정
     python scripts/run.py sample.png --config config/prod.yaml
 
-    # 디렉터리 일괄 처리
-    python scripts/run.py data/*.png -o out/
+    # PDF — 페이지별로 png + json 이 나온다
+    python scripts/run.py 계약서.pdf -o out/
+
+    # PDF 페이지 범위 지정
+    python scripts/run.py 계약서.pdf -o out/ --pages 1-3,7
+
+    # 이미지와 PDF 를 섞어서 일괄 처리
+    python scripts/run.py data/*.png data/*.pdf -o out/
 
     # 일회성 변경 — 설정 파일을 고치지 않고 덮어쓰기
     python scripts/run.py sample.png --model Qwen/Qwen3.5-9B --no-pass2
@@ -32,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -39,7 +47,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pii_pipeline import PiiPipeline  # noqa: E402
 from pii_pipeline.config import describe, load_config  # noqa: E402
-from pii_pipeline.output import format_summary, save_result  # noqa: E402
+from pii_pipeline.output import (  # noqa: E402
+    IMAGE_SUFFIX,
+    JSON_SUFFIX,
+    default_stem,
+    format_summary,
+)
 from pii_pipeline.viz import legend_text  # noqa: E402
 
 BOOL = argparse.BooleanOptionalAction
@@ -56,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=legend_text(),
     )
-    p.add_argument("images", nargs="*", help="입력 이미지 경로")
+    p.add_argument("inputs", nargs="*", help="입력 이미지 또는 PDF 경로")
     p.add_argument("-c", "--config", default=None,
                    help="설정 파일 경로 "
                         "(기본: $PII_CONFIG > ./config.yaml > ./config/default.yaml)")
@@ -73,6 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="OCR 박스 전체를 회색으로 표시 (디버깅)")
     g.add_argument("--include-ocr", action=BOOL, default=None,
                    help="JSON 에 OCR 박스와 LLM 원시응답 포함 (디버깅)")
+
+    g = p.add_argument_group("PDF 입력")
+    g.add_argument("--pages", default=None,
+                   help='처리할 페이지 범위. 예: "1-3,7", "5-" (기본: 전체)')
+    g.add_argument("--pdf-password", default=None,
+                   help="암호화된 PDF 의 열기 암호 "
+                        "(셸 히스토리에 남으므로 PII_PDF_PASSWORD 환경변수를 권장)")
 
     g = p.add_argument_group("파이프라인")
     g.add_argument("--pass2", action=BOOL, default=None,
@@ -94,6 +114,20 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--image-max-side", type=int, default=None,
                    help="pass2 이미지 긴 변 길이. 1500 이상 유지할 것")
     return p
+
+
+def written_paths(out_dir: Path, result) -> dict[str, Path]:
+    """이미 저장된 파일 경로를 요약 출력용으로 재구성한다.
+
+    저장은 ``run_any(out_dir=...)`` 안에서 끝났으므로 실제 존재하는 것만 담는다.
+    """
+    stem = default_stem(result)
+    found: dict[str, Path] = {}
+    for key, suffix in (("image", IMAGE_SUFFIX), ("json", JSON_SUFFIX)):
+        path = out_dir / f"{stem}{suffix}"
+        if path.exists():
+            found[key] = path
+    return found
 
 
 def apply_cli_overrides(config, args: argparse.Namespace) -> None:
@@ -143,8 +177,9 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(config))
         return 0
 
-    if not args.images:
-        print("입력 이미지를 지정하십시오. (--help 로 사용법 확인)", file=sys.stderr)
+    if not args.inputs:
+        print("입력 이미지 또는 PDF 를 지정하십시오. (--help 로 사용법 확인)",
+              file=sys.stderr)
         return 2
 
     print(describe(config))
@@ -157,32 +192,33 @@ def main(argv: list[str] | None = None) -> int:
     pipeline = PiiPipeline(config.pipeline)
     exit_code = 0
 
-    for image_path in args.images:
-        stem = Path(image_path).stem
+    password = args.pdf_password or os.getenv("PII_PDF_PASSWORD")
+
+    for input_path in args.inputs:
         try:
-            result = pipeline.run(image_path)
+            results = pipeline.run_any(
+                input_path,
+                out_dir=str(out_dir),
+                pages=args.pages,
+                password=password,
+                write_image=config.output.write_image,
+                include_ocr=config.output.include_ocr,
+                font_path=config.output.font_path,
+                show_ocr_boxes=config.output.show_ocr_boxes,
+            )
         except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
-            logging.exception("처리 실패: %s", image_path)
+            logging.exception("처리 실패: %s", input_path)
             exit_code = 1
-            (out_dir / f"{stem}.error.txt").write_text(
+            (out_dir / f"{Path(input_path).stem}.error.txt").write_text(
                 f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
             )
             continue
 
-        # 박스 표시 이미지와 위치 JSON 을 함께 저장한다.
-        # 전처리 이미지는 result 가 들고 있으므로 재처리하지 않는다.
-        written = save_result(
-            result,
-            out_dir,
-            stem=stem,
-            write_image=config.output.write_image,
-            include_ocr=config.output.include_ocr,
-            font_path=config.output.font_path,
-            show_ocr_boxes=config.output.show_ocr_boxes,
-        )
-
-        print()
-        print(format_summary(result, written))
+        for result in results:
+            if any(w.startswith("처리 실패") for w in result.warnings):
+                exit_code = 1
+            print()
+            print(format_summary(result, written_paths(out_dir, result)))
 
     return exit_code
 

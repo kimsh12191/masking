@@ -276,6 +276,129 @@ class TestFailureHandling:
         assert results[2].regions  # 실패 후에도 계속 처리된다
 
 
+class TestPdfInput:
+    """PDF 1개 -> 페이지별 결과. 렌더링은 실제 pypdfium2 를 쓴다."""
+
+    @pytest.fixture
+    def pdf_wired(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        pytest.importorskip("pypdfium2")
+        pytest.importorskip("PIL")
+        pytest.importorskip("numpy")
+        from PIL import Image
+
+        boxes = fake_boxes()
+
+        def fake_preprocess_array(img: Any, **kwargs: Any) -> PreprocessResult:
+            h, w = img.shape[:2]
+            return PreprocessResult(image=img, width=w, height=h, applied=["fake"])
+
+        monkeypatch.setattr(pipeline_mod, "preprocess_array", fake_preprocess_array)
+
+        pages = [Image.new("RGB", (620, 877), (255, 255 - 20 * i, 255)) for i in range(3)]
+        pdf_path = tmp_path / "계약서.pdf"
+        pages[0].save(pdf_path, save_all=True, append_images=pages[1:], resolution=150)
+
+        def build(**cfg: Any):
+            pipe = PiiPipeline(PipelineConfig(**cfg))
+            pipe.ocr = FakeOcr(boxes)                    # type: ignore[assignment]
+            pipe.llm = FakeLlm(PASS1_OK, {"missed": []})  # type: ignore[assignment]
+            return pipe, pdf_path
+
+        return build
+
+    def test_one_result_per_page(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path))
+        assert [r.page_no for r in results] == [1, 2, 3]
+
+    def test_each_page_is_processed(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path))
+        assert all(r.regions for r in results)
+
+    def test_image_path_stays_the_pdf(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path))
+        assert all(r.image_path == str(pdf_path) for r in results)
+
+    def test_page_range(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path), pages="2-3")
+        assert [r.page_no for r in results] == [2, 3]
+
+    def test_render_info_recorded_in_warnings(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path))
+        assert any("PDF 렌더링" in w for w in results[0].warnings)
+
+    def test_saves_per_page_files(self, pdf_wired, tmp_path) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        out = tmp_path / "out"
+        pipe.run_pdf(str(pdf_path), out_dir=str(out))
+
+        names = sorted(p.name for p in out.iterdir())
+        assert names == [
+            "계약서_p001.boxes.png", "계약서_p001.json",
+            "계약서_p002.boxes.png", "계약서_p002.json",
+            "계약서_p003.boxes.png", "계약서_p003.json",
+        ]
+
+    def test_saving_releases_images(self, pdf_wired, tmp_path) -> None:
+        """페이지가 많은 문서에서 메모리가 터지지 않아야 한다."""
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_pdf(str(pdf_path), out_dir=str(tmp_path / "out"))
+        assert all(r.image is None for r in results)
+
+    def test_json_records_page_number(self, pdf_wired, tmp_path) -> None:
+        import json
+
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        out = tmp_path / "out"
+        pipe.run_pdf(str(pdf_path), out_dir=str(out))
+        data = json.loads((out / "계약서_p002.json").read_text(encoding="utf-8"))
+        assert data["page_no"] == 2
+
+    def test_run_any_dispatches_pdf(self, pdf_wired) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        assert len(pipe.run_any(str(pdf_path))) == 3
+
+    def test_run_any_dispatches_image(self, pdf_wired, monkeypatch) -> None:
+        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
+            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
+
+        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
+        pipe, _ = pdf_wired(enable_pass2=False)
+        results = pipe.run_any("page.png")
+        assert len(results) == 1
+        assert results[0].page_no is None
+
+    def test_run_batch_mixes_images_and_pdfs(self, pdf_wired, monkeypatch) -> None:
+        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
+            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
+
+        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        results = pipe.run_batch(["a.png", str(pdf_path)])
+        # 이미지 1장 + PDF 3페이지 = 4개. 입력 개수와 다르다.
+        assert len(results) == 4
+        assert [r.page_no for r in results] == [None, 1, 2, 3]
+
+    def test_unopenable_pdf_raises(self, pdf_wired, tmp_path) -> None:
+        pipe, _ = pdf_wired(enable_pass2=False)
+        bad = tmp_path / "broken.pdf"
+        bad.write_bytes(b"garbage")
+        with pytest.raises(RuntimeError, match="열 수 없습니다"):
+            pipe.run_pdf(str(bad))
+
+    def test_batch_survives_unopenable_pdf(self, pdf_wired, tmp_path) -> None:
+        pipe, pdf_path = pdf_wired(enable_pass2=False)
+        bad = tmp_path / "broken.pdf"
+        bad.write_bytes(b"garbage")
+        results = pipe.run_batch([str(bad), str(pdf_path)])
+        assert any("처리 실패" in w for r in results for w in r.warnings)
+        assert sum(1 for r in results if r.regions) == 3
+
+
 class TestOutputContract:
     def test_json_roundtrip(self, wired) -> None:
         import json
