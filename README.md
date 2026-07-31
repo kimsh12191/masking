@@ -36,7 +36,7 @@ pip install pytest Pillow PyYAML numpy pypdfium2
 python -m pytest
 ```
 
-→ **592건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·설정 로딩·
+→ **610건 통과**하면 체크섬·정규식·읽기순서 정렬·병합 검증·프롬프트·설정 로딩·
 라벨 스키마·PDF 페이지 분해·파이프라인 배선이 모두 정상이다.
 
 설정만 확인해보려면:
@@ -151,8 +151,15 @@ python scripts/run.py data/synth/*.png -o out_full/
 ```
 
 ②에서 손글씨·도장 항목이 주황색으로 잡히면 이미지 pass 가 값을 하는 것이다.
-합성 데이터 정답의 `difficulty` 필드(`handwriting` / `stamp_overlap` / `signature`)로
-난이도별 recall 을 분리해 측정하면 된다.
+합성 데이터 정답의 `difficulty` 필드로 난이도별 recall 을 분리해 측정하면 된다.
+
+| `difficulty` | 무엇을 검증하나 |
+|---|---|
+| `handwriting` | OCR rec 실패 → 이미지 pass 회수 |
+| `stamp_overlap` | 도장에 가린 글자 |
+| `signature` | 자필 서명 (OCR 박스가 없을 수도 있다) |
+| `inline_label` | `담당자: 조민석` — 라벨과 값이 **한 박스**. 실제 문서에 흔하다 |
+| `unlabeled_value` | 라벨 없는 `(1978-04-15)` — 형태와 문맥으로만 판단 |
 
 실측 소요시간은 결과 JSON 의 `timings` 에 단계별로 기록된다.
 

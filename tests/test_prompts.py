@@ -104,6 +104,28 @@ class TestSystemPrompts:
     def test_pass1_forbids_coordinate_guessing(self) -> None:
         assert "좌표를 추측하지 마라" in SYSTEM_PASS1
 
+    def test_pass1_covers_label_and_value_in_one_box(self) -> None:
+        """실제 문서는 "담당자: 조민석" 처럼 라벨과 값이 한 박스에 섞여 있다.
+
+        박스 단위로만 답할 수 있다는 제약을 알려주지 않으면 모델이 그 박스를
+        건너뛴다 (라벨은 제외하라는 지시와 충돌하기 때문).
+        """
+        assert "박스 단위로만 답할 수 있다" in SYSTEM_PASS1
+        assert "담당자: 조민석" in SYSTEM_PASS1
+        assert "그 박스를 포함" in SYSTEM_PASS1
+
+    def test_pass1_excludes_label_only_boxes(self) -> None:
+        assert "라벨만 있고 값이 없는 박스" in SYSTEM_PASS1
+
+    def test_pass1_handles_unlabeled_values(self) -> None:
+        """라벨 없는 값(괄호 안 생년월일 등)도 형태로 판단해야 한다."""
+        assert "라벨이 없어도" in SYSTEM_PASS1
+        assert "1978-04-15" in SYSTEM_PASS1
+
+    def test_pass2_also_states_box_unit_constraint(self) -> None:
+        assert "박스 단위로만 답할 수 있다" in SYSTEM_PASS2
+        assert "라벨이 없어도" in SYSTEM_PASS2
+
     def test_pass2_prefers_idx_over_bbox(self) -> None:
         assert "idx" in SYSTEM_PASS2 and "bbox_norm" in SYSTEM_PASS2
         assert "하나만" in SYSTEM_PASS2

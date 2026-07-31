@@ -137,3 +137,45 @@ class TestRuleLayerFindsGeneratedValues:
     def test_passport_detected(self, seed: int) -> None:
         boxes = self._boxes([["여권번호", gen_passport(random.Random(seed))]])
         assert any(h.label == "PASSPORT" for h in detect(boxes))
+
+
+class TestDifficultyCoverage:
+    """합성 문서가 실제 문서의 어려운 형태를 실제로 담고 있는지 확인한다.
+
+    이 커버리지가 없어서 "담당자: 조민석" 처럼 라벨과 값이 한 박스에 섞인
+    케이스를 프롬프트가 놓치는 결함을 잡지 못했다.
+    """
+
+    def _truth(self, tmp_path):
+        from make_synthetic import find_font, make_page
+
+        pytest.importorskip("PIL")
+        _, truth = make_page(random.Random(7), find_font(), 1)
+        return truth
+
+    def test_has_inline_label_cases(self, tmp_path) -> None:
+        kinds = [t.get("difficulty") for t in self._truth(tmp_path)]
+        assert kinds.count("inline_label") >= 2
+
+    def test_has_unlabeled_value_case(self, tmp_path) -> None:
+        kinds = [t.get("difficulty") for t in self._truth(tmp_path)]
+        assert "unlabeled_value" in kinds
+
+    def test_keeps_ocr_failure_cases(self, tmp_path) -> None:
+        kinds = [t.get("difficulty") for t in self._truth(tmp_path)]
+        for kind in ("handwriting", "stamp_overlap", "signature"):
+            assert kind in kinds
+
+    def test_inline_label_text_excludes_the_label(self, tmp_path) -> None:
+        """text 는 개인정보 값만 담는다 (bbox 는 라벨을 포함한 박스 전체)."""
+        for t in self._truth(tmp_path):
+            if t.get("difficulty") == "inline_label" and t["text"]:
+                assert "담당자" not in str(t["text"])
+                assert "신청인" not in str(t["text"])
+                assert "전화" not in str(t["text"])
+
+    def test_every_truth_entry_has_a_known_label(self, tmp_path) -> None:
+        from pii_pipeline.schema import PII_LABELS
+
+        for t in self._truth(tmp_path):
+            assert t["type"] in PII_LABELS

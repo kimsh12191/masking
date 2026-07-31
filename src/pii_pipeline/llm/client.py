@@ -129,10 +129,17 @@ class LlmClient:
         """
         content: Any = user
         if image is not None:
-            content = [
-                {"type": "text", "text": user},
-                {"type": "image_url", "image_url": {"url": self.encode_image(image)}},
-            ]
+            # 인코딩 실패도 예외로 던지지 않는다. 이 함수가 예외를 던지면
+            # 이미 계산된 규칙 레이어 결과까지 함께 날아간다.
+            try:
+                content = [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": self.encode_image(image)}},
+                ]
+            except Exception as exc:  # noqa: BLE001 - 페이지 전체를 잃지 않는다
+                error = f"이미지 인코딩 실패: {type(exc).__name__}: {exc}"
+                log.warning("%s", error)
+                return {}, {"error": error, "attempt": 0}
 
         messages = [
             {"role": "system", "content": system},

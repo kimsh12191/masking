@@ -10,6 +10,8 @@
 * 도장/인영 (반투명 빨간 원) — 글자를 가린다
 * 저대비 작은 글씨 — LOW_CONF 를 유발한다
 * 다단 컬럼 — 읽기 순서 정렬을 검증한다
+* **인라인 라벨** ("담당자: 조민석") — 라벨과 값이 한 OCR 박스에 섞인 형태.
+  실제 문서에 흔하지만 라벨/값이 분리된 서식만 만들면 이 케이스를 놓친다.
 
 사용 예:
 
@@ -59,6 +61,9 @@ DEPTS = ["리스크관리부", "여신심사팀", "IT개발본부", "자금운�
 BANKS = ["하나은행", "국민은행", "신한은행", "우리은행", "농협은행"]
 TITLES = ["과장", "차장", "부장", "팀장", "대리", "사원"]
 PRODUCTS = ["신용대출", "주택담보대출", "전세자금대출", "사업자대출"]
+#: 실제 유선 지역번호
+AREA_CODES = ["02", "031", "032", "033", "041", "042", "043", "051",
+              "052", "053", "054", "055", "061", "062", "063", "064"]
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +292,51 @@ def make_page(
             "difficulty": "signature",
         }
     )
+
+    # 증명문 블록 — 라벨과 값이 **한 줄(= 한 OCR 박스)** 에 섞인 형태.
+    # 실제 행정/금융 문서에 흔하다. 라벨/값이 분리된 서식만 만들면
+    # "담당자: 조민석" 같은 박스를 프롬프트가 건너뛰는 결함을 못 잡는다.
+    y += 60
+    draw.line((left_x, y, PAGE_W - 130, y), fill=(190, 190, 190), width=1)
+    y += 30
+    put(left_x, y, "위 기재사항은 원본 내용과 틀림없음을 증명합니다.", f_small,
+        fill=(90, 90, 90))
+    y += 50
+
+    staff = rng.choice(SURNAMES) + rng.choice(GIVEN)
+    inline_bbox = put(left_x, y, f"담당자: {staff}", f_value)
+    truth.append({
+        "type": "NAME", "bbox": list(inline_bbox), "text": staff,
+        "difficulty": "inline_label",
+        "note": "라벨과 값이 한 박스. 박스 전체가 정답 영역이다.",
+    })
+    tel = f"{rng.choice(AREA_CODES)}-{rng.randint(100, 999)}-{rng.randint(1000, 9999)}"
+    tel_bbox = put(left_x + 430, y, f"전화: {tel}", f_value)
+    truth.append({
+        "type": "PHONE", "bbox": list(tel_bbox), "text": tel,
+        "difficulty": "inline_label",
+        "note": "라벨과 값이 한 박스. 규칙 레이어가 값을 잡지만 bbox 는 박스 전체다.",
+    })
+    y += 56
+
+    applicant = rng.choice(SURNAMES) + rng.choice(GIVEN)
+    inline_bbox = put(left_x, y, f"신청인: {applicant}", f_value)
+    truth.append({
+        "type": "NAME", "bbox": list(inline_bbox), "text": applicant,
+        "difficulty": "inline_label",
+        "note": "라벨과 값이 한 박스. 박스 전체가 정답 영역이다.",
+    })
+    # 라벨 없는 생년월일 — 형태와 주변 문맥으로만 판단해야 한다
+    birth_bbox = put(left_x + 430, y,
+                     f"(19{rng.randint(60, 99)}-{rng.randint(1, 12):02d}-"
+                     f"{rng.randint(1, 28):02d})", f_value)
+    truth.append({
+        "type": "BIRTH", "bbox": list(birth_bbox), "text": None,
+        "difficulty": "unlabeled_value",
+        "note": "라벨이 없다. 옆의 사람 이름을 보고 생년월일로 판단해야 한다.",
+    })
+    y += 56
+    put(left_x, y, "용도 및 목적:", f_value, fill=(70, 70, 70))  # 라벨만 — 개인정보 아님
 
     put(130, PAGE_H - 150, f"문서번호 SYN-{page_no:04d} / 본 문서는 검증용 합성 데이터입니다.",
         f_small, fill=(120, 120, 120))
