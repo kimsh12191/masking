@@ -82,6 +82,49 @@ class TestDrawOverlay:
         result.regions[0].bbox = (0, 0, 120, 20)
         draw_overlay(blank_image(), result)
 
+    def test_label_never_covers_box_interior(self) -> None:
+        """라벨 배지가 박스 안을 덮으면 내용을 검수할 수 없다.
+
+        박스 내부(테두리 안쪽)는 원본 픽셀이 그대로 남아 있어야 한다.
+        """
+        from PIL import Image
+
+        src = Image.new("RGB", (PAGE_W, PAGE_H), (255, 255, 255))
+        result = sample_result()
+        result.regions = [result.regions[0]]
+        result.regions[0].bbox = (100, 200, 400, 260)
+        out = draw_overlay(src, result, line_width=3)
+
+        x1, y1, x2, y2 = result.regions[0].bbox
+        inset = 6  # 테두리 두께보다 넉넉히 안쪽
+        for y in range(y1 + inset, y2 - inset):
+            for x in range(x1 + inset, x2 - inset):
+                assert out.getpixel((x, y)) == (255, 255, 255), (
+                    f"({x},{y}) 가 덮였습니다 — 라벨이 박스 내부를 침범했습니다"
+                )
+
+    def test_label_falls_below_when_no_room_above(self) -> None:
+        """위쪽에 자리가 없으면 라벨을 아래로 내려야 한다 (내부를 덮지 않도록)."""
+        from PIL import Image
+
+        src = Image.new("RGB", (PAGE_W, PAGE_H), (255, 255, 255))
+        result = sample_result()
+        result.regions = [result.regions[0]]
+        result.regions[0].bbox = (100, 0, 400, 60)   # y1 == 0 → 위쪽 여백 없음
+        out = draw_overlay(src, result, line_width=3)
+
+        # 박스 아래쪽에 배지 색이 나타나야 한다
+        color = SOURCE_COLORS[result.regions[0].source]
+        below = [out.getpixel((105, y)) for y in range(61, 100)]
+        assert color in below
+
+    def test_wide_label_does_not_overflow_canvas(self) -> None:
+        result = sample_result()
+        result.regions = [result.regions[0]]
+        result.regions[0].bbox = (PAGE_W - 20, 100, PAGE_W - 5, 130)
+        out = draw_overlay(blank_image(), result)
+        assert out.size == (PAGE_W, PAGE_H)
+
     def test_no_regions(self) -> None:
         result = sample_result()
         result.regions = []

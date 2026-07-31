@@ -171,6 +171,16 @@ class PageResult:
     raw_llm: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
+    #: 전처리된 페이지 이미지 (BGR numpy). 박스 오버레이를 그릴 때만 쓴다.
+    #: **직렬화되지 않으며 일시적이다.** 결과 좌표는 이 이미지 기준이므로
+    #: 오버레이를 다시 그리려면 같은 전처리 설정으로 재처리해야 한다.
+    #: 배치 처리 시 메모리를 잡아먹으므로 저장 후 ``release_image()`` 로 해제한다.
+    image: Any = field(default=None, repr=False, compare=False)
+
+    def release_image(self) -> None:
+        """전처리 이미지 참조를 해제한다 (배치 처리 메모리 관리용)."""
+        self.image = None
+
     def to_dict(self, include_ocr: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
             "image_path": self.image_path,

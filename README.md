@@ -1,11 +1,16 @@
 # 개인정보 영역 탐지 파이프라인
 
-금융 문서 이미지에서 **개인정보 영역의 좌표와 유형**을 찾아 JSON 으로 반환한다.
+금융 문서 이미지에서 **개인정보 영역의 좌표와 유형**을 찾는다.
 마스킹/치환은 이 출력을 받는 별도 모듈에서 한다.
 
 ```
-입력: 이미지 1장  →  출력: [{"bbox": [412,780,690,812], "type": "RRN"}, ...]
+입력                출력 (페이지당 2개)
+────────────  →  ─────────────────────────────────────────────
+문서 이미지        {이름}.boxes.png   박스 영역이 표시된 이미지
+                  {이름}.json        박스 위치 + 개인정보 유형
 ```
+
+두 파일의 좌표계는 같다. `boxes.png` 위의 박스와 `json` 의 `bbox` 가 1:1로 대응한다.
 
 구성: `PaddleOCR` + `Qwen3.5-9B` (A100 80GB 1장, 1페이지 5~8초 예상)
 
@@ -87,11 +92,17 @@ vllm serve Qwen/Qwen3.5-9B \
 ### 실행
 
 ```bash
-# 처리 + 검수 이미지 생성
-python scripts/run.py data/synth/*.png -o out/ --overlay --show-ocr-boxes
+python scripts/run.py data/synth/*.png -o out/
 ```
 
-`out/synth_001.overlay.png` 를 열어 **좌표가 맞는지 눈으로 확인**하는 게 가장 빠르다.
+```
+out/
+├── synth_001.boxes.png    ← 박스 표시 이미지
+└── synth_001.json         ← 박스 위치 + 유형
+```
+
+`boxes.png` 를 열어 **좌표가 맞는지 눈으로 확인**하는 게 가장 빠르다.
+라벨은 박스 **바깥**에 붙으므로 안의 내용을 가리지 않는다.
 
 | 색 | 의미 |
 |---|---|
@@ -110,7 +121,7 @@ python scripts/run.py data/synth/*.png -o out/ --overlay --show-ocr-boxes
 python scripts/run.py data/synth/*.png -o out_base/ --no-pass2
 
 # ② 이미지 pass 켜고 — 회수량 비교
-python scripts/run.py data/synth/*.png -o out_full/ --overlay
+python scripts/run.py data/synth/*.png -o out_full/
 ```
 
 ②에서 손글씨·도장 항목이 주황색으로 잡히면 이미지 pass 가 값을 하는 것이다.
@@ -129,26 +140,40 @@ python scripts/run.py --help
 
 | 옵션 | 용도 |
 |---|---|
+| `--no-image` | 박스 표시 이미지 생략, JSON 만 저장 |
+| `--font` | 한글 폰트 경로 (없어도 라벨은 ASCII 라 표시됨) |
+| `--show-ocr-boxes` | OCR 박스 전체를 회색으로 표시 (디버깅) |
 | `--no-pass2` | 이미지 pass 끄기 (베이스라인) |
 | `--pass2-blind` | 1차 결과를 감추고 독립 판단 (앵커링 편향 비교) |
-| `--include-ocr` | 결과 JSON 에 OCR 박스 + LLM 원시응답 포함 (디버깅) |
+| `--include-ocr` | JSON 에 OCR 박스 + LLM 원시응답 포함 (디버깅) |
 | `--image-max-side` | pass2 이미지 크기. **1500 이상 유지** (작으면 작은 글씨를 못 읽음) |
 | `--cpu` | OCR 을 CPU 로 |
 
 라이브러리로:
 
 ```python
-from pii_pipeline import PiiPipeline, PipelineConfig
+from pii_pipeline import PiiPipeline, PipelineConfig, save_result
 
 pipeline = PiiPipeline(PipelineConfig())     # 배치 처리 시 인스턴스는 하나만
+
 result = pipeline.run("document.png")
+save_result(result, "out/")                  # boxes.png + json 저장
+
 for r in result.regions:
     print(r.type, r.bbox, r.source.value, r.confidence)
+```
+
+여러 장을 한 번에 (한 장씩 즉시 저장하고 이미지 메모리를 해제한다):
+
+```python
+pipeline.run_batch(["a.png", "b.png"], out_dir="out/")
 ```
 
 ---
 
 ## 5. 출력 형식
+
+`{이름}.json`:
 
 ```json
 {

@@ -68,7 +68,7 @@ def draw_overlay(
 
     canvas = image.convert("RGB").copy()
     draw = ImageDraw.Draw(canvas)
-    font = _load_font(font_path, size=max(12, canvas.height // 90))
+    font = _load_font(font_path, size=max(11, canvas.height // 130))
 
     if show_ocr_boxes:
         for box in result.ocr_boxes:
@@ -84,7 +84,7 @@ def draw_overlay(
         color = SOURCE_COLORS.get(region.source, (128, 128, 128))
         x1, y1, x2, y2 = region.bbox
 
-        # coarse 영역은 점선 느낌으로 구분 (두껍게 + 내부 보조선)
+        # coarse 영역은 두껍게 + 내부 보조선으로 구분
         draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
         if region.coarse:
             draw.rectangle((x1 + 3, y1 + 3, x2 - 3, y2 - 3), outline=color, width=1)
@@ -93,13 +93,51 @@ def draw_overlay(
         if region.needs_review:
             label += " !"
 
-        bbox_txt = draw.textbbox((0, 0), label, font=font)
-        tw, th = bbox_txt[2] - bbox_txt[0], bbox_txt[3] - bbox_txt[1]
-        ty = max(0, y1 - th - 4)
-        draw.rectangle((x1, ty, x1 + tw + 6, ty + th + 4), fill=color)
-        draw.text((x1 + 3, ty + 2), label, fill=(255, 255, 255), font=font)
+        _draw_label(draw, label, (x1, y1, x2, y2), color, font, canvas.size)
 
     return canvas
+
+
+def _draw_label(
+    draw: Any,
+    text: str,
+    bbox: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    font: Any,
+    canvas_size: tuple[int, int],
+    pad: int = 3,
+) -> None:
+    """라벨 배지를 박스 **바깥**에 그린다.
+
+    박스 내용을 가리면 검수를 할 수 없으므로 위쪽 여백에 붙이고, 위에 자리가
+    없으면 아래쪽으로 넘긴다.
+
+    잉크 bbox 의 오프셋(``ink[0]``, ``ink[1]``)을 빼서 글자를 배지 안에 정확히
+    맞춘다. ``draw.text()`` 의 원점은 잉크 좌상단이 아니므로 이 보정을 빼면
+    글자가 배지 밖으로 흘러 박스 내용을 덮는다.
+    """
+    x1, y1, x2, y2 = bbox
+    page_w, page_h = canvas_size
+
+    ink = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = ink[2] - ink[0], ink[3] - ink[1]
+    badge_w, badge_h = text_w + pad * 2, text_h + pad * 2
+
+    # 위쪽 우선, 자리가 없으면 아래쪽
+    badge_y = y1 - badge_h if y1 - badge_h >= 0 else min(y2, page_h - badge_h)
+    badge_y = max(0, badge_y)
+
+    badge_x = min(x1, max(0, page_w - badge_w))
+
+    draw.rectangle(
+        (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h), fill=color
+    )
+    draw.text(
+        (badge_x + pad - ink[0], badge_y + pad - ink[1]),
+        text,
+        fill=(255, 255, 255),
+        font=font,
+    )
 
 
 def legend_text() -> str:

@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """파이프라인 실행 CLI.
 
+이미지를 입력하면 페이지당 두 파일을 남긴다.
+
+    {이름}.boxes.png   박스 영역이 표시된 이미지
+    {이름}.json        박스 위치 + 개인정보 유형
+
 사용 예:
 
-    # 1장 처리 + 시각화 검수 이미지 생성
-    python scripts/run.py sample.png -o out/ --overlay
+    # 1장 처리 (이미지 + JSON 둘 다 저장)
+    python scripts/run.py sample.png -o out/
 
     # 디렉터리 일괄 처리
     python scripts/run.py data/*.png -o out/
+
+    # JSON 만 (이미지 저장 생략)
+    python scripts/run.py sample.png -o out/ --no-image
 
     # 텍스트 pass 만 (이미지 pass 끄고 베이스라인 측정)
     python scripts/run.py sample.png -o out/ --no-pass2
@@ -19,7 +27,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -29,20 +36,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pii_pipeline import PiiPipeline, PipelineConfig  # noqa: E402
 from pii_pipeline.llm.client import LlmConfig  # noqa: E402
 from pii_pipeline.ocr.paddle_runner import OcrConfig  # noqa: E402
-from pii_pipeline.viz import draw_overlay, legend_text  # noqa: E402
+from pii_pipeline.output import format_summary, save_result  # noqa: E402
+from pii_pipeline.viz import legend_text  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="금융 문서 개인정보 영역 탐지",
+        description="금융 문서 개인정보 영역 탐지 — 박스 표시 이미지 + 위치 JSON 을 저장한다",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=legend_text(),
     )
     p.add_argument("images", nargs="+", help="입력 이미지 경로")
     p.add_argument("-o", "--out", default="out", help="출력 디렉터리 (기본: out)")
-    p.add_argument("--overlay", action="store_true", help="시각화 검수 이미지 생성")
-    p.add_argument("--font", default=None, help="오버레이용 한글 폰트 경로")
-    p.add_argument("--show-ocr-boxes", action="store_true", help="OCR 박스 전체 표시")
+
+    g = p.add_argument_group("출력")
+    g.add_argument("--no-image", action="store_true",
+                   help="박스 표시 이미지를 저장하지 않고 JSON 만 남긴다")
+    g.add_argument("--font", default=None,
+                   help="한글 폰트 경로 (없어도 라벨은 ASCII 로 표시된다)")
+    g.add_argument("--show-ocr-boxes", action="store_true",
+                   help="OCR 박스 전체를 회색으로 함께 표시 (디버깅)")
+    g.add_argument("--include-ocr", action="store_true",
+                   help="JSON 에 OCR 박스와 LLM 원시응답 포함 (디버깅)")
 
     g = p.add_argument_group("파이프라인")
     g.add_argument("--no-pass2", action="store_true", help="이미지 검수 pass 끄기")
@@ -62,8 +77,6 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--image-max-side", type=int, default=1800,
                    help="pass2 이미지 긴 변 길이. 너무 줄이면 작은 글씨를 못 읽는다")
 
-    p.add_argument("--include-ocr", action="store_true",
-                   help="결과 JSON 에 OCR 박스와 LLM 원시응답 포함 (디버깅)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -120,40 +133,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
 
-        json_path = out_dir / f"{stem}.json"
-        json_path.write_text(
-            result.to_json(include_ocr=args.include_ocr), encoding="utf-8"
+        # 박스 표시 이미지와 위치 JSON 을 함께 저장한다.
+        # 전처리 이미지는 result 가 들고 있으므로 재처리하지 않는다.
+        written = save_result(
+            result,
+            out_dir,
+            stem=stem,
+            write_image=not args.no_image,
+            include_ocr=args.include_ocr,
+            font_path=args.font,
+            show_ocr_boxes=args.show_ocr_boxes,
         )
 
-        stats = result.stats()
-        timings = {k: round(v, 2) for k, v in result.timings.items()}
-        print(f"\n=== {image_path} ===")
-        print(f"  결과      {json_path}")
-        print(f"  OCR 박스  {stats['n_ocr_boxes']}")
-        print(f"  탐지 영역 {stats['n_regions']}  (검토필요 {stats['n_needs_review']})")
-        print(f"  출처별    {json.dumps(stats['by_source'], ensure_ascii=False)}")
-        print(f"  유형별    {json.dumps(stats['by_type'], ensure_ascii=False)}")
-        print(f"  소요시간  {json.dumps(timings)}")
-        for warning in result.warnings:
-            print(f"  ! {warning}")
-
-        if args.overlay:
-            from pii_pipeline.preprocess import preprocess
-
-            pre = preprocess(
-                image_path,
-                target_long_side=config.target_long_side,
-                deskew=config.deskew,
-            )
-            overlay = draw_overlay(
-                pre.image,
-                result,
-                font_path=args.font,
-                show_ocr_boxes=args.show_ocr_boxes,
-            )
-            overlay_path = out_dir / f"{stem}.overlay.png"
-            overlay.save(overlay_path)
-            print(f"  검수 이미지 {overlay_path}")
+        print()
+        print(format_summary(result, written))
 
     return exit_code
 

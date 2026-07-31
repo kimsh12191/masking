@@ -121,6 +121,7 @@ class PiiPipeline:
             timings=timings,
             warnings=warnings,
             raw_llm=raw_llm,
+            image=pre.image,  # 박스 오버레이 렌더링용. 직렬화 대상이 아니다.
         )
         if pre.applied:
             warnings.append("전처리 적용: " + ", ".join(pre.applied))
@@ -183,12 +184,29 @@ class PiiPipeline:
         )
         return result
 
-    def run_batch(self, image_paths: list[str]) -> list[PageResult]:
-        """여러 장을 순차 처리한다. 1장이 실패해도 나머지는 계속 처리한다."""
+    def run_batch(
+        self,
+        image_paths: list[str],
+        out_dir: str | None = None,
+        **save_kwargs: Any,
+    ) -> list[PageResult]:
+        """여러 장을 순차 처리한다. 1장이 실패해도 나머지는 계속 처리한다.
+
+        Args:
+            image_paths: 입력 이미지 경로 목록.
+            out_dir: 지정하면 한 장씩 즉시 저장하고 전처리 이미지를 해제한다.
+                생략하면 모든 결과가 이미지를 물고 있으므로 (장당 ~13MB)
+                많은 페이지를 처리할 때 메모리를 주의해야 한다.
+            **save_kwargs: ``save_result()`` 로 전달 (write_image, font_path 등).
+
+        Returns:
+            입력 순서와 같은 길이의 결과 목록. 실패한 페이지는 빈 결과 +
+            ``warnings`` 에 사유가 담긴다.
+        """
         results: list[PageResult] = []
         for path in image_paths:
             try:
-                results.append(self.run(path))
+                result = self.run(path)
             except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
                 log.exception("처리 실패: %s", path)
                 results.append(
@@ -199,4 +217,11 @@ class PiiPipeline:
                         warnings=[f"처리 실패: {type(exc).__name__}: {exc}"],
                     )
                 )
+                continue
+
+            if out_dir is not None:
+                from .output import save_result
+
+                save_result(result, out_dir, release=True, **save_kwargs)
+            results.append(result)
         return results
