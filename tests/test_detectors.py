@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from pii_pipeline.ocr.layout import assign_reading_order
 from pii_pipeline.rules.detectors import detect, is_field_label
 from pii_pipeline.schema import OcrBox, OcrStatus
@@ -134,6 +136,76 @@ class TestEmailDetection:
     def test_detects(self) -> None:
         boxes = make_boxes([["이메일", "hong.gildong@example.co.kr"]])
         assert "EMAIL" in labels(boxes)
+
+
+class TestIpDetection:
+    @pytest.mark.parametrize(
+        "value",
+        ["192.168.0.1", "10.0.0.255", "8.8.8.8", "0.0.0.0", "255.255.255.255"],
+    )
+    def test_detects_ipv4(self, value: str) -> None:
+        boxes = make_boxes([["접속IP", value]])
+        hits = [h for h in detect(boxes) if h.label == "IP"]
+        assert len(hits) == 1
+        assert hits[0].text == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "fe80::1",
+            "::1",
+            "fe80::",
+            "2001:db8::8a2e:370:7334",
+            "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        ],
+    )
+    def test_detects_ipv6(self, value: str) -> None:
+        boxes = make_boxes([["접속IP", value]])
+        hits = [h for h in detect(boxes) if h.label == "IP"]
+        assert len(hits) == 1
+        assert hits[0].text == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "256.1.1.1",      # 옥텟 범위 초과
+            "300.1.2.3",      # 옥텟 범위 초과
+            "1.2.3",          # 3옥텟
+            "192.168.0",      # 3옥텟
+            "1.2.3.4.5",      # 5옥텟
+        ],
+    )
+    def test_rejects_malformed_ipv4(self, value: str) -> None:
+        boxes = make_boxes([["접속IP", value]])
+        assert "IP" not in labels(boxes)
+
+    @pytest.mark.parametrize("value", ["12:34:56", "09:30", "23:59:59", "::"])
+    def test_rejects_time_like_strings(self, value: str) -> None:
+        """IPv6 그룹 수 하한을 낮추면 시각 표기를 IP 로 잡는다."""
+        boxes = make_boxes([["처리시각", value]])
+        assert "IP" not in labels(boxes)
+
+    def test_rejects_date(self) -> None:
+        boxes = make_boxes([["약정일자", "2022. 10. 06."]])
+        assert "IP" not in labels(boxes)
+
+    def test_ip_claims_span_before_numeric_patterns(self) -> None:
+        """구조 검증을 통과한 IP 는 다른 숫자 패턴에 구간을 빼앗기지 않아야 한다."""
+        boxes = make_boxes([["접속IP 192.168.100.200 기록"]])
+        hits = detect(boxes)
+        assert [h.label for h in hits] == ["IP"]
+        assert hits[0].text == "192.168.100.200"
+
+    def test_ip_and_email_in_one_box(self) -> None:
+        boxes = make_boxes([["a@b.com 에서 10.1.2.3 접속"]])
+        assert labels(boxes) == {"EMAIL", "IP"}
+
+    def test_checksum_flag_set_for_structural_validation(self) -> None:
+        """IP 는 체크섬이 없지만 옥텟 범위로 구조 검증이 되므로 확정 처리한다."""
+        boxes = make_boxes([["접속IP", "192.168.0.1"]])
+        hit = next(h for h in detect(boxes) if h.label == "IP")
+        assert hit.checksum_ok is True
+        assert hit.needs_review is False
 
 
 class TestPassportDetection:

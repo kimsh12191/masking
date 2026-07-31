@@ -16,19 +16,27 @@ from typing import Any
 # 라벨 스키마 (닫힌 집합)
 # --------------------------------------------------------------------------
 
+#: 탐지 대상 개인정보 라벨 (18종).
+#:
+#: 여기를 고치면 프롬프트와 guided-decoding 스키마가 자동으로 따라간다.
+#: 항목을 늘릴 때 정형 식별자라면 ``RULE_LABELS`` 에도 추가하고
+#: ``rules/detectors.py`` 에 패턴을 넣어야 한다.
 PII_LABELS: tuple[str, ...] = (
-    "NAME",            # 성명
+    # ── 핵심 9종 ────────────────────────────────────────────────
+    "NAME",            # 이름
     "RRN",             # 주민등록번호
-    "FOREIGN_ID",      # 외국인등록번호
-    "PASSPORT",        # 여권번호
-    "DRIVER_LICENSE",  # 운전면허번호
-    "BIZ_NO",          # 사업자등록번호
-    "CORP_NO",         # 법인등록번호
+    "ADDRESS",         # 주소
+    "EMAIL",           # 이메일
+    "IP",              # IP 주소
     "ACCOUNT_NO",      # 계좌번호
     "CARD_NO",         # 카드번호
     "PHONE",           # 전화번호
-    "EMAIL",           # 이메일
-    "ADDRESS",         # 주소
+    "PASSPORT",        # 여권번호
+    # ── 추가 9종 ────────────────────────────────────────────────
+    "FOREIGN_ID",      # 외국인등록번호
+    "DRIVER_LICENSE",  # 운전면허번호
+    "BIZ_NO",          # 사업자등록번호
+    "CORP_NO",         # 법인등록번호
     "BIRTH",           # 생년월일
     "ORG",             # 소속/직장명
     "TITLE",           # 직위/직책
@@ -36,8 +44,8 @@ PII_LABELS: tuple[str, ...] = (
     "OTHER",           # 위에 없는 개인식별정보
 )
 
-# 규칙 레이어(정규식+체크섬)로 확정 가능한 라벨.
-# LLM은 이 라벨들을 다시 판단하지 않는다.
+#: 규칙 레이어(정규식+체크섬)로 확정 가능한 라벨.
+#: LLM 은 이 라벨들을 다시 판단하지 않는다.
 RULE_LABELS: frozenset[str] = frozenset(
     {
         "RRN",
@@ -49,6 +57,7 @@ RULE_LABELS: frozenset[str] = frozenset(
         "CARD_NO",
         "PHONE",
         "EMAIL",
+        "IP",
         "ACCOUNT_NO",
     }
 )

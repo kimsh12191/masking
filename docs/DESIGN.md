@@ -162,16 +162,7 @@ OCR 은 주소를 2~4조각으로 쪼갠다. LLM 이 인덱스 **그룹**으로 
 단 `bbox` 는 항상 **박스 전체 영역**임에 유의 — OCR 이 문자 단위 좌표를
 주지 않으므로 글자수 비례 분할은 근사치다.
 
----
-
-## 라벨 스키마
-
-| 규칙 레이어가 확정 (체크섬/패턴) | LLM 이 판단 (문맥) |
-|---|---|
-| `RRN` `FOREIGN_ID` `PASSPORT` `DRIVER_LICENSE` `BIZ_NO` `CORP_NO` `ACCOUNT_NO` `CARD_NO` `PHONE` `EMAIL` | `NAME` `ADDRESS` `BIRTH` `ORG` `TITLE` `SIGNATURE` `OTHER` |
-
-`src/pii_pipeline/schema.py` 의 `PII_LABELS` / `RULE_LABELS` 에서 수정한다.
-프롬프트와 guided-decoding 스키마가 이 상수에서 자동 생성되므로 한 곳만 고치면 된다.
+라벨 18종의 목록과 규칙/LLM 담당 분리는 [`../README.md`](../README.md) 7번 절에 있다.
 
 ---
 

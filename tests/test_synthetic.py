@@ -19,6 +19,8 @@ from make_synthetic import (  # noqa: E402
     gen_biz_no,
     gen_card,
     gen_email,
+    gen_ip,
+    gen_passport,
     gen_phone,
     gen_rrn,
 )
@@ -69,6 +71,21 @@ class TestGeneratedFormats:
     def test_email_format(self) -> None:
         assert "@" in gen_email(random.Random(1), "user")
 
+    @pytest.mark.parametrize("seed", SEEDS)
+    def test_ip_is_private_range(self, seed: int) -> None:
+        """실제 공인 IP 를 만들지 않는다."""
+        import ipaddress
+
+        addr = ipaddress.ip_address(gen_ip(random.Random(seed)))
+        assert addr.is_private
+
+    @pytest.mark.parametrize("seed", SEEDS)
+    def test_passport_format(self, seed: int) -> None:
+        value = gen_passport(random.Random(seed))
+        assert len(value) == 9
+        assert value[0] in "MSR"
+        assert value[1:].isdigit()
+
 
 class TestRuleLayerFindsGeneratedValues:
     """합성 값이 규칙 레이어에 실제로 잡히는지 (엔드투엔드 연결 확인)."""
@@ -110,3 +127,13 @@ class TestRuleLayerFindsGeneratedValues:
     def test_account_detected_via_context_keyword(self) -> None:
         boxes = self._boxes([["입금계좌번호", f"하나은행 {gen_account(random.Random(3))}"]])
         assert any(h.label == "ACCOUNT_NO" for h in detect(boxes))
+
+    @pytest.mark.parametrize("seed", SEEDS[:10])
+    def test_ip_detected(self, seed: int) -> None:
+        boxes = self._boxes([["전자서명 접속IP", gen_ip(random.Random(seed))]])
+        assert any(h.label == "IP" for h in detect(boxes))
+
+    @pytest.mark.parametrize("seed", SEEDS[:10])
+    def test_passport_detected(self, seed: int) -> None:
+        boxes = self._boxes([["여권번호", gen_passport(random.Random(seed))]])
+        assert any(h.label == "PASSPORT" for h in detect(boxes))

@@ -106,6 +106,7 @@ def validate_luhn(value: str) -> bool:
 
 
 #: 라벨 -> 검증 함수. 검증 함수가 없는 라벨은 패턴만으로 확정한다.
+#: (EMAIL / IP / PHONE / PASSPORT / ACCOUNT_NO 는 표준 체크섬이 없다.)
 VALIDATORS = {
     "RRN": validate_rrn,
     "FOREIGN_ID": validate_foreign_id,

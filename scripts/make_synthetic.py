@@ -114,6 +114,20 @@ def gen_email(rng: random.Random, name_ascii: str) -> str:
     return f"{name_ascii}{rng.randint(1, 99)}@{domain}"
 
 
+def gen_ip(rng: random.Random) -> str:
+    """사설 IP 대역에서 생성한다 (실제 공인 IP 를 만들지 않기 위해)."""
+    kind = rng.choice(["10", "172", "192"])
+    if kind == "10":
+        return f"10.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+    if kind == "172":
+        return f"172.{rng.randint(16, 31)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+    return f"192.168.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+
+
+def gen_passport(rng: random.Random) -> str:
+    return f"{rng.choice('MSR')}{rng.randint(0, 99999999):08d}"
+
+
 # --------------------------------------------------------------------------
 # 렌더링
 # --------------------------------------------------------------------------
@@ -172,8 +186,10 @@ def make_page(
         ("직장명", f"{rng.choice(BANKS)} {rng.choice(DEPTS)}", "ORG"),
         ("직위", rng.choice(TITLES), "TITLE"),
         ("사업자등록번호", gen_biz_no(rng), "BIZ_NO"),
+        ("여권번호", gen_passport(rng), "PASSPORT"),
         ("결제카드번호", gen_card(rng), "CARD_NO"),
         ("입금계좌번호", f"{rng.choice(BANKS)} {gen_account(rng)}", "ACCOUNT_NO"),
+        ("전자서명 접속IP", gen_ip(rng), "IP"),
     ]
 
     for label_text, value, pii_type in rows:
