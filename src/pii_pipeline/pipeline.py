@@ -4,10 +4,15 @@
       ├─① 전처리          기울기 보정 / 해상도 정규화
       ├─② OCR             det 임계값↓, rec 실패 박스도 번호 부여해 유지
       ├─③ 규칙 레이어      정규식 + 체크섬으로 정형 식별자 확정
+      │                   (원문 + 회피 표기 정규형을 각각 스캔)
       ├─④ LLM pass-1      OCR 텍스트만. 문맥 항목 분류.
       ├─④' VLM pass-2     이미지 직접 확인. OCR 이 구조적으로 놓친 것 회수.
-      ├─⑤ 병합·검증        범위/중복/공간 검사, 제외 훅
-      └─⑥ 결과 JSON
+      ├─⑤ 값 전파          확정된 값과 같은 텍스트를 가진 나머지 박스 회수.
+      ├─⑥ 병합·검증        범위/중복/공간 검사, 제외 훅
+      └─⑦ 결과 JSON
+
+중복 차단은 ``ClaimLedger`` 로 **(박스, 라벨) 단위**로 한다. 박스 단위로 막으면
+``"홍길동 901231-1234567"`` 처럼 한 박스에 두 종류가 섞였을 때 뒤쪽이 사라진다.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from .llm.prompts import (
     build_pass2_user,
 )
 from .merge import (
+    claims_from_hits,
     confirmed_map,
     finalize,
     regions_from_pass1,
@@ -36,6 +42,7 @@ from .merge import (
 from .ocr.paddle_runner import OcrConfig, PaddleOcrRunner
 from .pdf import is_pdf, render_pages
 from .preprocess import preprocess, preprocess_array
+from .propagate import PropagateConfig, propagate_regions
 from .rules.detectors import detect as rule_detect
 from .schema import PASS1_SCHEMA, PASS2_SCHEMA, OcrBox, PageResult
 
@@ -55,6 +62,9 @@ class PipelineConfig:
         deskew: 기울기 보정 여부.
         ocr: OCR 설정.
         llm: LLM 설정.
+        propagate: 값 전파 설정. 한 곳에서 확정된 값과 같은 텍스트를 가진
+            나머지 박스를 회수한다. 같은 이름/번호가 문서에 여러 번 나오는데
+            일부만 탐지되는 상황을 메운다.
     """
 
     enable_pass2: bool = True
@@ -63,6 +73,7 @@ class PipelineConfig:
     deskew: bool = True
     ocr: OcrConfig = field(default_factory=OcrConfig.from_env)
     llm: LlmConfig = field(default_factory=LlmConfig)
+    propagate: PropagateConfig = field(default_factory=PropagateConfig)
 
 
 @contextmanager
@@ -153,7 +164,10 @@ class PiiPipeline:
             rule_regions = regions_from_rules(hits, boxes, page_w, page_h)
             confirmed = confirmed_map(hits)
 
-        claimed: set[int] = set(confirmed)
+        # (박스, 라벨) 단위 원장. 규칙이 RRN 을 확정한 박스라도 같은 박스의
+        # 이름은 아직 미확정이므로, LLM 이 그 박스를 NAME 으로 보고할 수 있어야
+        # 한다. 박스 단위로 막으면 부분 마스킹 구현 시 그대로 유출된다.
+        claimed = claims_from_hits(hits)
         regions = list(rule_regions)
 
         # ── ④ LLM pass-1 (텍스트) ─────────────────────────────────
@@ -180,7 +194,7 @@ class PiiPipeline:
                         page_w,
                         page_h,
                         confirmed=confirmed,
-                        detected_idx=sorted(claimed),
+                        detected_idx=sorted(claimed.indices()),
                         blind=cfg.pass2_blind,
                     ),
                     schema=PASS2_SCHEMA,
@@ -193,7 +207,23 @@ class PiiPipeline:
                     payload2, boxes, claimed, page_w, page_h, warnings
                 )
 
-        # ── ⑤ 병합·검증 ───────────────────────────────────────────
+        # ── ⑤ 값 전파 ─────────────────────────────────────────────
+        # 같은 값이 문서 여러 곳에 나오는데 일부만 탐지되는 것은 정상적으로
+        # 발생한다 (규칙은 박스 단위, pass-1 은 라벨 근처, pass-2 는 상위 몇 개).
+        # 한 곳에서 확정됐으면 나머지 위치도 같은 개인정보다.
+        with _timed(timings, "propagate"):
+            propagated = propagate_regions(
+                regions,
+                boxes,
+                page_w,
+                page_h,
+                claimed=claimed,
+                config=cfg.propagate,
+                warnings=warnings,
+            )
+            regions += propagated
+
+        # ── ⑥ 병합·검증 ───────────────────────────────────────────
         with _timed(timings, "merge"):
             result.regions = finalize(regions, boxes, warnings)
 

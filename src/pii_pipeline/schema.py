@@ -75,6 +75,7 @@ class Source(str, Enum):
     LLM_PASS1 = "llm_pass1"          # OCR 텍스트 기반 분류.
     VLM_PASS2 = "vlm_pass2"          # 이미지 검수 pass 에서 회수. OCR 박스 좌표 있음.
     VLM_GROUNDING = "vlm_grounding"  # OCR det 도 놓쳐 VLM 좌표를 그대로 쓴 경우. 좌표 부정확.
+    PROPAGATED = "propagated"        # 다른 박스에서 확정된 값과 같아서 전파된 경우.
 
 
 class OcrStatus(str, Enum):
@@ -124,6 +125,22 @@ class OcrBox:
         if page_w <= 0 or page_h <= 0:
             return (0.0, 0.0)
         return (round(self.bbox[0] / page_w, 3), round(self.bbox[1] / page_h, 3))
+
+    def norm_bbox(self, page_w: int, page_h: int) -> tuple[float, float, float, float]:
+        """프롬프트에 넣을 정규화 박스 전체 좌표 ``(x1,y1,x2,y2)``.
+
+        좌상단만 주면 모델이 박스의 **폭을 알 수 없어** 인접 여부를 판단할 수
+        없다 (긴 주소 박스의 오른쪽 끝이 어디인지 모른다). 그룹화 규칙을
+        지키게 하려면 범위를 줘야 한다.
+        """
+        if page_w <= 0 or page_h <= 0:
+            return (0.0, 0.0, 0.0, 0.0)
+        return (
+            round(self.bbox[0] / page_w, 3),
+            round(self.bbox[1] / page_h, 3),
+            round(self.bbox[2] / page_w, 3),
+            round(self.bbox[3] / page_h, 3),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -271,6 +288,12 @@ PASS1_SCHEMA: dict[str, Any] = {
 
 #: pass-2 (이미지 검수) 출력 스키마.
 #: ``idx`` 는 OCR 박스 번호. det 도 놓친 영역은 ``bbox_norm`` 으로 받는다.
+#:
+#: ``idx`` 와 ``bbox_norm`` 은 둘 다 optional 이다 — 항목마다 하나만 채우기
+#: 때문이다. 다만 **둘 다 비면 좌표를 알 수 없어 그 탐지는 버려진다**
+#: (``merge.regions_from_pass2``). JSON Schema 로 "정확히 하나"를 강제하려면
+#: ``anyOf`` 가 필요한데 guided-decoding 백엔드 지원이 불확실하므로,
+#: ``idx`` 에 ``minItems`` 를 걸어 빈 배열만 막고 나머지는 프롬프트로 지시한다.
 PASS2_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -283,6 +306,7 @@ PASS2_SCHEMA: dict[str, Any] = {
                     "idx": {
                         "type": "array",
                         "items": {"type": "integer", "minimum": 0},
+                        "minItems": 1,
                         "maxItems": 12,
                     },
                     "bbox_norm": {

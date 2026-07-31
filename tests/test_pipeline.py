@@ -184,7 +184,16 @@ class TestFullRun:
     def test_timings_recorded_for_every_stage(self, wired) -> None:
         pipe, _ = wired(PASS1_OK, PASS2_OK)
         result = pipe.run("fake.png")
-        for key in ("preprocess", "ocr", "rules", "llm_pass1", "llm_pass2", "merge", "total"):
+        for key in (
+            "preprocess",
+            "ocr",
+            "rules",
+            "llm_pass1",
+            "llm_pass2",
+            "propagate",
+            "merge",
+            "total",
+        ):
             assert key in result.timings
 
     def test_run_is_deterministic(self, wired) -> None:
@@ -213,6 +222,133 @@ class TestPass2Blind:
         pipe.run("fake.png")
         pass2_user = pipe.llm.calls[1]["user"]  # type: ignore[attr-defined]
         assert "이미 탐지된 박스 번호" not in pass2_user
+
+
+# --------------------------------------------------------------------------
+# 한 박스에 여러 종류가 섞이는 경우 + 값 전파
+# --------------------------------------------------------------------------
+
+
+def mixed_boxes() -> list[OcrBox]:
+    """같은 박스에 이름+주민번호가 섞이고, 같은 이름이 아래에 또 나오는 서식.
+
+    행 구성:
+      0: 성명 및 주민등록번호 | 홍길동 901231-1234563   <- 한 박스에 두 종류
+      1: 위 본인은 동의합니다  | 확인자 홍길동            <- 같은 이름 재등장
+      2: 담당자                | 하나은행 강남지점
+    """
+    rows = [
+        ["성명 및 주민등록번호", "홍길동 901231-1234563"],
+        ["위 본인은 동의합니다", "확인자 홍길동"],
+        ["담당자", "하나은행 강남지점"],
+    ]
+    boxes: list[OcrBox] = []
+    for r, row in enumerate(rows):
+        for c, text in enumerate(row):
+            x1 = 200 + c * 500
+            y1 = 300 + r * 90
+            boxes.append(
+                OcrBox(index=-1, bbox=(x1, y1, x1 + 480, y1 + 50), text=text, rec_conf=0.95)
+            )
+    return assign_reading_order(boxes)
+
+
+@pytest.fixture
+def wired_mixed(monkeypatch: pytest.MonkeyPatch):
+    boxes = mixed_boxes()
+
+    def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
+        return PreprocessResult(
+            image=object(), width=PAGE_W, height=PAGE_H, applied=["fake"]
+        )
+
+    monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
+
+    def build(pass1: dict[str, Any], pass2: dict[str, Any], **cfg: Any):
+        pipe = PiiPipeline(PipelineConfig(**cfg))
+        pipe.ocr = FakeOcr(boxes)          # type: ignore[assignment]
+        pipe.llm = FakeLlm(pass1, pass2)   # type: ignore[assignment]
+        return pipe, boxes
+
+    return build
+
+
+# 박스: 0 라벨 / 1 "홍길동 901231-1234563" / 2 문구 / 3 "확인자 홍길동" /
+#       4 "담당자" / 5 "하나은행 강남지점"
+MIXED_PASS1 = {"regions": [{"idx": [1], "type": "NAME", "conf": 0.9}]}
+MIXED_PASS2: dict[str, Any] = {"missed": []}
+
+
+class TestMixedLabelBox:
+    def test_rule_rrn_and_llm_name_coexist_in_one_box(self, wired_mixed) -> None:
+        """박스 단위로 차단하면 규칙이 RRN 을 확정한 순간 이름이 사라진다.
+
+        영역 bbox 는 어차피 박스 전체라 전부 마스킹하는 다운스트림은 무사하지만,
+        ``char_span`` 으로 부분 마스킹(``901231-1******``)을 구현하면 이름이
+        그대로 노출된다.
+        """
+        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
+        result = pipe.run("fake.png")
+
+        on_box1 = [r for r in result.regions if r.member_index == [1]]
+        types = {r.type for r in on_box1}
+        assert "RRN" in types, "규칙 레이어의 주민번호"
+        assert "NAME" in types, "같은 박스의 이름도 살아남아야 한다"
+
+    def test_confirmed_tag_still_shown_to_model(self, wired_mixed) -> None:
+        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
+        pipe.run("fake.png")
+        pass1_user = pipe.llm.calls[0]["user"]  # type: ignore[attr-defined]
+        assert "<CONFIRMED:RRN>" in pass1_user
+
+
+class TestValuePropagation:
+    def test_repeated_name_is_recovered_without_llm_reporting_it(
+        self, wired_mixed
+    ) -> None:
+        """pass1 은 박스 1 만 보고했다. 박스 3 의 같은 이름도 회수돼야 한다."""
+        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
+        result = pipe.run("fake.png")
+
+        propagated = [r for r in result.regions if r.source is Source.PROPAGATED]
+        assert [r.member_index for r in propagated] == [[3]]
+        assert propagated[0].type == "NAME"
+        assert "홍길동" in (propagated[0].reason or "")
+
+    def test_propagated_span_points_at_the_value_only(self, wired_mixed) -> None:
+        pipe, boxes = wired_mixed(MIXED_PASS1, MIXED_PASS2)
+        result = pipe.run("fake.png")
+        hit = next(r for r in result.regions if r.source is Source.PROPAGATED)
+        start, end = hit.char_span
+        assert boxes[3].text[start:end] == "홍길동"
+
+    def test_rrn_propagates_too(self, wired_mixed) -> None:
+        """규칙 레이어 값도 씨앗이 된다 (같은 번호가 다른 칸에 또 있으면)."""
+        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
+        result = pipe.run("fake.png")
+        # 이 서식에는 주민번호가 한 번만 나오므로 전파 대상이 없어야 한다
+        assert not [
+            r
+            for r in result.regions
+            if r.source is Source.PROPAGATED and r.type == "RRN"
+        ]
+
+    def test_institution_name_is_not_propagated(self, wired_mixed) -> None:
+        """ORG 는 기본 전파 제외 — 은행명이 서식 전체에 깔려 있다."""
+        pipe, _ = wired_mixed(
+            {"regions": [{"idx": [5], "type": "ORG", "conf": 0.8}]}, MIXED_PASS2
+        )
+        result = pipe.run("fake.png")
+        assert not [r for r in result.regions if r.source is Source.PROPAGATED]
+
+    def test_can_be_disabled(self, wired_mixed) -> None:
+        from pii_pipeline.propagate import PropagateConfig
+
+        pipe, _ = wired_mixed(
+            MIXED_PASS1, MIXED_PASS2, propagate=PropagateConfig(enabled=False)
+        )
+        result = pipe.run("fake.png")
+        assert not [r for r in result.regions if r.source is Source.PROPAGATED]
 
 
 class TestFailureHandling:

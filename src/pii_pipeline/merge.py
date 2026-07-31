@@ -6,19 +6,24 @@ LLM 출력을 그대로 신뢰하지 않는다. 다음을 모두 검사한다.
 검사                          처리
 ===========================  ==================================================
 범위 초과 idx                 폐기 + warning
-이미 확정된 박스 재출력       규칙 레이어 우선, LLM 것 폐기
-한 박스가 두 라벨에           conf 높은 쪽 채택
+같은 박스 + 같은 라벨 재출력  규칙 레이어 우선, LLM 것 폐기
+같은 박스 + 다른 라벨         **둘 다 채택** (한 박스에 여러 종류가 섞인 경우)
+같은 박스 집합 + 같은 라벨    conf 높은 쪽 채택
 그룹인데 공간적으로 멀다      행 간격으로 그룹 분해
 conf 낮음                     **폐기하지 않고** low_confidence 플래그
 ===========================  ==================================================
 
 ``text`` 는 LLM 출력이 아니라 **OCR 원문에서 재조립**한다. 이래야 텍스트 환각이
 구조적으로 불가능하다.
+
+중복 차단은 **박스 단위가 아니라 (박스, 라벨) 단위**다 (``ClaimLedger``).
+한 박스에 여러 종류가 섞이는 일이 흔하기 때문이다 — ``"홍길동 901231-1234567"``
+을 박스 단위로 차단하면 규칙 레이어가 RRN 을 확정한 순간 이름이 사라진다.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .exclusions import should_exclude
@@ -34,6 +39,86 @@ COARSE_PAD = 12
 
 #: 이 값 미만이면 low_confidence 플래그. 폐기하지는 않는다.
 LOW_CONF_THRESHOLD = 0.5
+
+#: 모든 라벨을 차단하는 와일드카드. 평문 ``set[int]`` 로 넘어온 입력에 쓴다.
+_ANY_LABEL = "*"
+
+
+# --------------------------------------------------------------------------
+# 중복 차단 원장
+# --------------------------------------------------------------------------
+
+
+class ClaimLedger:
+    """어떤 박스가 **어떤 라벨로** 이미 확정됐는지 추적한다.
+
+    박스 단위로 차단하면 한 박스에 섞인 두 번째 개인정보가 사라진다.
+    ``"홍길동 901231-1234567"`` 한 박스에서 규칙 레이어가 RRN 을 확정하면,
+    박스 단위 차단에서는 이름이 영원히 회수되지 않는다. 부분 마스킹
+    (``char_span`` 기반)을 구현한 다운스트림에서는 그대로 유출로 이어진다.
+
+    ``set[int]`` 를 그대로 넘기면 하위호환을 위해 **모든 라벨 차단**으로 본다.
+    """
+
+    def __init__(
+        self, initial: Mapping[int, str] | Iterable[int] | None = None
+    ) -> None:
+        self._by_box: dict[int, set[str]] = {}
+        if initial is None:
+            return
+        if isinstance(initial, Mapping):
+            for idx, label in initial.items():
+                # confirmed_map 은 "PHONE+EMAIL" 처럼 합쳐 놓는다
+                for part in str(label).split("+"):
+                    self.add(idx, part)
+        else:
+            for idx in initial:
+                self.add(idx, _ANY_LABEL)
+
+    def has(self, idx: int, label: str) -> bool:
+        """``idx`` 박스가 ``label`` 로 이미 확정됐는가."""
+        labels = self._by_box.get(idx)
+        if not labels:
+            return False
+        return _ANY_LABEL in labels or label in labels
+
+    def add(self, idx: int, label: str) -> None:
+        self._by_box.setdefault(idx, set()).add(label)
+
+    def add_all(self, indices: Iterable[int], label: str) -> None:
+        for idx in indices:
+            self.add(idx, label)
+
+    def labels(self, idx: int) -> set[str]:
+        return set(self._by_box.get(idx, ()))
+
+    def indices(self) -> set[int]:
+        """무엇이든 확정된 박스 번호. 프롬프트의 "이미 탐지된 번호" 용."""
+        return set(self._by_box)
+
+    def __contains__(self, idx: object) -> bool:
+        return idx in self._by_box
+
+    def __iter__(self) -> Iterable[int]:
+        return iter(sorted(self._by_box))
+
+    def __len__(self) -> int:
+        return len(self._by_box)
+
+
+def as_ledger(claimed: ClaimLedger | set[int] | None) -> ClaimLedger:
+    """평문 ``set`` 도 받아들인다 (기존 호출부/테스트 하위호환)."""
+    if isinstance(claimed, ClaimLedger):
+        return claimed
+    return ClaimLedger(claimed)
+
+
+def claims_from_hits(hits: list[RuleHit]) -> ClaimLedger:
+    """규칙 레이어 결과로 원장을 만든다. 라벨별로 차단된다."""
+    ledger = ClaimLedger()
+    for hit in hits:
+        ledger.add(hit.box_index, hit.label)
+    return ledger
 
 
 def _assemble_text(indices: Iterable[int], boxes: list[OcrBox]) -> str | None:
@@ -83,10 +168,22 @@ def regions_from_rules(
                 ocr_status=box.status,
                 needs_review=hit.needs_review,
                 low_confidence=not hit.checksum_ok,
-                reason="체크섬 통과" if hit.checksum_ok else "패턴 일치, 체크섬 미통과",
+                reason=_rule_reason(hit),
             )
         )
     return regions
+
+
+def _rule_reason(hit: RuleHit) -> str:
+    """규칙 탐지 근거 문구.
+
+    회피 표기를 접어서 잡았다면 그 사실을 남긴다 — 감사에서 "문서에는 뭐라고
+    적혀 있었나" 를 되짚을 수 있어야 하고, 검수 우선순위도 달라진다.
+    """
+    base = "체크섬 통과" if hit.checksum_ok else "패턴 일치, 체크섬 미통과"
+    if hit.normalized:
+        return f"{base} (회피 표기 정규화: '{hit.text}' -> '{hit.canonical}')"
+    return base
 
 
 def confirmed_map(hits: list[RuleHit]) -> dict[int, str]:
@@ -109,12 +206,19 @@ def confirmed_map(hits: list[RuleHit]) -> dict[int, str]:
 def regions_from_pass1(
     payload: dict[str, Any],
     boxes: list[OcrBox],
-    claimed: set[int],
+    claimed: ClaimLedger | set[int],
     page_w: int,
     page_h: int,
     warnings: list[str],
 ) -> list[PiiRegion]:
-    """텍스트 pass 출력을 영역으로 변환하고 검증한다."""
+    """텍스트 pass 출력을 영역으로 변환하고 검증한다.
+
+    Args:
+        claimed: 중복 차단 원장. ``ClaimLedger`` 면 **(박스, 라벨) 단위**로
+            차단하므로 이미 다른 라벨로 확정된 박스에도 새 라벨을 붙일 수 있다.
+            평문 ``set[int]`` 를 주면 박스 단위로 전부 차단한다.
+    """
+    ledger = as_ledger(claimed)
     regions: list[PiiRegion] = []
 
     for item in payload.get("regions", []) or []:
@@ -128,7 +232,9 @@ def regions_from_pass1(
         if out_of_range:
             warnings.append(f"pass1: 범위를 벗어난 박스 번호 폐기 {out_of_range} (type={label})")
 
-        usable = [i for i in raw_idx if 0 <= i < len(boxes) and i not in claimed]
+        usable = [
+            i for i in raw_idx if 0 <= i < len(boxes) and not ledger.has(i, label)
+        ]
         if not usable:
             continue
 
@@ -138,7 +244,11 @@ def regions_from_pass1(
                     group, label, conf, boxes, page_w, page_h, Source.LLM_PASS1, None
                 )
             )
-            claimed.update(group)
+            ledger.add_all(group, label)
+
+    if isinstance(claimed, set):
+        # 평문 set 을 넘긴 호출부는 in-place 갱신을 기대한다
+        claimed.update(ledger.indices())
 
     return regions
 
@@ -151,7 +261,7 @@ def regions_from_pass1(
 def regions_from_pass2(
     payload: dict[str, Any],
     boxes: list[OcrBox],
-    claimed: set[int],
+    claimed: ClaimLedger | set[int],
     page_w: int,
     page_h: int,
     warnings: list[str],
@@ -160,7 +270,11 @@ def regions_from_pass2(
 
     ``idx`` 가 있으면 OCR 좌표를 쓴다 (정확). 없고 ``bbox_norm`` 만 있으면
     VLM grounding 좌표를 쓰되 ``coarse``/``needs_review`` 로 태깅한다.
+
+    Args:
+        claimed: 중복 차단 원장. ``regions_from_pass1`` 과 같은 규칙을 따른다.
     """
+    ledger = as_ledger(claimed)
     regions: list[PiiRegion] = []
 
     for item in payload.get("missed", []) or []:
@@ -176,7 +290,9 @@ def regions_from_pass2(
         if out_of_range:
             warnings.append(f"pass2: 범위를 벗어난 박스 번호 폐기 {out_of_range} (type={label})")
 
-        usable = [i for i in raw_idx if 0 <= i < len(boxes) and i not in claimed]
+        usable = [
+            i for i in raw_idx if 0 <= i < len(boxes) and not ledger.has(i, label)
+        ]
 
         if usable:
             for group in spatially_split(usable, boxes):
@@ -185,11 +301,11 @@ def regions_from_pass2(
                         group, label, conf, boxes, page_w, page_h, Source.VLM_PASS2, reason
                     )
                 )
-                claimed.update(group)
+                ledger.add_all(group, label)
             continue
 
         if raw_idx and not usable:
-            # 전부 이미 탐지된 박스였다. 앵커링 무시 사례이므로 조용히 넘긴다.
+            # 전부 같은 라벨로 이미 탐지된 박스였다. 앵커링 무시 사례이므로 조용히 넘긴다.
             continue
 
         if bbox_norm and len(bbox_norm) == 4:
@@ -213,6 +329,9 @@ def regions_from_pass2(
             )
         else:
             warnings.append(f"pass2: idx 도 bbox_norm 도 없는 항목 폐기 (type={label})")
+
+    if isinstance(claimed, set):
+        claimed.update(ledger.indices())
 
     return regions
 

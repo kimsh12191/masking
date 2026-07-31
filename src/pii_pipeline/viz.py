@@ -20,6 +20,7 @@ SOURCE_COLORS: dict[Source, tuple[int, int, int]] = {
     Source.LLM_PASS1: (0, 122, 214),     # 파랑 — 텍스트 pass
     Source.VLM_PASS2: (255, 149, 0),     # 주황 — 이미지 pass 회수
     Source.VLM_GROUNDING: (214, 45, 32), # 빨강 — 좌표 근사, 검토 필수
+    Source.PROPAGATED: (148, 82, 214),   # 보라 — 같은 값이라 전파됨
 }
 
 

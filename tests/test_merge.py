@@ -6,6 +6,8 @@ LLM 출력을 신뢰하지 않는다는 설계가 실제로 지켜지는지 확�
 from __future__ import annotations
 
 from pii_pipeline.merge import (
+    ClaimLedger,
+    claims_from_hits,
     confirmed_map,
     finalize,
     regions_from_pass1,
@@ -131,12 +133,34 @@ class TestRegionsFromPass1:
         assert any("999" in w for w in warnings)
 
     def test_already_claimed_box_is_skipped(self) -> None:
-        """규칙 레이어가 확정한 박스는 LLM 이 다시 주장해도 무시한다."""
+        """평문 set 을 넘기면 박스 단위로 전부 차단한다 (하위호환 경로)."""
         boxes = sample_boxes()
         warnings: list[str] = []
         payload = {"regions": [{"idx": [3], "type": "OTHER", "conf": 0.9}]}
         regions = regions_from_pass1(payload, boxes, {3}, PAGE_W, PAGE_H, warnings)
         assert regions == []
+
+    def test_same_label_on_claimed_box_is_skipped(self) -> None:
+        boxes = sample_boxes()
+        ledger = ClaimLedger({3: "RRN"})
+        payload = {"regions": [{"idx": [3], "type": "RRN", "conf": 0.9}]}
+        assert regions_from_pass1(payload, boxes, ledger, PAGE_W, PAGE_H, []) == []
+
+    def test_different_label_on_claimed_box_survives(self) -> None:
+        """한 박스에 여러 종류가 섞이는 경우.
+
+        ``"홍길동 901231-1234567"`` 처럼 규칙이 RRN 을 확정한 박스라도 이름은
+        아직 미확정이다. 박스 단위로 막으면 ``char_span`` 기반 부분 마스킹을
+        구현한 다운스트림에서 이름이 그대로 노출된다.
+        """
+        boxes = sample_boxes()
+        ledger = ClaimLedger({3: "RRN"})
+        payload = {"regions": [{"idx": [3], "type": "NAME", "conf": 0.9}]}
+        regions = regions_from_pass1(payload, boxes, ledger, PAGE_W, PAGE_H, [])
+        assert len(regions) == 1
+        assert regions[0].type == "NAME"
+        assert regions[0].member_index == [3]
+        assert ledger.labels(3) == {"RRN", "NAME"}
 
     def test_spatially_distant_group_is_split(self) -> None:
         boxes = sample_boxes()
@@ -241,6 +265,61 @@ class TestRegionsFromPass2:
     def test_empty_missed(self) -> None:
         boxes = sample_boxes()
         assert regions_from_pass2({"missed": []}, boxes, set(), PAGE_W, PAGE_H, []) == []
+
+
+class TestClaimLedger:
+    def test_blocks_per_label_not_per_box(self) -> None:
+        ledger = ClaimLedger()
+        ledger.add(3, "RRN")
+        assert ledger.has(3, "RRN") is True
+        assert ledger.has(3, "NAME") is False
+
+    def test_plain_set_input_blocks_every_label(self) -> None:
+        """하위호환 — 라벨 정보 없이 넘어온 박스는 전부 차단으로 본다."""
+        ledger = ClaimLedger({3})
+        assert ledger.has(3, "RRN") is True
+        assert ledger.has(3, "NAME") is True
+
+    def test_confirmed_map_joined_labels_are_split(self) -> None:
+        ledger = ClaimLedger({3: "PHONE+EMAIL"})
+        assert ledger.has(3, "PHONE") is True
+        assert ledger.has(3, "EMAIL") is True
+        assert ledger.has(3, "NAME") is False
+
+    def test_claims_from_hits_keeps_labels_separate(self) -> None:
+        hits = [RuleHit(3, "RRN", "x", (0, 1), True)]
+        ledger = claims_from_hits(hits)
+        assert ledger.has(3, "RRN") is True
+        assert ledger.has(3, "NAME") is False
+        assert ledger.indices() == {3}
+
+    def test_indices_reports_any_claimed_box(self) -> None:
+        ledger = ClaimLedger()
+        ledger.add_all([1, 2], "NAME")
+        assert ledger.indices() == {1, 2}
+        assert 1 in ledger and 9 not in ledger
+
+
+class TestPass2WithLedger:
+    def test_different_label_on_pass1_box_survives(self) -> None:
+        boxes = sample_boxes()
+        ledger = ClaimLedger()
+        ledger.add(1, "NAME")
+        payload = {
+            "missed": [{"idx": [1], "type": "BIRTH", "conf": 0.7, "reason": "이름 옆 날짜"}]
+        }
+        regions = regions_from_pass2(payload, boxes, ledger, PAGE_W, PAGE_H, [])
+        assert len(regions) == 1
+        assert regions[0].type == "BIRTH"
+
+    def test_same_label_on_pass1_box_is_silently_ignored(self) -> None:
+        boxes = sample_boxes()
+        ledger = ClaimLedger()
+        ledger.add(1, "NAME")
+        warnings: list[str] = []
+        payload = {"missed": [{"idx": [1], "type": "NAME", "conf": 0.9, "reason": "x"}]}
+        assert regions_from_pass2(payload, boxes, ledger, PAGE_W, PAGE_H, warnings) == []
+        assert warnings == []
 
 
 class TestFinalize:

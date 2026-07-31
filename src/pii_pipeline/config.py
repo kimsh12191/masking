@@ -25,6 +25,7 @@ from typing import Any
 from .llm.client import LlmConfig
 from .ocr.paddle_runner import OcrConfig
 from .pipeline import PipelineConfig
+from .propagate import PropagateConfig
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +148,9 @@ def read_yaml(path: Path) -> dict[str, Any]:
 # 진입점
 # --------------------------------------------------------------------------
 
-SECTIONS = ("pipeline", "ocr", "llm", "output")
+#: YAML 최상위 섹션. ``ocr``/``llm``/``propagate`` 는 코드상 ``PipelineConfig``
+#: 안에 있지만, 설정 파일에서는 평평하게 두는 편이 읽기 쉬워 최상위로 뺀다.
+SECTIONS = ("pipeline", "ocr", "llm", "propagate", "output")
 
 
 def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConfig:
@@ -165,7 +168,9 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
         ValueError: 알 수 없는 설정 키가 있을 때.
     """
     config = AppConfig(
-        pipeline=PipelineConfig(ocr=OcrConfig(), llm=LlmConfig()),
+        pipeline=PipelineConfig(
+            ocr=OcrConfig(), llm=LlmConfig(), propagate=PropagateConfig()
+        ),
         output=OutputConfig(),
     )
 
@@ -183,6 +188,7 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             "pipeline": config.pipeline,
             "ocr": config.pipeline.ocr,
             "llm": config.pipeline.llm,
+            "propagate": config.pipeline.propagate,
             "output": config.output,
         }
         for section in SECTIONS:
@@ -222,6 +228,8 @@ def describe(config: AppConfig) -> str:
             f"pass2       {'ON' if pipe.enable_pass2 else 'OFF'}"
             f"{' (blind)' if pipe.pass2_blind else ''}"
             f"  image_max_side={llm.image_max_side}",
+            f"값 전파     {'ON' if pipe.propagate.enabled else 'OFF'}"
+            f"  min_similarity={pipe.propagate.min_similarity}",
             f"출력        {out.out_dir}  이미지={'ON' if out.write_image else 'OFF'}",
         ]
     )
