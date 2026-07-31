@@ -25,6 +25,24 @@ from .layout import assign_reading_order, quad_to_bbox
 log = logging.getLogger(__name__)
 
 
+def parse_gpu_id(raw: str) -> int:
+    """GPU 번호 문자열을 정수로 바꾼다.
+
+    환경변수는 항상 문자열이므로 여기서 한 번만 검사한다. 오타를 조용히
+    0 번으로 떨어뜨리면 "왜 여전히 vLLM 과 같은 GPU 를 쓰지" 로 헤매게 된다.
+
+    Raises:
+        ValueError: 정수가 아니거나 음수일 때.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"GPU 번호는 정수여야 합니다: {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"GPU 번호는 0 이상이어야 합니다: {value}")
+    return value
+
+
 @dataclass
 class OcrConfig:
     """PaddleOCR 설정.
@@ -40,6 +58,11 @@ class OcrConfig:
         rec_conf_ok: 이 값 이상이면 ``OcrStatus.OK``.
         rec_conf_floor: 이 값 미만이면 ``OcrStatus.FAILED`` 로 간주 (텍스트 신뢰 불가).
         use_gpu: GPU 사용 여부.
+        gpu_id: 사용할 GPU 번호 (``nvidia-smi`` 의 인덱스). vLLM 이 0 번을 쓰고
+            있으면 1 번 등으로 옮겨 메모리 경합을 피할 수 있다.
+            ``CUDA_VISIBLE_DEVICES`` 가 설정되어 있으면 **그 목록 안에서의
+            상대 번호**로 해석된다 (예: ``CUDA_VISIBLE_DEVICES=2,3`` 에서
+            ``gpu_id=1`` 은 물리 2번이 아니라 3번).
         gpu_mem: PaddleOCR 에 허용할 GPU 메모리 (MB). vLLM 과 경합하므로 제한한다.
         max_side_len: 검출 입력 최대 변 길이. 작으면 작은 글씨를 놓친다.
     """
@@ -54,17 +77,22 @@ class OcrConfig:
     rec_conf_ok: float = 0.80
     rec_conf_floor: float = 0.35
     use_gpu: bool = True
+    gpu_id: int = 0
     gpu_mem: int = 4000
     max_side_len: int = 2560
 
     @classmethod
     def from_env(cls) -> OcrConfig:
-        """환경변수에서 모델 경로를 읽는다 (폐쇄망 배포 편의)."""
-        return cls(
+        """환경변수에서 모델 경로와 GPU 번호를 읽는다 (폐쇄망 배포 편의)."""
+        config = cls(
             det_model_dir=os.getenv("PII_OCR_DET_DIR"),
             rec_model_dir=os.getenv("PII_OCR_REC_DIR"),
             cls_model_dir=os.getenv("PII_OCR_CLS_DIR"),
         )
+        raw = os.getenv("PII_OCR_GPU_ID")
+        if raw:
+            config.gpu_id = parse_gpu_id(raw)
+        return config
 
     def validate_offline(self) -> list[str]:
         """폐쇄망 실행 가능 여부를 점검하고 문제 목록을 반환한다."""
@@ -123,7 +151,18 @@ class PaddleOcrRunner:
         }
         if self.config.use_gpu:
             kwargs["use_gpu"] = True
+            kwargs["gpu_id"] = self.config.gpu_id
             kwargs["gpu_mem"] = self.config.gpu_mem
+            log.info(
+                "OCR GPU 사용: gpu_id=%d gpu_mem=%dMB%s",
+                self.config.gpu_id,
+                self.config.gpu_mem,
+                (
+                    f" (CUDA_VISIBLE_DEVICES={visible} 기준 상대 번호)"
+                    if (visible := os.getenv("CUDA_VISIBLE_DEVICES"))
+                    else ""
+                ),
+            )
         else:
             kwargs["use_gpu"] = False
 

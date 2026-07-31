@@ -102,6 +102,27 @@ vllm serve Qwen/Qwen3.5-9B \
 `--max-model-len 8192` 를 **반드시** 넣어야 한다. 기본값(262k)이면 KV 캐시가
 80GB 를 다 먹는다.
 
+### GPU 가 여러 장이면 — OCR 과 vLLM 을 나눈다
+
+기본값은 둘 다 0 번 GPU 를 쓴다. 카드가 여러 장이면 나누는 편이 낫다
+(`gpu_mem` 상한을 신경 쓸 필요가 없어지고 vLLM 처리량도 회복된다).
+
+```bash
+# vLLM 은 0 번
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3.5-9B --max-model-len 8192 ...
+
+# OCR 은 1 번 — 셋 중 아무 방법이나
+python scripts/run.py sample.png --gpu-id 1     # ① CLI (일회성)
+export PII_OCR_GPU_ID=1                          # ② 환경변수
+#   config.yaml:  ocr: { gpu_id: 1 }             # ③ 설정 파일
+```
+
+번호는 `nvidia-smi` 의 인덱스다. 단, `CUDA_VISIBLE_DEVICES` 를 같이 쓰면
+**그 목록 안에서의 상대 번호**로 해석된다 — `CUDA_VISIBLE_DEVICES=2,3` 이면
+`--gpu-id 1` 은 물리 2번이 아니라 3번이다. 헷갈리면 둘 중 하나만 쓸 것.
+실제로 어디에 올라갔는지는 `--print-config` 의 `OCR 장치` 줄과 실행 로그의
+`OCR GPU 사용: gpu_id=...` 로 확인한다.
+
 ### 실행
 
 ```bash
@@ -349,6 +370,7 @@ export PII_LLM_MODEL=/opt/models/qwen35-9b
 export PII_LLM_BASE_URL=http://10.0.0.5:8000/v1
 export PII_OCR_DET_DIR=/opt/ocr_models/det
 export PII_OCR_REC_DIR=/opt/ocr_models/rec
+export PII_OCR_GPU_ID=1                      # OCR 을 1 번 GPU 로
 ```
 
 > **오타난 설정 키는 조용히 무시되지 않고 실행이 즉시 실패한다.**
@@ -383,6 +405,7 @@ python scripts/run.py --help
 | `--pass2-blind` | 1차 결과를 감추고 독립 판단 (앵커링 편향 비교) |
 | `--include-ocr` | JSON 에 OCR 박스 + LLM 원시응답 포함 (디버깅) |
 | `--image-max-side` | pass2 이미지 크기. **1500 이상 유지** (작으면 작은 글씨를 못 읽음) |
+| `--gpu-id` | OCR 을 돌릴 GPU 번호 (기본 0). vLLM 과 다른 카드로 보낼 때 |
 | `--cpu` | OCR 을 CPU 로 |
 
 라이브러리로:
