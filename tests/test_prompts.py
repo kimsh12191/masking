@@ -38,9 +38,17 @@ class TestRenderBoxList:
         text = render_box_list(boxes(), PAGE_W, PAGE_H)
         lines = text.splitlines()
         assert len(lines) == 4
-        assert lines[0].startswith("[00] (0.05,0.03)")
+        assert lines[0].startswith("[00] (0.05,0.03,0.24,0.05)")
         assert "성명" in lines[0]
         assert "홍길동" in lines[1]
+
+    def test_renders_full_extent_not_just_top_left(self) -> None:
+        """좌상단만 주면 모델이 박스 폭을 몰라 인접 판단(그룹화)을 못 한다."""
+        text = render_box_list(boxes(), PAGE_W, PAGE_H)
+        coords = text.splitlines()[0].split("(")[1].split(")")[0].split(",")
+        assert len(coords) == 4
+        x1, y1, x2, y2 = (float(c) for c in coords)
+        assert x2 > x1 and y2 > y1
 
     def test_confirmed_tag_is_appended_not_removed(self) -> None:
         """확정된 박스도 목록에 남아야 한다 — 서식 구조 이해에 필요하다."""
@@ -138,6 +146,87 @@ class TestSystemPrompts:
     def test_pass2_covers_all_labels(self) -> None:
         for label in PII_LABELS:
             assert label in SYSTEM_PASS2
+
+    def test_pass1_states_output_wrapper_for_nonempty_case(self) -> None:
+        """빈 결과 형식만 알려주면 정상 출력 구조는 문법 제약에만 의존한다."""
+        assert '{"regions":[{"idx"' in SYSTEM_PASS1.replace(" ", "")
+
+    def test_pass1_examples_include_required_conf(self) -> None:
+        """예시가 스키마 required 를 위반하면 few-shot 이 계약과 어긋난다."""
+        for line in SYSTEM_PASS1.splitlines():
+            if '"type"' in line and '"idx"' in line:
+                assert '"conf"' in line, f"conf 없는 예시: {line}"
+
+    def test_pass2_example_includes_required_reason(self) -> None:
+        for line in SYSTEM_PASS2.splitlines():
+            if '"type"' in line and '"conf"' in line and line.strip().startswith("예:"):
+                assert '"reason"' in line, f"reason 없는 예시: {line}"
+
+    def test_both_passes_recover_rule_layer_misses(self) -> None:
+        """OCR 오독으로 규칙 정규식이 빗나간 정형 식별자를 회수해야 한다.
+
+        pass-1 의 라벨 집합에는 RRN/PHONE 이 없으므로, 지시가 없으면 모델이
+        눈으로 보고도 붙일 라벨이 없어 그냥 버린다.
+        """
+        assert "규칙 검사가 놓친 정형 식별자" in SYSTEM_PASS1
+        assert "0IO-l234-5678" in SYSTEM_PASS1
+        assert "규칙 검사가 놓친 정형 식별자" in SYSTEM_PASS2
+
+    def test_both_passes_handle_mixed_labels_as_other(self) -> None:
+        """한 박스에 여러 종류가 섞이면 종류를 고르다 나머지를 버리면 안 된다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "여러 종류가 섞여 있으면" in prompt
+            assert "OTHER" in prompt
+
+    def test_confirmed_tag_does_not_silence_other_pii_in_same_box(self) -> None:
+        """<CONFIRMED:RRN> 박스의 이름까지 침묵시키면 부분 마스킹 시 유출된다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "그 **타입만**" in prompt
+            assert "다른 종류" in prompt
+
+    def test_both_passes_exclude_issuing_institution(self) -> None:
+        """은행명·지점명·부서명을 제외하지 않으면 서식 전체가 마스킹된다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "기관 자체" in prompt
+            assert "하나은행 강남지점" in prompt
+            # 단, 기관 직원이라도 사람 이름은 개인정보다
+            assert "기관 직원이라도 NAME" in prompt
+
+    def test_both_passes_exclude_document_dates_from_birth(self) -> None:
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "문서 자체의 날짜" in prompt
+            assert "만기일" in prompt
+
+    def test_both_passes_give_conf_calibration(self) -> None:
+        """conf 앵커가 없으면 모델이 전부 0.9 로 채워 needs_review 가 무의미해진다."""
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "conf 기준" in prompt
+            assert "0.5 미만" in prompt
+
+    def test_exclusions_outrank_recall_priority(self) -> None:
+        """"애매하면 포함" 과 "기관 정보 제외" 의 우선순위를 명시해야 한다."""
+        assert "우선한다" in SYSTEM_PASS1
+
+    def test_pass1_defines_ocr_failed_behaviour(self) -> None:
+        """<OCR_FAILED> 처리 지침이 없으면 동작이 정의되지 않는다."""
+        assert "<OCR_FAILED>" in SYSTEM_PASS1
+        assert "근거 없이 추측하지 마라" in SYSTEM_PASS1
+
+    def test_pass2_requires_one_coordinate_field(self) -> None:
+        """"하나만" 만 있으면 둘 다 비운 응답이 조용히 폐기된다."""
+        assert "반드시 하나는 채워야 한다" in SYSTEM_PASS2
+        assert "버려진다" in SYSTEM_PASS2
+
+    def test_example_box_numbers_are_not_reused_for_different_items(self) -> None:
+        """번호가 의미를 갖는 프롬프트에서 같은 번호를 다른 항목에 쓰면 혼란스럽다."""
+        import re
+
+        seen: dict[str, set[str]] = {}
+        for m in re.finditer(r'\{"idx":\[([\d,]+)\],"type":"(\w+)"', SYSTEM_PASS1):
+            for idx in m.group(1).split(","):
+                seen.setdefault(idx, set()).add(m.group(2))
+        collisions = {k: v for k, v in seen.items() if len(v) > 1}
+        assert not collisions, f"같은 번호가 다른 라벨로 쓰였다: {collisions}"
 
 
 class TestSchemas:

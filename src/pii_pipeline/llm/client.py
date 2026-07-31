@@ -28,7 +28,14 @@ class LlmConfig:
         model: 모델 이름 (vLLM 기동 시 지정한 것과 일치해야 함).
         api_key: 더미 값이어도 무관 (vLLM 은 검증하지 않음).
         temperature: 0 고정 권장.
-        max_tokens: 출력 상한. 인덱스만 반환하므로 512 로 충분.
+        max_tokens: 출력 상한.
+            **512 는 부족하다.** 한 항목이 pass-1 은 약 20토큰, pass-2 는
+            ``reason`` 까지 포함해 40~60토큰이다. 밀집한 신청서(주민등록등본,
+            대출신청서)는 탐지가 25건을 쉽게 넘기므로 512 에서는 JSON 이
+            중간에 잘린다. 잘리면 그 페이지의 LLM 탐지가 **전량** 날아간다.
+        max_tokens_on_truncation: 출력이 잘렸을 때 재시도에 쓸 상한.
+            ``temperature=0`` + 같은 입력이면 재시도해도 **똑같은 지점에서
+            똑같이 잘린다.** 잘림은 상한을 올려야만 벗어날 수 있다.
         timeout: 초 단위 요청 타임아웃.
         guided_backend: guided decoding 백엔드.
         enable_thinking: Qwen3 계열 추론 모드. **반드시 False.**
@@ -41,7 +48,8 @@ class LlmConfig:
     model: str = "Qwen/Qwen3.5-9B"
     api_key: str = "EMPTY"
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 2048
+    max_tokens_on_truncation: int = 4096
     timeout: float = 60.0
     guided_backend: str = "xgrammar"
     enable_thinking: bool = False
@@ -154,13 +162,14 @@ class LlmClient:
         }
 
         last_error: str | None = None
+        max_tokens = self.config.max_tokens
         for attempt in range(self.config.max_retries + 1):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.config.model,
                     messages=messages,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_tokens=max_tokens,
                     extra_body=extra_body,
                 )
                 raw = (resp.choices[0].message.content or "").strip()
@@ -168,6 +177,7 @@ class LlmClient:
                     "raw": raw,
                     "attempt": attempt,
                     "finish_reason": resp.choices[0].finish_reason,
+                    "max_tokens": max_tokens,
                 }
                 if getattr(resp, "usage", None):
                     meta["usage"] = {
@@ -175,9 +185,16 @@ class LlmClient:
                         "completion_tokens": resp.usage.completion_tokens,
                     }
                 if meta["finish_reason"] == "length":
-                    # max_tokens 에서 잘렸다면 JSON 이 불완전하다
-                    last_error = "출력이 max_tokens 에서 잘렸습니다"
+                    # max_tokens 에서 잘렸다면 JSON 이 불완전하다.
+                    # temperature=0 + 같은 입력이면 같은 상한으로는 매번 같은
+                    # 지점에서 잘린다. 상한을 올려야 재시도에 의미가 생긴다.
+                    last_error = (
+                        f"출력이 max_tokens({max_tokens}) 에서 잘렸습니다"
+                    )
                     log.warning("%s (attempt %d)", last_error, attempt)
+                    if max_tokens < self.config.max_tokens_on_truncation:
+                        max_tokens = self.config.max_tokens_on_truncation
+                        log.warning("max_tokens 를 %d 로 올려 재시도합니다", max_tokens)
                     continue
                 return json.loads(raw), meta
             except json.JSONDecodeError as exc:
