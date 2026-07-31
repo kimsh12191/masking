@@ -34,7 +34,25 @@ class PreprocessResult:
 
 
 def _estimate_skew(gray: Any) -> float:
-    """텍스트 라인 방향으로부터 기울기 각도(도)를 추정한다."""
+    """텍스트 라인 방향으로부터 기울기 각도(도)를 추정한다.
+
+    **실패해도 예외를 던지지 않는다.** 기울기 추정은 보조 기능인데,
+    여기서 예외가 새면 ``run.py`` 의 배치 루프가 그 입력을 통째로 버린다
+    (그 페이지의 마스킹 결과가 아예 안 나온다). 기울어진 채로라도 처리하는
+    편이 낫다.
+    """
+    try:
+        return _estimate_skew_unsafe(gray)
+    except Exception as exc:  # noqa: BLE001 - 페이지 전체를 잃지 않는다
+        log.warning(
+            "기울기 추정 실패 — 보정 없이 계속합니다 (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return 0.0
+
+
+def _estimate_skew_unsafe(gray: Any) -> float:
     import cv2  # type: ignore[import-not-found]
     import numpy as np  # type: ignore[import-not-found]
 

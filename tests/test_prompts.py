@@ -150,6 +150,19 @@ class TestSystemPrompts:
         assert "담당자: 조민석" in SYSTEM_PASS1
         assert "그 박스를 포함" in SYSTEM_PASS1
 
+    def test_both_passes_cover_identity_attributes(self) -> None:
+        """성별·본(본관)·가족관계는 지시가 없으면 행마다 다르게 판단된다.
+
+        현장 사고: 가족관계증명서의 본 칸에서 "전주" 만 잡히고 "김해"·"밀양"·
+        "경주" 가 누락됐다. 이런 항목을 어떻게 다룰지 프롬프트에 없었기 때문에
+        모델이 매 행 다르게 판단한 것이다.
+        """
+        for prompt in (SYSTEM_PASS1, SYSTEM_PASS2):
+            assert "성별" in prompt
+            assert "본(본관)" in prompt
+            assert "같은 열은 같은 종류다" in prompt
+            assert "항목명(열 머리글)만 있는 칸은 제외" in prompt
+
     def test_both_passes_cover_label_glued_to_value(self) -> None:
         """OCR 이 라벨과 값을 묶으면 구분자가 아예 없다 ("신청인홍길동").
 
