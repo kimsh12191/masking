@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .llm.client import LlmConfig
-from .ocr.paddle_runner import OcrConfig
+from .ocr.paddle_runner import OcrConfig, parse_gpu_id
 from .pipeline import PipelineConfig
 from .propagate import PropagateConfig
 
@@ -37,6 +37,7 @@ ENV_MAP: dict[str, tuple[str, str]] = {
     "PII_OCR_DET_DIR": ("ocr", "det_model_dir"),
     "PII_OCR_REC_DIR": ("ocr", "rec_model_dir"),
     "PII_OCR_CLS_DIR": ("ocr", "cls_model_dir"),
+    "PII_OCR_GPU_ID": ("ocr", "gpu_id"),
     "PII_LLM_BASE_URL": ("llm", "base_url"),
     "PII_LLM_MODEL": ("llm", "model"),
     "PII_LLM_API_KEY": ("llm", "api_key"),
@@ -208,6 +209,14 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
                 setattr(targets[section], field_name, value)
                 log.debug("환경변수 적용: %s -> %s.%s", env_name, section, field_name)
 
+    # 환경변수와 YAML 은 "1" 같은 문자열을 줄 수 있다. GPU 번호는 정수로
+    # 넘겨야 PaddleOCR 이 받으므로 마지막에 한 번 정규화한다.
+    ocr = config.pipeline.ocr
+    try:
+        ocr.gpu_id = parse_gpu_id(ocr.gpu_id)
+    except ValueError as exc:
+        raise ValueError(f"ocr.gpu_id 설정이 잘못되었습니다 ({exc})") from exc
+
     return config
 
 
@@ -225,6 +234,12 @@ def describe(config: AppConfig) -> str:
             f"모델        {llm.model} @ {llm.base_url}",
             f"OCR         lang={ocr.lang} det={ocr.det_model_dir or '(자동)'} "
             f"rec={ocr.rec_model_dir or '(자동)'}",
+            f"OCR 장치    {f'GPU {ocr.gpu_id} (상한 {ocr.gpu_mem}MB)' if ocr.use_gpu else 'CPU'}"
+            + (
+                f"  CUDA_VISIBLE_DEVICES={visible}"
+                if ocr.use_gpu and (visible := os.getenv('CUDA_VISIBLE_DEVICES'))
+                else ""
+            ),
             f"pass2       {'ON' if pipe.enable_pass2 else 'OFF'}"
             f"{' (blind)' if pipe.pass2_blind else ''}"
             f"  image_max_side={llm.image_max_side}",

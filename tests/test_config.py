@@ -179,6 +179,23 @@ class TestEnvOverrides:
             "/opt/det", "/opt/rec", "/opt/cls",
         )
 
+    def test_gpu_id_from_env_is_int(self, isolated: Path, monkeypatch) -> None:
+        """환경변수는 문자열이지만 PaddleOCR 은 정수를 받아야 한다."""
+        monkeypatch.setenv("PII_OCR_GPU_ID", "1")
+        gpu_id = load_config().pipeline.ocr.gpu_id
+        assert gpu_id == 1
+        assert isinstance(gpu_id, int)
+
+    def test_bad_gpu_id_raises(self, isolated: Path, monkeypatch) -> None:
+        monkeypatch.setenv("PII_OCR_GPU_ID", "첫번째")
+        with pytest.raises(ValueError, match="gpu_id"):
+            load_config()
+
+    def test_negative_gpu_id_raises(self, isolated: Path, monkeypatch) -> None:
+        monkeypatch.setenv("PII_OCR_GPU_ID", "-1")
+        with pytest.raises(ValueError, match="gpu_id"):
+            load_config()
+
     def test_base_url_from_env(self, isolated: Path, monkeypatch) -> None:
         monkeypatch.setenv("PII_LLM_BASE_URL", "http://10.0.0.5:8000/v1")
         assert load_config().pipeline.llm.base_url == "http://10.0.0.5:8000/v1"
@@ -296,6 +313,18 @@ class TestCliOverrides:
         apply_cli_overrides(config, parse(["x.png", "--cpu"]))
         assert config.pipeline.ocr.use_gpu is False
 
+    def test_gpu_id_override(self, isolated: Path) -> None:
+        config = load_config()
+        apply_cli_overrides(config, parse(["x.png", "--gpu-id", "1"]))
+        assert config.pipeline.ocr.gpu_id == 1
+
+    def test_gpu_id_zero_still_overrides(self, isolated: Path) -> None:
+        """0 은 falsy 지만 '미지정'이 아니다."""
+        path = write_yaml(isolated / "c.yaml", "ocr:\n  gpu_id: 3\n")
+        config = load_config(path)
+        apply_cli_overrides(config, parse(["x.png", "--gpu-id", "0"]))
+        assert config.pipeline.ocr.gpu_id == 0
+
     def test_out_dir_override(self, isolated: Path) -> None:
         config = load_config()
         apply_cli_overrides(config, parse(["x.png", "-o", "myout"]))
@@ -315,7 +344,8 @@ class TestCliOverrides:
         for name in (
             "out", "image", "font", "show_ocr_boxes", "include_ocr",
             "pass2", "pass2_blind", "deskew", "long_side",
-            "det_dir", "rec_dir", "cls_dir", "base_url", "model", "image_max_side",
+            "det_dir", "rec_dir", "cls_dir", "gpu_id",
+            "base_url", "model", "image_max_side",
         ):
             assert getattr(args, name) is None, f"--{name} 의 기본값이 None 이 아닙니다"
 

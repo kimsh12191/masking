@@ -106,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--det-dir", default=None, help="검출 모델 디렉터리 (폐쇄망 필수)")
     g.add_argument("--rec-dir", default=None, help="인식 모델 디렉터리 (폐쇄망 필수)")
     g.add_argument("--cls-dir", default=None, help="방향분류 모델 디렉터리")
+    g.add_argument("--gpu-id", type=int, default=None,
+                   help="OCR 에 쓸 GPU 번호 (기본 0). vLLM 이 0 번을 쓰면 1 등으로 옮긴다. "
+                        "CUDA_VISIBLE_DEVICES 가 있으면 그 목록 안의 상대 번호")
     g.add_argument("--cpu", action="store_true", help="OCR 을 CPU 로 실행")
 
     g = p.add_argument_group("LLM")
@@ -147,6 +150,7 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.det_dir, ocr, "det_model_dir"),
         (args.rec_dir, ocr, "rec_model_dir"),
         (args.cls_dir, ocr, "cls_model_dir"),
+        (args.gpu_id, ocr, "gpu_id"),
         (args.base_url, llm, "base_url"),
         (args.model, llm, "model"),
         (args.image_max_side, llm, "image_max_side"),

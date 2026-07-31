@@ -67,7 +67,11 @@ ocr:
   rec_conf_floor: 0.35
 
   use_gpu: true
-  # vLLM 과 같은 GPU 를 쓰므로 상한을 둔다 (MB).
+  # 사용할 GPU 번호 (nvidia-smi 인덱스). vLLM 이 0 번을 점유하고 있다면
+  # 여기를 1 로 바꿔 다른 카드로 보내면 메모리 경합이 사라진다.
+  # CUDA_VISIBLE_DEVICES 를 함께 쓰면 그 목록 안에서의 상대 번호로 해석된다.
+  gpu_id: 0
+  # 같은 GPU 를 공유할 때의 상한 (MB).
   # vLLM 의 --gpu-memory-utilization 과 합이 100% 를 넘지 않게 맞출 것.
   gpu_mem: 4000
   # 검출 입력 최대 변 길이. 작으면 작은 글씨를 놓친다.
