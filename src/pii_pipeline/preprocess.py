@@ -55,16 +55,20 @@ def _estimate_skew(gray: Any) -> float:
 
 def preprocess(
     image_path: str,
-    target_long_side: int | None = 2480,
+    target_long_side: int | None = 2464,
     deskew: bool = True,
+    align: int = 32,
 ) -> PreprocessResult:
     """이미지 파일을 읽어 OCR 에 적합한 형태로 정규화한다.
 
     Args:
         image_path: 입력 이미지 경로.
-        target_long_side: 긴 변 목표 길이 (A4 300dpi ≈ 2480). ``None`` 이면 원본 유지.
-            **확대는 하지 않는다** (없는 정보를 만들지 않음).
+        target_long_side: 긴 변 목표 길이. **``align`` 의 배수로 둘 것** —
+            A4 300dpi 는 2480 이지만 32 의 배수가 아니라 2464(=32×77)를 쓴다.
+            ``None`` 이면 원본 유지. **확대는 하지 않는다** (없는 정보를 만들지 않음).
         deskew: 기울기 보정 여부.
+        align: 이 값의 배수가 되도록 오른쪽·아래에 흰 여백을 붙인다
+            (VLM 패치 격자. ``DetectConfig.image_factor``). 1 이면 끈다.
 
     Returns:
         전처리 결과. ``image`` 는 OpenCV BGR numpy 배열.
@@ -81,13 +85,16 @@ def preprocess(
     if img is None:
         raise RuntimeError(f"이미지를 읽을 수 없습니다: {image_path}")
 
-    return preprocess_array(img, target_long_side=target_long_side, deskew=deskew)
+    return preprocess_array(
+        img, target_long_side=target_long_side, deskew=deskew, align=align
+    )
 
 
 def preprocess_array(
     img: Any,
-    target_long_side: int | None = 2480,
+    target_long_side: int | None = 2464,
     deskew: bool = True,
+    align: int = 32,
 ) -> PreprocessResult:
     """이미 메모리에 있는 이미지를 정규화한다.
 
@@ -97,6 +104,7 @@ def preprocess_array(
         img: BGR numpy 배열.
         target_long_side: 긴 변 목표 길이. ``None`` 이면 축소하지 않는다.
         deskew: 기울기 보정 여부.
+        align: 이 값의 배수가 되도록 오른쪽·아래에 흰 여백을 붙인다. 1 이면 끈다.
 
     Returns:
         전처리 결과. 입력 배열은 변경하지 않는다.
@@ -147,6 +155,25 @@ def preprocess_array(
             applied.append(f"deskew(angle={angle:.2f})")
         elif abs(angle) > DESKEW_MAX_ANGLE:
             log.info("기울기 추정값 %.2f 도가 임계값을 넘어 보정을 건너뜁니다", angle)
+
+    # 3) 패치 격자 정렬 — **오른쪽·아래에만 여백을 붙인다.**
+    #
+    # VLM 의 비전 인코더는 이미지를 factor(=패치×merge) 배수로 리사이즈한다.
+    # 페이지가 배수가 아니면 조각 크기도 배수가 될 수 없고, 서버가 조각을 다시
+    # 리샘플한다 — 10px 급 한글이 보간으로 뭉개지고 그건 곧 미탐이다.
+    #
+    # 자르지 않고 붙이는 이유: 기존 픽셀이 하나도 움직이지 않아 **좌표가 그대로
+    # 유효하다.** 잘라내면 페이지 끝의 값을 잃는데, 그건 미탐이다.
+    if align > 1:
+        h, w = img.shape[:2]
+        pad_w = (-w) % align
+        pad_h = (-h) % align
+        if pad_w or pad_h:
+            img = cv2.copyMakeBorder(
+                img, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+            )
+            transform["align_pad"] = [pad_w, pad_h]
+            applied.append(f"align({w}x{h}->{w + pad_w}x{h + pad_h}, /{align})")
 
     h, w = img.shape[:2]
     return PreprocessResult(

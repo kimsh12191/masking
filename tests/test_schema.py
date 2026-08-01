@@ -63,18 +63,25 @@ class TestVlmSchema:
     def test_requires_text_before_bbox(self) -> None:
         """생성 순서가 곧 조건화 순서다. 값을 먼저 확정해야 한다."""
         keys = list(VLM_SCHEMA["properties"]["findings"]["items"]["properties"])
-        assert keys.index("text") < keys.index("bbox_norm")
-        assert keys.index("type") < keys.index("bbox_norm")
+        assert keys.index("text") < keys.index("bbox_2d")
+        assert keys.index("type") < keys.index("bbox_2d")
 
     def test_all_fields_required(self) -> None:
         item = VLM_SCHEMA["properties"]["findings"]["items"]
-        assert set(item["required"]) == {"text", "type", "field", "bbox_norm", "conf"}
+        assert set(item["required"]) == {"text", "type", "field", "bbox_2d", "conf"}
 
-    def test_bbox_is_four_normalized_numbers(self) -> None:
-        bbox = VLM_SCHEMA["properties"]["findings"]["items"]["properties"]["bbox_norm"]
+    def test_bbox_is_four_per_mille_integers(self) -> None:
+        """Qwen-VL 의 native grounding 형식이다 — 0~1000 정수, 키는 ``bbox_2d``.
+
+        우리 편의대로 0.0~1.0 소수와 ``bbox_norm`` 을 요구하던 때가 있었는데,
+        그건 어느 Qwen 버전의 native 형식도 아니다. grounding 은 분포에 가장
+        민감한 과제라 형식을 바꾸는 대가가 좌표 정확도로 나온다.
+        """
+        bbox = VLM_SCHEMA["properties"]["findings"]["items"]["properties"]["bbox_2d"]
         assert bbox["minItems"] == bbox["maxItems"] == 4
+        assert bbox["items"]["type"] == "integer"
         assert bbox["items"]["minimum"] == 0
-        assert bbox["items"]["maximum"] == 1
+        assert bbox["items"]["maximum"] == 1000
 
     def test_closed_object(self) -> None:
         assert VLM_SCHEMA["additionalProperties"] is False

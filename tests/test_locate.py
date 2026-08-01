@@ -458,14 +458,67 @@ class TestLocate:
         assert "901112-2846261" in reason
         assert "9O1112-284626" in reason
 
-    def test_no_overlap_at_all_blames_the_vlm_coordinate(self) -> None:
-        """박스는 있는데 겹치지 않는다 = VLM 좌표 문제. 크롭을 넓혀도 안 낫는다."""
+    def test_no_overlap_falls_back_to_the_nearest_line_in_the_crop(self) -> None:
+        """겹치는 박스가 없어도 크롭 안에 글자가 있으면 좌표를 포기하지 않는다.
+
+        예전에는 여기서 ``vlm_coarse`` 로 떨어졌다. 그게 이 파이프라인의 실제
+        고장이었다 — VLM 좌표가 밀리면 페이지의 **모든** 항목이 이 경로로 가서
+        전부 VLM 원본 좌표(빨간 박스)로 나왔다. 크롭을 뜰 때 인정한 공차를
+        고를 때도 인정하지 않았기 때문이다.
+        """
         f = finding("홍길동", bbox=(0.6, 0.6, 0.8, 0.65))
         ocr = FakeOcr([[box("전혀다른칸", 0, 0, 40, 20)]] * 2)
         regions, _ = locate([f], blank_page(), ocr)
         r = regions[0]
+        assert r.source is Source.OCR_REFINED
+        assert r.coarse is False
+        assert r.needs_review is True
+        assert "가장 가까운 줄" in (r.reason or "")
+
+    def test_nearby_selection_covers_the_vlm_box_too(self) -> None:
+        """어느 쪽이 맞는지 모르므로 둘 다 덮는다 — 한쪽만 택하면 미탐이 된다."""
+        f = finding("홍길동", bbox=(0.6, 0.6, 0.8, 0.65))
+        ocr = FakeOcr([[box("전혀다른칸", 0, 0, 40, 20)]] * 2)
+        page = blank_page()
+        regions, _ = locate([f], page, ocr)
+        r = regions[0]
+        h, w = page.shape[:2]
+        assert r.vlm_bbox is not None
+        assert r.bbox[0] <= r.vlm_bbox[0] and r.bbox[1] <= r.vlm_bbox[1]
+        assert r.bbox[2] >= r.vlm_bbox[2] and r.bbox[3] >= r.vlm_bbox[3]
+        # 크롭 범위로 닫혀 있다 — 페이지 전체로 번지지 않는다
+        assert (r.bbox[2] - r.bbox[0]) < w * 0.5
+        assert (r.bbox[3] - r.bbox[1]) < h * 0.5
+
+    def test_crop_padding_absorbs_the_models_grounding_floor(self) -> None:
+        """크롭 여유가 **모델의 해상도 하한(비전 토큰 1개)** 보다 커야 한다.
+
+        Qwen-VL 의 공간 단위는 32x32px 이고 300dpi 한글 한 줄이 30~40px 이므로
+        모델은 한 줄보다 정확할 수 없다. 한 줄짜리 이름 칸에서 세로 여유가
+        그보다 작으면 값이 크롭 밖으로 새어나가고, 텍스트 매칭이 구조적으로
+        실패한다 — 설정 하나가 파이프라인의 전제를 깨는 자리다.
+        """
+        cfg = LocateConfig()
+        # 이름 칸: 1748x2480 페이지에서 약 100x30px
+        f = finding("김수현", bbox=(0.300, 0.400, 0.357, 0.412))
+        x1, y1, x2, y2 = crop_rect(f, 1748, 2480, cfg.pad_ratio, cfg.min_pad_px)
+        assert (y2 - y1 - 30) / 2 >= 32, "세로 여유가 비전 토큰 1개보다 작다"
+
+    def test_nearby_selection_is_warned(self) -> None:
+        """이 건수가 크면 grounding 이 전반적으로 밀렸다는 신호다."""
+        warnings: list[str] = []
+        f = finding("홍길동", bbox=(0.6, 0.6, 0.8, 0.65))
+        ocr = FakeOcr([[box("전혀다른칸", 0, 0, 40, 20)]] * 2)
+        locate([f], blank_page(), ocr, warnings=warnings)
+        assert any("근접 선택" in w for w in warnings)
+
+    def test_empty_crop_is_still_the_coarse_path(self) -> None:
+        """크롭에 박스가 하나도 없으면 여전히 VLM 좌표를 쓴다 (OCR 검출 문제)."""
+        f = finding("홍길동", bbox=(0.6, 0.6, 0.8, 0.65))
+        regions, _ = locate([f], blank_page(), FakeOcr([[], []]))
+        r = regions[0]
         assert r.source is Source.VLM_COARSE
-        assert "겹치는 OCR 박스가 없다" in (r.reason or "")
+        assert "검출되지 않았다" in (r.reason or "")
 
     def test_geometry_fallback_can_be_disabled(self) -> None:
         f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))

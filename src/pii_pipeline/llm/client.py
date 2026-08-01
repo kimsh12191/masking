@@ -132,6 +132,9 @@ class LlmConfig:
         enable_thinking: Qwen3 계열 추론 모드. 운영에서는 **False** 다
             (지연시간을 먹고 guided 와 충돌한다). 측정·라벨 생성에서만 켠다.
         image_max_side: VLM 으로 보낼 이미지의 긴 변 길이.
+            **``DetectConfig.image_factor`` 의 배수로 둘 것** (1984 = 32×62).
+            배수가 아니면 여기서 줄인 결과가 패치 격자와 안 맞아 서버가 다시
+            리샘플한다 — ``detect`` 가 조각을 격자에 맞춰 놓은 것이 무효가 된다.
             **타일링과 함께 봐야 하는 값이다.** A4 를 ``target_long_side=2480``
             으로 전처리하면 1748x2480 이고, 그대로 보내면 여기서 0.73배로
             줄어 주민등록번호 숫자가 10px 대로 떨어진다 — 읽을 수 없다.
@@ -151,9 +154,32 @@ class LlmConfig:
     guided_backend: str = "xgrammar"
     guided: bool = True
     enable_thinking: bool = False
-    image_max_side: int = 2000
+    image_max_side: int = 1984
     max_retries: int = 2
     extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+def fit_max_side(height: int, width: int, max_side: int) -> tuple[int, int]:
+    """긴 변을 ``max_side`` 로 맞춘 크기. 확대는 하지 않는다.
+
+    **``detect`` 와 여기가 같은 계산을 써야 한다.** 모델이 실제로 본 이미지
+    크기를 알아야 절대 픽셀 좌표를 옳게 환산할 수 있는데, 그 크기는 이 축소를
+    거친 뒤의 값이다. 두 곳에 따로 적어 두면 한쪽만 바뀌었을 때 좌표가 조용히
+    어긋나고, 화면에는 "박스가 전체적으로 밀렸다" 로만 보인다.
+
+    Args:
+        height: 원본 높이 (px).
+        width: 원본 폭 (px).
+        max_side: 긴 변 상한. 0 이하면 축소하지 않는다.
+
+    Returns:
+        ``(높이, 폭)``.
+    """
+    long_side = max(height, width)
+    if max_side <= 0 or long_side <= max_side:
+        return (height, width)
+    scale = max_side / long_side
+    return (max(1, int(height * scale)), max(1, int(width * scale)))
 
 
 class LlmClient:
@@ -199,11 +225,9 @@ class LlmClient:
                 arr = arr[:, :, ::-1]  # BGR -> RGB
             image = Image.fromarray(arr)
 
-        max_side = self.config.image_max_side
-        if max(image.size) > max_side:
-            scale = max_side / max(image.size)
-            new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
-            image = image.resize(new_size, Image.LANCZOS)
+        h, w = fit_max_side(image.height, image.width, self.config.image_max_side)
+        if (w, h) != image.size:
+            image = image.resize((w, h), Image.LANCZOS)
 
         buf = io.BytesIO()
         image.convert("RGB").save(buf, format="JPEG", quality=92)

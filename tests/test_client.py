@@ -148,8 +148,8 @@ class TestSalvage:
 
     def test_jsonl_items_are_wrapped(self) -> None:
         raw = (
-            '{"text":"홍길동","type":"NAME","field":"성명","bbox_norm":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
-            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_norm":[0.1,0.5,0.4,0.6],"conf":0.8}'
+            '{"text":"홍길동","type":"NAME","field":"성명","bbox_2d":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
+            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_2d":[0.1,0.5,0.4,0.6],"conf":0.8}'
         )
         out = salvage_json(raw, "findings")
         assert out is not None
@@ -187,8 +187,8 @@ class TestSalvage:
 
     def test_client_recovers_jsonl_and_marks_meta(self, monkeypatch) -> None:
         raw = (
-            '{"text":"홍길동","type":"NAME","field":"성명","bbox_norm":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
-            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_norm":[0.1,0.5,0.4,0.6],"conf":0.8}'
+            '{"text":"홍길동","type":"NAME","field":"성명","bbox_2d":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
+            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_2d":[0.1,0.5,0.4,0.6],"conf":0.8}'
         )
         client = LlmClient(LlmConfig(max_retries=0))
         monkeypatch.setattr(

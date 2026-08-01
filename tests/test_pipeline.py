@@ -15,6 +15,7 @@ import pytest
 
 from pii_pipeline import pipeline as pipeline_mod
 from pii_pipeline.detect import DetectConfig
+from pii_pipeline.llm.client import LlmConfig
 from pii_pipeline.locate import LocateConfig
 from pii_pipeline.pipeline import PiiPipeline, PipelineConfig
 from pii_pipeline.preprocess import PreprocessResult
@@ -35,7 +36,7 @@ def blank_page(w: int = PAGE_W, h: int = PAGE_H) -> Any:
 def vlm_item(text: str, label: str, bbox, conf: float = 0.9, field: str = "") -> dict:
     return {
         "text": text, "type": label, "field": field,
-        "bbox_norm": list(bbox), "conf": conf,
+        "bbox_2d": list(bbox), "conf": conf,
     }
 
 
@@ -48,6 +49,8 @@ class FakeClient:
         self.calls = 0
 
     client = None  # detect() 의 지연 초기화 프라이밍 대상
+    #: detect() 가 '모델이 본 크기' 를 계산할 때 image_max_side 를 읽는다.
+    config = LlmConfig()
 
     def complete_json(
         self,
@@ -87,11 +90,18 @@ def box(text: str, x1=5, y1=5, x2=200, y2=45, status=OcrStatus.OK) -> OcrBox:
 def no_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     """전처리를 항등 함수로 만든다 (opencv 의존 제거)."""
 
-    def fake(img: Any, target_long_side: Any = None, deskew: bool = True) -> PreprocessResult:
+    def fake(
+        img: Any,
+        target_long_side: Any = None,
+        deskew: bool = True,
+        align: int = 32,
+    ) -> PreprocessResult:
         h, w = img.shape[:2]
         return PreprocessResult(image=img, width=w, height=h, applied=[])
 
-    def fake_path(path: str, target_long_side: Any = None, deskew: bool = True):
+    def fake_path(
+        path: str, target_long_side: Any = None, deskew: bool = True, align: int = 32
+    ):
         return fake(blank_page())
 
     monkeypatch.setattr(pipeline_mod, "preprocess_array", fake)
@@ -317,7 +327,9 @@ class TestTiling:
             detect=DetectConfig(tiles=2, overlap=0.0, workers=1),
         )
         result = pipe.run("x.png", image=blank_page())
-        assert result.findings[0].bbox_norm[1] >= 0.5
+        # 정확히 0.5 가 아니다 — 조각 경계는 패치 격자(32px)로 스냅된다.
+        # 2000/2 = 1000 은 32 의 배수가 아니라 896 으로 내려간다.
+        assert result.findings[0].bbox_norm[1] >= 0.44
 
 
 class TestImagePassthrough:

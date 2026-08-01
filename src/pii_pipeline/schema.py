@@ -179,6 +179,10 @@ class PiiRegion:
             이므로 "검증 실패" 와 구분하려면 ``checksum`` 을 함께 보라.
         checksum: ``"ok"`` / ``"failed"`` / ``None``(해당 라벨에 체크섬 없음).
         agreement: VLM 값과 OCR 값의 일치 정도.
+        vlm_bbox: **VLM 이 원래 지목한 좌표** (픽셀). ``bbox`` 와의 차이가
+            grounding 오차 그 자체다. 이 값을 남겨 두지 않으면 "좌표가 밀렸다" 를
+            눈으로만 보고할 수 있고 숫자로 못 낸다 — ``scripts/diagnose.py`` 가
+            이걸로 밀림의 크기와 방향을 집계한다.
     """
 
     id: str
@@ -188,6 +192,7 @@ class PiiRegion:
     confidence: float
     text: str | None = None
     vlm_text: str | None = None
+    vlm_bbox: BBox | None = None
     field: str | None = None
     member_boxes: list[BBox] = _dc_field(default_factory=list)
     member_index: list[int] = _dc_field(default_factory=list)
@@ -208,6 +213,7 @@ class PiiRegion:
         d["agreement"] = self.agreement.value
         d["bbox"] = list(self.bbox)
         d["member_boxes"] = [list(b) for b in self.member_boxes]
+        d["vlm_bbox"] = list(self.vlm_bbox) if self.vlm_bbox else None
         return d
 
 
@@ -323,15 +329,21 @@ VLM_SCHEMA: dict[str, Any] = {
                     "text": {"type": "string", "maxLength": 120},
                     "type": {"type": "string", "enum": list(PII_LABELS)},
                     "field": {"type": "string", "maxLength": 40},
-                    "bbox_norm": {
+                    # 키 이름과 스케일 모두 **Qwen-VL 의 native grounding 형식**이다.
+                    # 공식 쿡북(cookbooks/2d_grounding.ipynb)의 출력이
+                    # ``{"bbox_2d": [x1,y1,x2,y2], "label": ...}`` 이고 좌표는
+                    # 0~1000 정수다. 우리 형식(0.0~1.0 소수 + bbox_norm)을 쓰면
+                    # grounding 과제에서 학습 분포와 싸우게 된다 — 9B 급에서
+                    # 그 대가는 좌표 정확도로 나온다.
+                    "bbox_2d": {
                         "type": "array",
-                        "items": {"type": "number", "minimum": 0, "maximum": 1},
+                        "items": {"type": "integer", "minimum": 0, "maximum": 1000},
                         "minItems": 4,
                         "maxItems": 4,
                     },
                     "conf": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["text", "type", "field", "bbox_norm", "conf"],
+                "required": ["text", "type", "field", "bbox_2d", "conf"],
                 "additionalProperties": False,
             },
         }

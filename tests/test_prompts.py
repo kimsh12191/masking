@@ -89,8 +89,21 @@ class TestTranscriptionPolicy:
 class TestBboxGuidance:
     def test_explicitly_lowers_coordinate_pressure(self) -> None:
         """좌표 정확도를 압박하면 그 용량이 전사 정확도에서 빠져나간다."""
-        assert "대략이어도 된다" in SYSTEM_VLM
+        assert "한 픽셀 단위로 맞추려고 애쓰지 마라" in SYSTEM_VLM
         assert "값을 정확히 읽는 것이 좌표보다 훨씬 중요하다" in SYSTEM_VLM
+
+    def test_uses_the_native_qwen_grounding_format(self) -> None:
+        """형식을 우리 편의대로 정하면 grounding 정확도로 대가를 치른다.
+
+        Qwen3-VL 의 기본 좌표계는 0~1000 이고 키는 ``bbox_2d`` 다 (공식 쿡북).
+        한때 ``bbox_norm`` + 0.0~1.0 소수를 요구했는데 그건 어느 버전의 native
+        형식도 아니었다.
+        """
+        assert "bbox_2d" in SYSTEM_VLM
+        assert "0 이상 1000 이하의 정수" in SYSTEM_VLM
+        assert "bbox_norm" not in SYSTEM_VLM
+        # 소수를 쓰지 말라고 명시해야 한다 — 반대 방향의 지시가 남아 있으면 안 된다
+        assert "소수를 쓰지 마라" in SYSTEM_VLM
 
     def test_prefers_generous_boxes(self) -> None:
         assert "넉넉하게" in SYSTEM_VLM
