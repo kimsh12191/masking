@@ -99,18 +99,30 @@ class DetectConfig:
 
 
 def tile_rects(
-    width: int, height: int, tiles: int, overlap: float
+    width: int, height: int, tiles: int, overlap: float, factor: int = 1
 ) -> list[tuple[float, float, float, float]]:
     """페이지를 **긴 축 방향으로** 나눈 정규화 사각형 목록을 만든다.
 
     긴 축을 자르는 것은 조각을 정사각형에 가깝게 만들기 위한 것이다. VLM 의
     비전 인코더는 극단적으로 긴 이미지에서 가로세로 한쪽을 크게 줄인다.
 
+    **경계는 ``factor`` 의 배수로 스냅한다.** 이것이 없으면 조각 크기가 패치
+    격자와 안 맞아 ``smart_resize`` 가 조각을 다시 리샘플한다 (1748x826 ->
+    1760x832). 그러면 두 가지를 잃는다.
+
+    1. **보간이 들어간다.** 10px 급 한글이 뭉개지고, 그건 곧 미탐이다.
+    2. **토큰 격자가 페이지 픽셀과 어긋난다.** 텍스트 한 줄이 토큰 두 행에
+       걸치고, 조각 경계에 걸친 토큰이 생긴다.
+
+    페이지 자체도 ``factor`` 의 배수여야 이 스냅이 끝까지 성립한다
+    (``preprocess`` 가 오른쪽·아래에 여백을 붙여 맞춘다).
+
     Args:
         width: 페이지 폭 (px).
         height: 페이지 높이 (px).
         tiles: 조각 수. 1 이하면 전체 1장.
         overlap: 겹침 비율 (0.0~0.5). 조각 두께의 이 비율만큼 양쪽으로 넓힌다.
+        factor: 패치 격자 (``DetectConfig.image_factor``). 1 이면 스냅하지 않는다.
 
     Returns:
         ``(x1, y1, x2, y2)`` 정규화 사각형 목록. 항상 최소 1개.
@@ -119,23 +131,37 @@ def tile_rects(
         return [(0.0, 0.0, 1.0, 1.0)]
 
     overlap = min(max(overlap, 0.0), 0.5)
-    band = 1.0 / tiles
-    pad = band * overlap
     vertical = height >= width  # 세로가 길면 y 를 자른다
+    span = height if vertical else width
+    f = max(1, factor)
+
+    band = span / tiles
+    pad = band * overlap
 
     rects: list[tuple[float, float, float, float]] = []
     for i in range(tiles):
-        lo = max(0.0, i * band - pad)
-        hi = min(1.0, (i + 1) * band + pad)
-        rects.append((0.0, lo, 1.0, hi) if vertical else (lo, 0.0, hi, 1.0))
+        lo = 0 if i == 0 else max(0, int((i * band - pad) // f) * f)
+        hi = span if i == tiles - 1 else min(span, -(-int((i + 1) * band + pad) // f) * f)
+        if hi <= lo:  # 조각이 격자보다 얇은 극단적 경우
+            hi = min(span, lo + f)
+        rects.append(
+            (0.0, lo / height, 1.0, hi / height)
+            if vertical
+            else (lo / width, 0.0, hi / width, 1.0)
+        )
     return rects
 
 
 def crop_norm(image: Any, rect: tuple[float, float, float, float]) -> Any:
-    """정규화 사각형으로 이미지를 잘라낸다 (numpy BGR 배열 가정)."""
+    """정규화 사각형으로 이미지를 잘라낸다 (numpy BGR 배열 가정).
+
+    네 변 모두 ``round`` 로 되돌린다. 예전에는 좌상단만 ``int``(내림)였는데,
+    그러면 ``tile_rects`` 가 스냅해 준 픽셀 경계가 1px 어긋나 **격자 정렬이
+    깨지고** ``_to_page`` 가 쓰는 사각형과 실제 크롭이 달라진다.
+    """
     h, w = image.shape[:2]
-    x1 = max(0, min(w - 1, int(rect[0] * w)))
-    y1 = max(0, min(h - 1, int(rect[1] * h)))
+    x1 = max(0, min(w - 1, int(round(rect[0] * w))))
+    y1 = max(0, min(h - 1, int(round(rect[1] * h))))
     x2 = max(x1 + 1, min(w, int(round(rect[2] * w))))
     y2 = max(y1 + 1, min(h, int(round(rect[3] * h))))
     return image[y1:y2, x1:x2]
@@ -396,7 +422,7 @@ def detect(
     warn = warnings if warnings is not None else []
     h, w = image.shape[:2]
 
-    rects = tile_rects(w, h, cfg.tiles, cfg.overlap)
+    rects = tile_rects(w, h, cfg.tiles, cfg.overlap, cfg.image_factor)
     user = build_user(cfg.hint)
     samples = max(1, cfg.samples)
     # samples==1 이면 온도를 건드리지 않는다 — 기존의 결정론적 동작을 지킨다.

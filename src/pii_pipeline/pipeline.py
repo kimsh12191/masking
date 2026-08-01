@@ -53,6 +53,9 @@ class PipelineConfig:
         target_long_side: 전처리 시 긴 변 목표 길이. 결과 좌표계의 기준이 된다.
             높이면 크롭 해상도가 올라가지만 VLM 입력도 커진다 (타일링이 이를
             흡수한다 — ``DetectConfig.tiles`` 참조).
+            **``detect.image_factor`` 의 배수로 둘 것.** A4 300dpi 는 2480 이지만
+            32 의 배수가 아니라 2464(=32×77)를 쓴다. 페이지가 격자에 맞아야
+            조각도 맞고, 그래야 서버가 조각을 다시 리샘플하지 않는다.
         deskew: 기울기 보정 여부.
         ocr: OCR 설정. 이제 OCR 은 페이지 전체가 아니라 **크롭에만** 돈다.
         llm: vLLM 접속/샘플링 설정.
@@ -61,7 +64,7 @@ class PipelineConfig:
         verify: ④ 검증 설정.
     """
 
-    target_long_side: int | None = 2480
+    target_long_side: int | None = 2464
     deskew: bool = True
     ocr: OcrConfig = field(default_factory=OcrConfig.from_env)
     llm: LlmConfig = field(default_factory=LlmConfig)
@@ -119,11 +122,17 @@ class PiiPipeline:
         with _timed(timings, "preprocess"):
             if image is not None:
                 pre = preprocess_array(
-                    image, target_long_side=cfg.target_long_side, deskew=cfg.deskew
+                    image,
+                    target_long_side=cfg.target_long_side,
+                    deskew=cfg.deskew,
+                    align=cfg.detect.image_factor,
                 )
             else:
                 pre = preprocess(
-                    image_path, target_long_side=cfg.target_long_side, deskew=cfg.deskew
+                    image_path,
+                    target_long_side=cfg.target_long_side,
+                    deskew=cfg.deskew,
+                    align=cfg.detect.image_factor,
                 )
 
         result = PageResult(

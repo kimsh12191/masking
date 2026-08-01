@@ -132,6 +132,9 @@ class LlmConfig:
         enable_thinking: Qwen3 계열 추론 모드. 운영에서는 **False** 다
             (지연시간을 먹고 guided 와 충돌한다). 측정·라벨 생성에서만 켠다.
         image_max_side: VLM 으로 보낼 이미지의 긴 변 길이.
+            **``DetectConfig.image_factor`` 의 배수로 둘 것** (1984 = 32×62).
+            배수가 아니면 여기서 줄인 결과가 패치 격자와 안 맞아 서버가 다시
+            리샘플한다 — ``detect`` 가 조각을 격자에 맞춰 놓은 것이 무효가 된다.
             **타일링과 함께 봐야 하는 값이다.** A4 를 ``target_long_side=2480``
             으로 전처리하면 1748x2480 이고, 그대로 보내면 여기서 0.73배로
             줄어 주민등록번호 숫자가 10px 대로 떨어진다 — 읽을 수 없다.
@@ -151,7 +154,7 @@ class LlmConfig:
     guided_backend: str = "xgrammar"
     guided: bool = True
     enable_thinking: bool = False
-    image_max_side: int = 2000
+    image_max_side: int = 1984
     max_retries: int = 2
     extra_body: dict[str, Any] = field(default_factory=dict)
 

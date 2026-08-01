@@ -130,6 +130,33 @@ class TestTileRects:
         for rect in tile_rects(PAGE_W, PAGE_H, 3, 5.0):
             assert 0.0 <= rect[1] <= rect[3] <= 1.0
 
+    def test_boundaries_snap_to_the_patch_grid(self) -> None:
+        """조각 크기가 패치 격자의 배수여야 서버가 다시 리샘플하지 않는다.
+
+        안 맞으면 1748x826 이 1760x832 로 보간되어 10px 급 한글이 뭉개진다.
+        그건 곧 미탐이다. 페이지가 격자에 맞아 있어야 (preprocess 가 여백을
+        붙여 맞춘다) 이 성질이 끝까지 성립한다.
+        """
+        w, h = 1760, 2464  # preprocess 가 내놓는 형태
+        for rect in tile_rects(w, h, 3, 0.08, 32):
+            y1, y2 = round(rect[1] * h), round(rect[3] * h)
+            assert (y2 - y1) % 32 == 0, f"조각 높이 {y2 - y1} 가 32 의 배수가 아니다"
+            assert y1 % 32 == 0
+
+    def test_no_snapping_when_factor_is_one(self) -> None:
+        """격자를 모르면 스냅하지 않는다 (이전 동작)."""
+        rects = tile_rects(1000, 2000, 2, 0.0, 1)
+        assert rects[1][1] == pytest.approx(0.5)
+
+    def test_snapping_never_leaves_a_gap(self) -> None:
+        """스냅 때문에 페이지 일부가 어느 조각에도 안 들어가면 그건 미탐이다."""
+        w, h = 1760, 2464
+        rects = tile_rects(w, h, 4, 0.08, 32)
+        assert rects[0][1] == 0.0
+        assert rects[-1][3] == 1.0
+        for a, b in zip(rects[:-1], rects[1:], strict=True):
+            assert b[1] <= a[3], "조각 사이에 빈 구간이 생겼다"
+
 
 class TestCropNorm:
     def test_shape_matches_rect(self) -> None:
@@ -253,15 +280,21 @@ class TestDetect:
         assert len(users) == 1
 
     def test_tile_local_coords_become_page_coords(self) -> None:
-        """조각 안의 y=0.5 는 페이지의 y=0.5 가 아니다."""
+        """조각 안의 y=0 은 페이지의 y=0 이 아니다.
+
+        기준값을 0.5 로 박아 두지 않는다. 조각 경계는 **패치 격자(32px)로
+        스냅되므로** 정확히 절반이 아니다 (2480/2 = 1240 은 32 의 배수가 아니다).
+        기대값을 ``tile_rects`` 에서 가져와야 환산 자체를 검증하게 된다.
+        """
         client = FakeClient([
             {"findings": []},
             {"findings": [item("홍길동", bbox=(0.2, 0.0, 0.4, 1.0))]},
         ])
+        rects = tile_rects(PAGE_W, PAGE_H, 2, 0.0, 32)
         findings, _ = detect(blank_page(), client, cfg(tiles=2, overlap=0.0))
         assert len(findings) == 1
-        # 두 번째 조각은 페이지 y 0.5~1.0 구간이다
-        assert findings[0].bbox_norm[1] == pytest.approx(0.5)
+        # 두 번째 조각의 상단이 곧 이 항목의 상단이다
+        assert findings[0].bbox_norm[1] == pytest.approx(rects[1][1])
         assert findings[0].bbox_norm[3] == pytest.approx(1.0)
         # x 는 세로 분할이므로 그대로다
         assert findings[0].bbox_norm[0] == pytest.approx(0.2)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,6 +22,7 @@ from pii_pipeline.config import (
     OutputConfig,
     describe,
     find_config,
+    grid_report,
     load_config,
 )
 
@@ -379,3 +381,45 @@ class TestAppConfigDefaults:
         assert config.pipeline.detect.tiles == 3
         assert config.output.out_dir == "out"
         assert config.source_path is None
+
+
+class TestGridReport:
+    """패치 격자 정합 검산.
+
+    격자에 어긋나면 서버가 조각을 다시 리샘플해 작은 한글이 뭉개진다. 그런데
+    실행해도 에러가 없고 결과만 조금 나빠지므로, 설정을 찍을 때 검산하지 않으면
+    아무도 모른다.
+    """
+
+    def _cfg(self, **kw: Any) -> AppConfig:
+        c = load_config(None, use_env=False)
+        c.pipeline.target_long_side = kw.get("long_side", 2464)
+        c.pipeline.llm.image_max_side = kw.get("max_side", 1984)
+        c.pipeline.locate.min_pad_px = kw.get("min_pad", 64)
+        c.pipeline.detect.image_factor = kw.get("factor", 32)
+        return c
+
+    def test_aligned_config_is_ok(self) -> None:
+        assert grid_report(self._cfg()).startswith("OK")
+
+    def test_a4_2480_is_flagged(self) -> None:
+        """2480 은 A4 300dpi 지만 32 의 배수가 아니다 — 2464 를 써야 한다."""
+        out = grid_report(self._cfg(long_side=2480))
+        assert "target_long_side=2480" in out and "2464 권장" in out
+
+    def test_unaligned_image_max_side_is_flagged(self) -> None:
+        out = grid_report(self._cfg(max_side=2000))
+        assert "image_max_side=2000" in out and "1984 권장" in out
+
+    def test_padding_below_the_grounding_floor_is_flagged(self) -> None:
+        out = grid_report(self._cfg(min_pad=12))
+        assert "min_pad_px=12" in out and "64 권장" in out
+
+    def test_factor_28_changes_every_recommendation(self) -> None:
+        """Qwen2/2.5-VL 로 바꾸면 격자가 28 이 되어 권장값이 전부 달라진다."""
+        out = grid_report(self._cfg(factor=28))
+        assert "2464" not in out.split("권장")[0] or "÷28" in out
+        assert "÷28" in out
+
+    def test_factor_one_disables_the_check(self) -> None:
+        assert "격자 정렬을 쓰지 않는다" in grid_report(self._cfg(factor=1))

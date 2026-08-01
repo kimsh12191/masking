@@ -114,7 +114,7 @@ class LocateConfig:
             0.35 는 세로 10px 밖에 주지 못해 ``max(12, 10) = 12px`` 이 되고,
             32px 오차를 흡수하지 못한다. 값이 크롭 밖으로 나가면 텍스트 매칭이
             실패하고, 그 다음은 어긋난 자리에서 박스를 고르게 된다. 모델의
-            해상도 하한의 1.5배를 준다.
+            해상도 하한의 **2배(토큰 2칸)** 를 준다 — 격자 단위로 맞추는 것이 일관된다.
         upscale: 크롭을 OCR 에 넣기 전 확대 배율. **작은 글씨에 대한 유일한
             대응책이다.** 원본에 없는 정보를 만들지는 못하지만, rec 모델은
             입력 글자 높이에 민감하므로 실측으로 효과가 있다. 1.0 이면 끈다.
@@ -133,7 +133,7 @@ class LocateConfig:
     """
 
     pad_ratio: float = 0.35
-    min_pad_px: int = 48
+    min_pad_px: int = 64
     upscale: float = 2.0
     max_crop_side: int = 1600
     retry_pad_ratio: float = 1.2

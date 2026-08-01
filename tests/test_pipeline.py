@@ -90,11 +90,18 @@ def box(text: str, x1=5, y1=5, x2=200, y2=45, status=OcrStatus.OK) -> OcrBox:
 def no_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     """전처리를 항등 함수로 만든다 (opencv 의존 제거)."""
 
-    def fake(img: Any, target_long_side: Any = None, deskew: bool = True) -> PreprocessResult:
+    def fake(
+        img: Any,
+        target_long_side: Any = None,
+        deskew: bool = True,
+        align: int = 32,
+    ) -> PreprocessResult:
         h, w = img.shape[:2]
         return PreprocessResult(image=img, width=w, height=h, applied=[])
 
-    def fake_path(path: str, target_long_side: Any = None, deskew: bool = True):
+    def fake_path(
+        path: str, target_long_side: Any = None, deskew: bool = True, align: int = 32
+    ):
         return fake(blank_page())
 
     monkeypatch.setattr(pipeline_mod, "preprocess_array", fake)
@@ -320,7 +327,9 @@ class TestTiling:
             detect=DetectConfig(tiles=2, overlap=0.0, workers=1),
         )
         result = pipe.run("x.png", image=blank_page())
-        assert result.findings[0].bbox_norm[1] >= 0.5
+        # 정확히 0.5 가 아니다 — 조각 경계는 패치 격자(32px)로 스냅된다.
+        # 2000/2 = 1000 은 32 의 배수가 아니라 896 으로 내려간다.
+        assert result.findings[0].bbox_norm[1] >= 0.44
 
 
 class TestImagePassthrough:

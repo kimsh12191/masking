@@ -229,6 +229,44 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
     return config
 
 
+def grid_report(config: AppConfig) -> str:
+    """패치 격자와 어긋난 설정값을 찾아 한 줄로 알려준다.
+
+    **격자에 맞지 않으면 서버가 조각을 다시 리샘플한다.** 10px 급 한글이 보간으로
+    뭉개지고 그건 곧 미탐이다. 그런데 이 어긋남은 실행해도 아무 에러가 없고
+    결과만 조금 나빠지므로, 설정을 찍을 때 검산해 주지 않으면 아무도 모른다.
+
+    ``target_long_side`` 가 배수가 아니어도 전처리가 여백을 붙여 맞추기는 한다.
+    다만 그건 보정이고, 처음부터 배수로 두는 것이 여백 없이 깔끔하다.
+
+    Args:
+        config: 검사할 설정.
+
+    Returns:
+        전부 맞으면 ``"OK ..."``, 아니면 어긋난 항목 목록.
+    """
+    f = config.pipeline.detect.image_factor
+    if f <= 1:
+        return "image_factor=1 — 격자 정렬을 쓰지 않는다"
+
+    bad: list[str] = []
+    long_side = config.pipeline.target_long_side
+    if long_side and long_side % f:
+        near = (long_side // f) * f
+        bad.append(f"target_long_side={long_side} (÷{f} 아님, {near} 권장)")
+    if config.pipeline.llm.image_max_side % f:
+        near = (config.pipeline.llm.image_max_side // f) * f
+        bad.append(f"image_max_side={config.pipeline.llm.image_max_side} (÷{f} 아님, {near} 권장)")
+    if config.pipeline.locate.min_pad_px < f:
+        bad.append(
+            f"min_pad_px={config.pipeline.locate.min_pad_px} < {f} "
+            f"(모델 grounding 하한보다 작다, {f * 2} 권장)"
+        )
+    if bad:
+        return "어긋남 — " + "; ".join(bad)
+    return f"OK — 모두 {f}px 격자에 맞음 (조각 리샘플 없음)"
+
+
 def describe(config: AppConfig) -> str:
     """현재 적용된 설정 요약 (실행 로그에 남길 용도).
 
@@ -284,6 +322,7 @@ def describe(config: AppConfig) -> str:
                 if pipe.detect.max_pixels
                 else "  max_pixels=모델 기본값"
             ),
+            "   격자 정합  " + grid_report(config),
             f"③ 좌표 확정  크롭 패딩 {pipe.locate.pad_ratio:.0%}"
             f" (최소 {pipe.locate.min_pad_px}px)"
             f"  업샘플 x{pipe.locate.upscale}"
