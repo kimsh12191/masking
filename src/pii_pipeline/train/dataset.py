@@ -1,0 +1,261 @@
+"""OCR 결과를 VLM 학습 타깃으로 바꾼다.
+
+한 타일에 대한 학습 샘플 하나는 이렇게 생겼다.
+
+    입력   타일 이미지 (추론 때 모델이 받는 것과 **같은** 이미지)
+    타깃   {"findings":[{"text":"...","bbox_2d":[x1,y1,x2,y2]}, ...]}
+
+``bbox_2d`` 는 추론과 같은 규약(타일 기준 0~1000 정수)이다.
+
+좌표를 만드는 방법 — 디코딩 함수를 뒤집는다
+--------------------------------------------
+
+추론에서 모델의 답이 페이지 좌표가 되는 경로는 이것뿐이다::
+
+    bbox_2d --(_sane_bbox: /1000)--> 타일 정규화 --(_to_page: rect)--> 페이지 정규화
+
+그래서 라벨은 이 경로를 **정확히 역으로** 계산한다. 크롭 사각형의 반올림된
+픽셀값으로 따로 계산하면 안 된다 — ``crop_norm`` 은 반올림 픽셀로 자르지만
+``_to_page`` 는 반올림 전 정규화 사각형을 쓰기 때문에, 둘을 섞으면 서브픽셀
+오차가 생기고 그 오차는 학습 내내 한 방향으로 쌓인다.
+
+남는 오차는 **per-mille 양자화뿐**이다. 폭 1760px 타일에서 눈금 하나가 1.76px
+이므로 왕복 오차의 상한이 그 절반이다. ``roundtrip`` 이 이 상한을 계산해
+검산에 쓴다.
+
+무엇을 정답으로 삼는가
+----------------------
+
+============================  ==================  ==========================
+OCR 박스                      text                왜
+============================  ==================  ==========================
+``OK`` (rec_conf 충분)        읽은 값             전사와 좌표를 함께 가르친다
+``LOW_CONF`` / 임계값 미만    ``""``              **좌표만.** 오독을 정답으로
+                                                  주면 지금 잘하는 전사가
+                                                  망가진다
+``FAILED`` (det 만 성공)      ``""``              손글씨·도장. "글자는 있는데
+                                                  못 읽었다" 는 좌표가 정확
+                                                  하다는 뜻이다
+============================  ==================  ==========================
+
+``FAILED`` 를 버리지 않는 것이 중요하다. OCR 이 못 읽는 부류가 정확히 손글씨와
+도장이고, 그건 VLM 좌표가 가장 나쁜 부류이기도 하다. det 는 성공했으므로
+**좌표 라벨로서는 멀쩡하다.**
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..detect import _sane_bbox, _to_page
+from ..ocr.layout import denorm_bbox
+from ..schema import BBox, OcrBox, OcrStatus
+
+#: 타일 정규화 사각형 ``(x1, y1, x2, y2)``. ``detect.tile_rects`` 의 원소.
+Rect = tuple[float, float, float, float]
+
+
+@dataclass
+class GroundingConfig:
+    """학습 샘플 생성 설정.
+
+    Attributes:
+        text_min_conf: 이 값 이상인 박스만 ``text`` 를 정답으로 쓴다. 미만이면
+            좌표만 쓰고 ``text`` 는 빈 문자열이다. **오독된 글자를 정답으로 주면
+            지금 잘하는 전사 능력이 망가진다.**
+        keep_textless: ``FAILED`` 박스(손글씨·도장)를 좌표 라벨로 쓸지.
+            끄면 학습이 인쇄 텍스트에만 치우친다.
+        min_containment: 박스가 타일 안에 이 비율 이상 들어와야 그 타일의 샘플에
+            넣는다. 타일 경계에 걸친 줄을 반쪽만 가르치면 모델이 잘린 박스를
+            배운다. 타일이 겹쳐 있으므로 걸린 줄은 옆 타일에서 온전히 잡힌다.
+        max_items: 타일당 최대 항목 수. ``schema.VLM_SCHEMA`` 의 ``maxItems`` 와
+            맞춰야 한다 — 추론에서 낼 수 없는 길이를 학습시키면 안 된다.
+        min_items: 이 개수 미만이면 샘플을 버린다. 빈 타일만 잔뜩 배우면
+            "아무것도 없다" 로 답하는 쪽이 쉬워진다.
+        min_side_px: 이보다 작은 박스는 버린다. 노이즈 검출이다.
+    """
+
+    text_min_conf: float = 0.9
+    keep_textless: bool = True
+    min_containment: float = 0.95
+    max_items: int = 32
+    min_items: int = 1
+    min_side_px: int = 6
+
+
+@dataclass
+class TileSample:
+    """타일 하나에 대한 학습 샘플.
+
+    Attributes:
+        tile: 타일 인덱스.
+        rect: 타일의 정규화 사각형. 좌표 검산에 필요하다.
+        items: ``{"text": str, "bbox_2d": [x1,y1,x2,y2]}`` 목록.
+        max_error_px: 이 샘플에서 관측된 최대 왕복 오차 (페이지 픽셀).
+            per-mille 양자화 상한을 넘으면 변환이 어딘가 어긋난 것이다.
+        n_textless: 좌표만 가르치는 항목 수 (손글씨·도장·저신뢰).
+    """
+
+    tile: int
+    rect: Rect
+    items: list[dict[str, Any]] = field(default_factory=list)
+    max_error_px: float = 0.0
+    n_textless: int = 0
+
+    def target_json(self) -> str:
+        """추론 스키마와 같은 모양의 학습 타깃 문자열."""
+        return json.dumps({"findings": self.items}, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# 좌표 변환 — 추론 디코딩의 역함수
+# --------------------------------------------------------------------------
+
+
+def to_permille(bbox: BBox, rect: Rect, page_w: int, page_h: int) -> list[int]:
+    """페이지 픽셀 박스를 **타일 기준 0~1000 정수**로 바꾼다.
+
+    ``detect._to_page`` 의 역이다. 그쪽이 쓰는 것과 같은 정규화 사각형을 써야
+    추론이 이 값을 원래 자리로 되돌린다.
+
+    Args:
+        bbox: 페이지 픽셀 좌표 박스.
+        rect: 타일의 정규화 사각형 (``detect.tile_rects`` 원소).
+        page_w: 페이지 폭 (px).
+        page_h: 페이지 높이 (px).
+
+    Returns:
+        ``[x1, y1, x2, y2]`` 0~1000 정수.
+    """
+    rw = max(1e-9, rect[2] - rect[0])
+    rh = max(1e-9, rect[3] - rect[1])
+
+    def local(value: float, page_dim: int, origin: float, span: float) -> int:
+        norm = value / max(1, page_dim)
+        return int(round(min(max((norm - origin) / span, 0.0), 1.0) * 1000))
+
+    return [
+        local(bbox[0], page_w, rect[0], rw),
+        local(bbox[1], page_h, rect[1], rh),
+        local(bbox[2], page_w, rect[0], rw),
+        local(bbox[3], page_h, rect[1], rh),
+    ]
+
+
+def roundtrip(permille: list[int], rect: Rect, page_w: int, page_h: int) -> BBox:
+    """``bbox_2d`` 를 **추론과 똑같은 경로로** 페이지 픽셀로 되돌린다.
+
+    검산 전용이다. 여기서 원래 박스가 안 나오면 라벨이 틀린 것이고, 그대로
+    학습시키면 모델에게 틀린 자리를 가르치게 된다.
+    """
+    local = _sane_bbox(list(permille), 1000.0, 1000.0)
+    assert local is not None  # 4개 정수는 항상 통과한다
+    return denorm_bbox(_to_page(local, rect), page_w, page_h)
+
+
+def quantization_limit(rect: Rect, page_w: int, page_h: int) -> float:
+    """per-mille 눈금 하나가 페이지 픽셀로 얼마인가 (왕복 오차의 상한).
+
+    타일이 넓을수록 눈금이 굵다. 폭 1760px 타일이면 1.76px 이고, 반올림이
+    양쪽으로 갈리므로 실제 상한은 그 값이다. 검산 허용치를 상수로 박으면
+    타일 크기가 바뀔 때 조용히 틀린다.
+    """
+    return max(
+        (rect[2] - rect[0]) * page_w / 1000.0,
+        (rect[3] - rect[1]) * page_h / 1000.0,
+    )
+
+
+# --------------------------------------------------------------------------
+# 샘플 생성
+# --------------------------------------------------------------------------
+
+
+def _containment(bbox: BBox, rect_px: BBox) -> float:
+    """``bbox`` 면적 중 ``rect_px`` 안에 들어온 비율."""
+    w = min(bbox[2], rect_px[2]) - max(bbox[0], rect_px[0])
+    h = min(bbox[3], rect_px[3]) - max(bbox[1], rect_px[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    return (w * h) / area if area > 0 else 0.0
+
+
+def rect_to_px(rect: Rect, page_w: int, page_h: int) -> BBox:
+    """정규화 사각형을 픽셀로. 포함 판정에만 쓴다 (좌표 계산에는 쓰지 않는다)."""
+    return (
+        int(round(rect[0] * page_w)),
+        int(round(rect[1] * page_h)),
+        int(round(rect[2] * page_w)),
+        int(round(rect[3] * page_h)),
+    )
+
+
+def _label_text(box: OcrBox, cfg: GroundingConfig) -> str | None:
+    """이 박스의 ``text`` 정답. ``None`` 이면 샘플에서 제외."""
+    if box.status is OcrStatus.FAILED or box.rec_conf < cfg.text_min_conf:
+        return "" if cfg.keep_textless else None
+    text = box.text.strip()
+    return text if text else ("" if cfg.keep_textless else None)
+
+
+def build_tile_sample(
+    boxes: list[OcrBox],
+    tile: int,
+    rect: Rect,
+    page_w: int,
+    page_h: int,
+    cfg: GroundingConfig | None = None,
+) -> TileSample | None:
+    """페이지 OCR 박스에서 타일 하나의 학습 샘플을 만든다.
+
+    OCR 은 **페이지 전체에 한 번만** 돌린다. 타일마다 돌리면 경계에서 같은 줄이
+    두 번 다르게 검출되고, 타일 간에 정답이 어긋난다.
+
+    Args:
+        boxes: 페이지 좌표계의 OCR 박스 전체.
+        tile: 타일 인덱스 (기록용).
+        rect: 타일의 정규화 사각형.
+        page_w: 페이지 폭 (px).
+        page_h: 페이지 높이 (px).
+        cfg: 설정.
+
+    Returns:
+        샘플. 유효 항목이 ``min_items`` 미만이면 ``None``.
+    """
+    cfg = cfg or GroundingConfig()
+    rect_px = rect_to_px(rect, page_w, page_h)
+
+    picked: list[tuple[OcrBox, str]] = []
+    for box in boxes:
+        if box.width < cfg.min_side_px or box.height < cfg.min_side_px:
+            continue
+        if _containment(box.bbox, rect_px) < cfg.min_containment:
+            continue
+        text = _label_text(box, cfg)
+        if text is None:
+            continue
+        picked.append((box, text))
+
+    if len(picked) < cfg.min_items:
+        return None
+
+    # 읽기 순서(위 -> 아래, 왼 -> 오른). 추론에서 기대하는 순서와 같아야 한다.
+    picked.sort(key=lambda p: (p[0].bbox[1], p[0].bbox[0]))
+    if len(picked) > cfg.max_items:
+        # 앞에서 자른다. 뒤를 버리면 "페이지 아래쪽은 답하지 않는다" 를
+        # 가르치게 되므로, 넘치는 타일은 애초에 타일 수를 늘려 해결할 일이다.
+        picked = picked[: cfg.max_items]
+
+    sample = TileSample(tile=tile, rect=rect)
+    for box, text in picked:
+        permille = to_permille(box.bbox, rect, page_w, page_h)
+        back = roundtrip(permille, rect, page_w, page_h)
+        error = max(abs(a - b) for a, b in zip(back, box.bbox, strict=True))
+        sample.max_error_px = max(sample.max_error_px, float(error))
+        sample.items.append({"text": text, "bbox_2d": permille})
+        if not text:
+            sample.n_textless += 1
+    return sample
