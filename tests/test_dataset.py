@@ -247,3 +247,49 @@ class TestScaleRegions:
                 continue
             limit = quantization_limit(rect, self.PAGE_W, self.PAGE_H) + 1.0
             assert sample.max_error_px <= limit
+
+
+class TestLocateTask:
+    """값을 주고 위치만 묻는 주 과제 — 질문은 중복 제거, 답은 모든 출현."""
+
+    def sample(self, boxes: list) -> object:
+        return build_tile_sample(boxes, 0, (0.0, 0.0, 1.0, 1.0), PAGE_W, PAGE_H)
+
+    def test_query_drops_duplicates(self) -> None:
+        """질문에 두 번 적으면 '두 번 물었으니 두 개' 를 배운다. 추론에서는
+        값이 몇 번 나오는지 아무도 모르므로 쓸 수 없는 규칙이다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("강동혁", 100, 300, 200, 340),
+            box("서울시", 100, 500, 220, 540),
+        ])
+        assert s.query() == ["강동혁", "서울시"]
+
+    def test_answer_keeps_every_occurrence(self) -> None:
+        """한 곳만 답하면 나머지 출현이 마스킹되지 않는다 — 가장 흔한 실패다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("강동혁", 100, 300, 200, 340),
+        ])
+        assert len(s.query()) == 1
+        assert len(s.locate_items()) == 2
+        assert {tuple(i["bbox_2d"]) for i in s.locate_items()}.__len__() == 2
+
+    def test_query_keeps_first_seen_order(self) -> None:
+        s = self.sample([
+            box("나중", 100, 500, 200, 540),
+            box("먼저", 100, 100, 200, 140),
+        ])
+        # items 는 읽기 순서로 정렬되므로 위쪽이 먼저다
+        assert s.query() == ["먼저", "나중"]
+
+    def test_textless_boxes_are_not_asked_or_answered(self) -> None:
+        """도장·손글씨는 지목할 텍스트가 없다. 묻지 않은 것을 답하라고 가르치면
+        모델이 질문에 없는 것을 지어낸다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("", 100, 300, 200, 340, status=OcrStatus.FAILED, conf=0.1),
+        ])
+        assert s.query() == ["강동혁"]
+        assert len(s.locate_items()) == 1
+        assert len(s.items) == 2  # read 과제용으로는 남아 있다

@@ -136,9 +136,9 @@ class TileSample:
     """타일 하나에 대한 학습 샘플.
 
     Attributes:
-        tile: 타일 인덱스.
+        tile: 타일 인덱스. 증강 영역은 ``-1``.
         rect: 타일의 정규화 사각형. 좌표 검산에 필요하다.
-        items: ``{"text": str, "bbox_2d": [x1,y1,x2,y2]}`` 목록.
+        items: ``{"text": str, "bbox_2d": [x1,y1,x2,y2]}`` 목록 (읽기 순서).
         max_error_px: 이 샘플에서 관측된 최대 왕복 오차 (페이지 픽셀).
             per-mille 양자화 상한을 넘으면 변환이 어딘가 어긋난 것이다.
         n_textless: 좌표만 가르치는 항목 수 (손글씨·도장·저신뢰).
@@ -153,6 +153,37 @@ class TileSample:
     def target_json(self) -> str:
         """추론 스키마와 같은 모양의 학습 타깃 문자열."""
         return json.dumps({"findings": self.items}, ensure_ascii=False)
+
+    def query(self) -> list[str]:
+        """위치 질의(``locate``)에 쓸 값 목록. **중복을 제거한다.**
+
+        같은 값이 여러 곳에 있다는 사실은 **답**에서 표현된다 (같은 텍스트로
+        항목이 여러 개). 질문에 두 번 적으면 "두 번 물었으니 두 개 답한다" 를
+        배우게 되고, 그건 추론에서 쓸 수 없는 규칙이다 — 추론 때는 값이 몇 번
+        나오는지 아무도 모른다.
+
+        빈 문자열(도장·손글씨)은 지목할 방법이 없으므로 뺀다.
+
+        Returns:
+            첫 등장 순서를 지킨 중복 없는 값 목록.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in self.items:
+            text = item["text"]
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+        return out
+
+    def locate_items(self) -> list[dict[str, Any]]:
+        """위치 질의의 정답. 질문에 담긴 값들의 **모든** 출현.
+
+        빈 문자열 항목은 질문에 없으므로 답에서도 뺀다. 있는데 묻지 않은 것을
+        답하라고 가르치면 모델이 질문에 없는 것을 지어내게 된다.
+        """
+        return [item for item in self.items if item["text"]]
 
 
 # --------------------------------------------------------------------------

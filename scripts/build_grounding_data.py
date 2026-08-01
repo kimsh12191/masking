@@ -287,7 +287,15 @@ def main(argv: list[str] | None = None) -> int:
         "잘라 타일 크기로 확대한다 — **입력 크기는 고정, 글자 크기만 커진다.** "
         "빈 문자열이면 증강 없음",
     )
-    ap.add_argument("--seed", type=int, default=0, help="증강 위치 난수 시드")
+    ap.add_argument(
+        "--read-ratio",
+        type=float,
+        default=0.3,
+        help="빈 항목(도장·손글씨)이 있는 영역에서 'read' 과제도 낼 확률. "
+        "지목할 텍스트가 없는 영역은 이 과제로만 가르칠 수 있다. "
+        "0 이면 locate 만 만든다",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="증강 위치·과제 선택 난수 시드")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -313,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     ocr = PaddleOcrRunner(cfg.ocr)
 
     n_pages = n_samples = n_items = n_textless = n_aug = 0
+    n_by_task: dict[str, int] = {}
     n_overlay = 0
     worst_error = 0.0
     problems: list[str] = []
@@ -344,28 +353,56 @@ def main(argv: list[str] | None = None) -> int:
 
                     cv2.imwrite(str(tile_path), tile_img)
 
-                    fp.write(
-                        json.dumps(
+                    # 이 영역에서 뽑을 과제를 정한다.
+                    #
+                    #   locate  값을 주고 위치만 묻는다 (주 과제).
+                    #           손실이 거의 전부 좌표에 걸린다
+                    #   read    전부 읽고 위치까지. **지목할 텍스트가 없는**
+                    #           도장·손글씨는 이쪽으로만 가르칠 수 있다
+                    #
+                    # 텍스트가 있으면 locate, 그리고 빈 항목(도장·손글씨)이
+                    # 섞여 있으면 read 도 함께 낸다.
+                    rows = []
+                    query = sample.query()
+                    if query:
+                        rows.append(
                             {
-                                "image": str(tile_path.relative_to(out_dir)),
-                                "target": {"findings": sample.items},
-                                # 재현·디버깅용. 학습에는 쓰지 않는다.
-                                "meta": {
-                                    "page": stem,
-                                    "tile": sample.tile,
-                                    "rect": [round(v, 6) for v in sample.rect],
-                                    "page_size": [page_w, page_h],
-                                    "max_error_px": round(sample.max_error_px, 2),
-                                },
-                            },
-                            ensure_ascii=False,
+                                "task": "locate",
+                                "query": query,
+                                "target": {"findings": sample.locate_items()},
+                            }
                         )
-                        + "\n"
-                    )
+                    if sample.n_textless and rng.random() < args.read_ratio:
+                        rows.append(
+                            {"task": "read", "target": {"findings": sample.items}}
+                        )
+                    if not rows:
+                        continue
 
-                    n_samples += 1
+                    for row in rows:
+                        fp.write(
+                            json.dumps(
+                                {
+                                    "image": str(tile_path.relative_to(out_dir)),
+                                    **row,
+                                    # 재현·디버깅용. 학습에는 쓰지 않는다.
+                                    "meta": {
+                                        "page": stem,
+                                        "tile": sample.tile,
+                                        "rect": [round(v, 6) for v in sample.rect],
+                                        "page_size": [page_w, page_h],
+                                        "max_error_px": round(sample.max_error_px, 2),
+                                    },
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        n_samples += 1
+                        n_by_task[row["task"]] = n_by_task.get(row["task"], 0) + 1
+                        n_items += len(row["target"]["findings"])
+
                     n_aug += int(sample.tile < 0)
-                    n_items += len(sample.items)
                     n_textless += sample.n_textless
                     worst_error = max(worst_error, sample.max_error_px)
 
@@ -383,7 +420,9 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("=" * 58)
     print(f" 페이지        {n_pages}")
-    print(f" 학습 샘플     {n_samples}  (추론 타일 {n_samples - n_aug} + 스케일 증강 {n_aug})")
+    print(f" 학습 샘플     {n_samples}"
+          f"   locate {n_by_task.get('locate', 0)}  read {n_by_task.get('read', 0)}")
+    print(f" 영역          추론 타일 + 스케일 증강 {n_aug}개")
     print(f" 항목          {n_items}  (타일당 평균 {n_items / max(1, n_samples):.1f})")
     print(
         f"   글자+좌표   {n_items - n_textless}"

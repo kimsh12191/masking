@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from pii_pipeline.llm.prompts import SYSTEM_GROUNDING, USER_GROUNDING
+from pii_pipeline.llm.prompts import (
+    SYSTEM_GROUNDING,
+    SYSTEM_LOCATE,
+    USER_GROUNDING,
+)
 from pii_pipeline.train.sft import (
     IGNORE_INDEX,
     TOKEN_AXIS_KEYS,
@@ -30,13 +34,16 @@ from pii_pipeline.train.sft import (
 )
 
 
-def example(findings=None) -> Example:
+def example(findings=None, task: str = "locate", query=None) -> Example:
+    items = findings if findings is not None else [
+        {"text": "강동혁", "bbox_2d": [318, 266, 398, 317]}
+    ]
     return Example(
         image_path=Path("tiles/x_t0.png"),
-        target={"findings": findings if findings is not None else [
-            {"text": "강동혁", "bbox_2d": [318, 266, 398, 317]}
-        ]},
+        target={"findings": items},
         meta={"tile": 0},
+        task=task,
+        query=query if query is not None else [i["text"] for i in items if i["text"]],
     )
 
 
@@ -107,8 +114,16 @@ class TestPadding:
 
 
 class TestBuildMessages:
-    def test_uses_the_grounding_prompts(self) -> None:
-        messages, _ = build_messages(example())
+    def test_locate_asks_for_the_given_values(self) -> None:
+        """주 과제 — 값을 알려주고 위치만 묻는다."""
+        messages, _ = build_messages(example(task="locate", query=["강동혁", "서울"]))
+        assert messages[0]["content"][0]["text"] == SYSTEM_LOCATE
+        user = messages[1]["content"][1]["text"]
+        assert "강동혁" in user and "서울" in user
+
+    def test_read_falls_back_to_the_transcription_prompt(self) -> None:
+        """도장·손글씨는 지목할 텍스트가 없어 이쪽으로만 가르칠 수 있다."""
+        messages, _ = build_messages(example(task="read"))
         assert messages[0]["content"][0]["text"] == SYSTEM_GROUNDING
         assert messages[1]["content"][1]["text"] == USER_GROUNDING
 
@@ -158,8 +173,10 @@ class TestLoadJsonl:
 
     def test_reads_rows(self, tmp_path: Path) -> None:
         rows = [
-            {"image": "tiles/a.png", "target": {"findings": []}, "meta": {"tile": 0}},
-            {"image": "tiles/b.png", "target": {"findings": []}, "meta": {"tile": 1}},
+            {"image": "tiles/a.png", "task": "read",
+             "target": {"findings": []}, "meta": {"tile": 0}},
+            {"image": "tiles/b.png", "task": "read",
+             "target": {"findings": []}, "meta": {"tile": 1}},
         ]
         got = load_jsonl(self._write(tmp_path, rows))
         assert len(got) == 2
@@ -167,7 +184,7 @@ class TestLoadJsonl:
 
     def test_missing_image_raises(self, tmp_path: Path) -> None:
         """조용히 건너뛰면 데이터가 반쯤 빠진 채 학습이 돈다."""
-        rows = [{"image": "tiles/gone.png", "target": {"findings": []}}]
+        rows = [{"image": "tiles/gone.png", "task": "read", "target": {"findings": []}}]
         path = self._write(tmp_path, rows, make_images=False)
         with pytest.raises(FileNotFoundError, match="이미지가 없습니다"):
             load_jsonl(path)
@@ -177,7 +194,10 @@ class TestLoadJsonl:
         (tmp_path / "tiles/a.png").write_bytes(b"x")
         path = tmp_path / "data.jsonl"
         path.write_text(
-            json.dumps({"image": "tiles/a.png", "target": {"findings": []}}) + "\n\n",
+            json.dumps(
+                {"image": "tiles/a.png", "task": "read", "target": {"findings": []}}
+            )
+            + "\n\n",
             encoding="utf-8",
         )
         assert len(load_jsonl(path)) == 1
