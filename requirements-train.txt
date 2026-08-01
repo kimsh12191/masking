@@ -1,0 +1,35 @@
+# 좌표 학습 전용 의존성 (scripts/train_grounding.py).
+#
+# **추론에는 필요 없다.** requirements.txt 와 분리한 이유가 그것이다 —
+# 운영 서버는 vLLM 에 붙는 OpenAI 클라이언트와 PaddleOCR 만 있으면 되고,
+# 여기 있는 것들은 학습 장비에만 깔린다.
+#
+# 데이터 생성(scripts/build_grounding_data.py)에는 이 파일이 필요 없다.
+# requirements.txt 의 PaddleOCR 로 충분하다.
+
+# ---------------------------------------------------------------------------
+# PyTorch — CUDA 버전에 맞는 휠을 **먼저** 설치할 것
+# ---------------------------------------------------------------------------
+# 이 파일에 torch 를 핀으로 박지 않는다. PyPI 기본 휠이 환경의 CUDA 와 안 맞으면
+# 조용히 CPU 로 떨어져서 "학습이 이상하게 느리다" 로만 나타난다.
+#
+#   CUDA 12.1:  pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   CUDA 11.8:  pip install torch --index-url https://download.pytorch.org/whl/cu118
+#
+# 설치 후 확인:
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+
+# ---------------------------------------------------------------------------
+# 학습 스택
+# ---------------------------------------------------------------------------
+# Qwen3-VL 지원이 들어간 버전이어야 한다. 낮으면 오토클래스를 못 찾고
+# train_grounding.py 가 무엇을 올려야 하는지 알려주며 죽는다.
+transformers>=4.51
+peft>=0.13
+accelerate>=0.34
+# Trainer 의 저장/체크포인트 경로에서 쓴다.
+safetensors>=0.4
+
+# 이미지 로딩. requirements.txt 에도 있지만 학습 장비에 추론 스택을 안 깔 수
+# 있으므로 여기에도 명시한다.
+Pillow>=10.0

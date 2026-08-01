@@ -180,28 +180,41 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def load_model(model_id: str, dtype: str) -> tuple[Any, Any]:
+def load_model(model_id: str, dtype: str, device_map: str | None = None) -> tuple[Any, Any]:
     """모델과 프로세서를 올린다.
 
-    ``AutoModelForVision2Seq`` 가 없는 구버전 transformers 를 위해 예외 메시지를
-    구체적으로 남긴다 — "왜 안 되지" 로 시간을 쓰지 않게.
+    VLM 오토클래스 이름이 transformers 버전마다 다르다 (``AutoModelForImageTextToText``
+    가 새 이름, ``AutoModelForVision2Seq`` 가 옛 이름). 둘 다 시도하고, 없으면
+    무엇을 올려야 하는지 알려준다 — "왜 안 되지" 로 시간을 쓰지 않게.
+
+    Args:
+        device_map: ``--list-modules`` 처럼 추론만 할 때 ``"auto"``. **학습에서는
+            ``None``** 이다. Trainer 가 모델 배치를 직접 관리하는데 ``device_map``
+            으로 이미 쪼개 놓으면 충돌한다 (9B bf16 은 80GB 한 장에 들어간다).
     """
     import torch  # type: ignore[import-not-found]
-    from transformers import AutoProcessor  # type: ignore[import-not-found]
+    import transformers  # type: ignore[import-not-found]
 
-    try:
-        from transformers import AutoModelForVision2Seq as AutoVlm  # type: ignore
-    except ImportError as exc:  # pragma: no cover - 환경 의존
+    auto_vlm = None
+    for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        auto_vlm = getattr(transformers, name, None)
+        if auto_vlm is not None:
+            log.info("오토클래스: transformers.%s", name)
+            break
+    if auto_vlm is None:  # pragma: no cover - 환경 의존
         raise RuntimeError(
-            "transformers 에 AutoModelForVision2Seq 가 없습니다. "
+            "transformers 에 VLM 오토클래스가 없습니다 "
+            "(AutoModelForImageTextToText / AutoModelForVision2Seq). "
             "Qwen3-VL 을 지원하는 버전으로 올리세요."
-        ) from exc
+        )
 
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype]
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoVlm.from_pretrained(
-        model_id, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
+    processor = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = auto_vlm.from_pretrained(
+        model_id, torch_dtype=torch_dtype, trust_remote_code=True, device_map=device_map
     )
+    # gradient checkpointing 과 충돌한다. PEFT 로 감싸기 전에 꺼 둔다.
+    model.config.use_cache = False
     return model, processor
 
 
@@ -326,6 +339,14 @@ def main(argv: list[str] | None = None) -> int:
         help="merger 를 동결한다. 32px 토큰 격자 아래로는 못 내려간다 — A/B 비교용",
     )
     ap.add_argument("--merge", default=None, help="학습 후 머지해 저장할 경로 (서빙용)")
+    ap.add_argument("--workers", type=int, default=4, help="데이터로더 워커 (이미지 전처리)")
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="앞에서 N개만 사용. **처음에는 8 정도로 한 번 돌려볼 것** — "
+        "배선이 틀렸는지 몇 분 만에 안다",
+    )
     ap.add_argument("--dry-run", action="store_true", help="데이터·프롬프트·마스킹만 확인")
     ap.add_argument("--dry-run-index", type=int, default=0)
     ap.add_argument("--list-modules", action="store_true", help="모듈 이름 출력 후 종료")
@@ -335,12 +356,14 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     if args.list_modules:
-        model, _ = load_model(args.model, args.dtype)
+        model, _ = load_model(args.model, args.dtype, device_map="auto")
         for name, _ in model.named_modules():
             print(name)
         return 0
 
     examples = load_jsonl(args.data)
+    if args.max_samples:
+        examples = examples[: args.max_samples]
     if not examples:
         print("학습 샘플이 없습니다.", file=sys.stderr)
         return 1
@@ -358,10 +381,23 @@ def main(argv: list[str] | None = None) -> int:
         args.dropout,
         None if args.no_merger else args.merger_module,
     )
-    model.config.use_cache = False  # gradient checkpointing 과 충돌한다
+
+    # gradient checkpointing + LoRA 의 고전적인 함정. 베이스가 전부 동결이라
+    # 체크포인트 구간 입력에 grad_fn 이 없고, 역전파가
+    # "element 0 of tensors does not require grad" 로 죽는다. 임베딩 출력에
+    # requires_grad 를 세워 사슬을 잇는다.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     dataset = GroundingDataset(examples, processor, args.max_len)
-    pad_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
+    pad_id = processor.tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = processor.tokenizer.eos_token_id
+    if pad_id is None:
+        raise RuntimeError(
+            "토크나이저에 pad_token_id 도 eos_token_id 도 없습니다. "
+            "패딩 값을 정할 수 없어 배치를 만들 수 없습니다."
+        )
 
     trainer = Trainer(
         model=model,
@@ -372,13 +408,18 @@ def main(argv: list[str] | None = None) -> int:
             per_device_train_batch_size=args.batch,
             gradient_accumulation_steps=args.grad_accum,
             gradient_checkpointing=True,
+            # reentrant 방식은 PEFT 와 섞였을 때 일부 파라미터의 grad 를 흘린다.
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             bf16=args.dtype == "bf16",
             fp16=args.dtype == "fp16",
             logging_steps=10,
             save_strategy="epoch",
             report_to=[],
             seed=args.seed,
-            remove_unused_columns=False,  # pixel_values 를 Trainer 가 버리지 않게
+            dataloader_num_workers=args.workers,
+            # pixel_values 는 모델 시그니처에 없는 이름일 수 있다. 끄지 않으면
+            # Trainer 가 조용히 버리고 모델이 이미지를 못 본다.
+            remove_unused_columns=False,
         ),
         train_dataset=dataset,
         data_collator=lambda batch: collate(batch, pad_id),
