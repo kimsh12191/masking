@@ -318,8 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pages", default=None, help="PDF 페이지 범위 (예: 1-3)")
     args = ap.parse_args(argv)
 
-    cfg = load_config(args.config) if args.config else None
-    pipeline = PiiPipeline(cfg)
+    # load_config 는 AppConfig 를 돌려준다. PiiPipeline 이 받는 것은 .pipeline 이다.
+    pipeline = PiiPipeline(load_config(args.config).pipeline if args.config else None)
 
     pages: list[PageResult] = []
     for path in args.inputs:
