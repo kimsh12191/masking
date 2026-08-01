@@ -140,21 +140,72 @@ def _to_page(
     return (rx + x1 * rw, ry + y1 * rh, rx + x2 * rw, ry + y2 * rh)
 
 
+def _numbers(raw: Any) -> list[float] | None:
+    """bbox 후보를 숫자 4개로 만든다. 못 만들면 ``None``."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        return [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+
+
+def infer_scale(
+    raws: list[Any], tile_w: int, tile_h: int
+) -> tuple[float, float, str]:
+    """한 응답의 bbox 들을 **함께 보고** 좌표 규약을 정한다.
+
+    이 함수가 없으면 조용히 망가진다. 프롬프트는 0.0~1.0 을 요구하지만
+    **Qwen-VL 계열의 native grounding 형식은 0~1000 스케일**이고, 모델은 종종
+    학습된 습관대로 답한다. 그 값을 0~1 로 알고 잘라내면 모든 항목이 페이지
+    우하단 한 점으로 뭉치고, 크롭이 전부 그 구석에서 떠지고, 뒤 단계 전체가
+    무의미해진다. 출력은 그럴듯한 형식의 쓰레기가 된다.
+
+    JSON Schema 에 ``maximum: 1`` 을 걸어 두었지만 **믿을 수 없다** — 문법 기반
+    guided decoding 은 숫자 범위를 강제하지 못하는 것이 보통이다.
+
+    판정은 항목별이 아니라 **응답 단위**로 한다. 한 항목만 보면 작은 값이
+    0~1 인지 0~1000 인지 알 수 없지만, 응답 전체의 최댓값을 보면 갈린다.
+
+    Args:
+        raws: 이 응답의 ``bbox_norm`` 원본들.
+        tile_w: 이 호출에 보낸 타일의 폭 (px).
+        tile_h: 타일의 높이 (px).
+
+    Returns:
+        ``(x 나눌 값, y 나눌 값, 규약 이름)``. 규약 이름은 경고와 메타에 남는다.
+    """
+    vals = [abs(v) for raw in raws if (nums := _numbers(raw)) for v in nums]
+    hi = max(vals, default=0.0)
+    if hi <= 1.0:
+        return 1.0, 1.0, "unit"
+    if hi <= 1000.0:
+        # 0~1000 (Qwen 계열 기본). 타일보다 큰 값이 나오면 픽셀일 수 없으므로
+        # 이쪽이 확실하고, 애매한 구간에서도 이쪽이 더 흔하다.
+        return 1000.0, 1000.0, "per-mille"
+    return float(max(1, tile_w)), float(max(1, tile_h)), "pixel"
+
+
 def _sane_bbox(
-    raw: Any,
+    raw: Any, scale_x: float = 1.0, scale_y: float = 1.0
 ) -> tuple[float, float, float, float] | None:
-    """모델이 준 bbox 를 정리한다. 못 쓰면 ``None``.
+    """모델이 준 bbox 를 정규화 좌표로 정리한다. 못 쓰면 ``None``.
 
     좌표 순서가 뒤집힌 것(x2<x1)은 정렬해 살린다 — 값 자체는 맞는데 순서만
     틀린 경우가 흔하고, 버리면 탐지 하나를 잃는다. 면적이 0 이면 최소 크기를
     준다 (한 점을 찍은 경우. 패딩을 붙이면 쓸 만한 크롭이 된다).
+
+    **범위를 벗어난 값은 규약 환산 뒤에도 남으면 잘라낸다.** 다만 그 전에
+    ``infer_scale`` 이 규약을 맞춰 놓았으므로, 여기까지 와서 잘리는 것은
+    소수의 이상치뿐이다 (예전에는 전량이 여기서 뭉개졌다).
     """
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+    nums = _numbers(raw)
+    if nums is None:
         return None
-    try:
-        vals = [min(max(float(v), 0.0), 1.0) for v in raw]
-    except (TypeError, ValueError):
-        return None
+    vals = [
+        min(max(v / (scale_x if i % 2 == 0 else scale_y), 0.0), 1.0)
+        for i, v in enumerate(nums)
+    ]
 
     x1, x2 = sorted((vals[0], vals[2]))
     y1, y2 = sorted((vals[1], vals[3]))
@@ -291,14 +342,27 @@ def detect(
                 f"({meta['salvaged']}) — 프롬프트/guided decoding 점검 필요"
             )
 
+        raw_items = [i for i in (payload.get("findings") or []) if isinstance(i, dict)]
+
+        # 좌표 규약을 먼저 정한다. 항목별로 판단하면 알 수 없다 (infer_scale).
+        tile_h_px, tile_w_px = tile_imgs[tile_no].shape[:2]
+        scale_x, scale_y, convention = infer_scale(
+            [i.get("bbox_norm") for i in raw_items], tile_w_px, tile_h_px
+        )
+        meta["coord_convention"] = convention
+        if convention != "unit":
+            warn.append(
+                f"VLM {where}: bbox 가 0.0~1.0 이 아니라 '{convention}' 규약으로 "
+                f"왔습니다 (÷{scale_x:g},{scale_y:g} 로 환산). 프롬프트가 요구한 "
+                f"형식이 아닙니다 — 모델을 바꾸면 다시 확인할 것"
+            )
+
         n_before = len(findings)
-        for item in payload.get("findings") or []:
-            if not isinstance(item, dict):
-                continue
+        for item in raw_items:
             label = item.get("type")
             if not label:
                 continue
-            bbox = _sane_bbox(item.get("bbox_norm"))
+            bbox = _sane_bbox(item.get("bbox_norm"), scale_x, scale_y)
             if bbox is None:
                 warn.append(
                     f"VLM {where}: bbox_norm 이 없거나 잘못된 항목 폐기 "

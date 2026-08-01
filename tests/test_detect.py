@@ -19,6 +19,7 @@ from pii_pipeline.detect import (
     _to_page,
     crop_norm,
     detect,
+    infer_scale,  # noqa: E402
     match_key,
     tile_rects,
 )
@@ -454,3 +455,79 @@ class TestParallel:
             banded_page(4), ByImageClient(4), DetectConfig(tiles=4, overlap=0.0, workers=4)
         )
         assert [m["tile"] for m in metas] == [0, 1, 2, 3]
+
+
+# --------------------------------------------------------------------------
+# 좌표 규약 — 조용히 망가지던 자리
+# --------------------------------------------------------------------------
+
+
+class TestInferScale:
+    """모델이 0~1 이 아닌 규약으로 답할 때.
+
+    Qwen-VL 계열의 native grounding 형식은 **0~1000 스케일**이다. 프롬프트가
+    0.0~1.0 을 요구해도 학습된 습관대로 답하는 일이 있고, JSON Schema 의
+    ``maximum: 1`` 은 문법 기반 guided decoding 이 강제해주지 않는다.
+    그걸 0~1 로 알고 잘라내면 **모든 항목이 우하단 한 점으로 뭉친다.**
+    """
+
+    def test_unit_scale_is_left_alone(self) -> None:
+        assert infer_scale([[0.1, 0.2, 0.3, 0.4]], 1748, 826) == (1.0, 1.0, "unit")
+
+    def test_thousand_scale_is_detected(self) -> None:
+        sx, sy, name = infer_scale([[310, 420, 440, 450]], 1748, 826)
+        assert (sx, sy, name) == (1000.0, 1000.0, "per-mille")
+
+    def test_pixel_scale_is_detected(self) -> None:
+        sx, sy, name = infer_scale([[310, 420, 1500, 700]], 1748, 826)
+        assert (sx, sy, name) == (1748.0, 826.0, "pixel")
+
+    def test_decision_uses_the_whole_response_not_one_item(self) -> None:
+        """항목 하나만 보면 작은 값이 0~1 인지 0~1000 인지 알 수 없다.
+
+        같은 응답 안에 큰 값이 하나라도 있으면 전부 같은 규약이다.
+        """
+        raws = [[0.1, 0.2, 0.3, 0.4], [310, 420, 440, 450]]
+        assert infer_scale(raws, 1748, 826)[2] == "per-mille"
+
+    def test_empty_response_does_not_crash(self) -> None:
+        assert infer_scale([], 1748, 826) == (1.0, 1.0, "unit")
+
+    def test_garbage_entries_are_skipped(self) -> None:
+        assert infer_scale([None, "x", [1, 2]], 1748, 826) == (1.0, 1.0, "unit")
+
+
+class TestCoordConventionEndToEnd:
+    def test_thousand_scale_lands_where_it_should(self) -> None:
+        """이 테스트가 없어서 출력이 통째로 쓰레기였다.
+
+        [310,420,440,450] 은 페이지의 왼쪽 중간이다. 환산 없이 잘라내면
+        (0.996,0.996,1.0,1.0) — 우하단 한 점이 된다.
+        """
+        client = FakeClient([{"findings": [
+            {"text": "김수현", "type": "NAME", "field": "신청인",
+             "bbox_norm": [310, 420, 440, 450], "conf": 0.9}
+        ]}])
+        findings, _ = detect(blank_page(), client, cfg(tiles=1))
+        assert len(findings) == 1
+        x1, y1, x2, y2 = findings[0].bbox_norm
+        assert 0.30 < x1 < 0.32 and 0.41 < y1 < 0.43
+        assert 0.43 < x2 < 0.45 and 0.44 < y2 < 0.46
+
+    def test_the_conversion_is_warned_not_silent(self) -> None:
+        """조용히 고치면 모델을 바꿨을 때 아무도 모른다."""
+        warnings: list[str] = []
+        client = FakeClient([{"findings": [
+            {"text": "김수현", "type": "NAME", "field": "",
+             "bbox_norm": [310, 420, 440, 450], "conf": 0.9}
+        ]}])
+        _, metas = detect(blank_page(), client, cfg(tiles=1), warnings)
+        assert any("per-mille" in w for w in warnings)
+        assert metas[0]["coord_convention"] == "per-mille"
+
+    def test_normal_response_says_nothing(self) -> None:
+        warnings: list[str] = []
+        client = FakeClient([{"findings": [item("김수현")]}])
+        _, metas = detect(blank_page(), client, cfg(tiles=1), warnings)
+        assert warnings == []
+        assert metas[0]["coord_convention"] == "unit"
