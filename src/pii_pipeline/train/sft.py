@@ -32,6 +32,35 @@ from ..llm.prompts import SYSTEM_GROUNDING, USER_GROUNDING
 #: 손실에서 제외할 라벨 값 (PyTorch cross-entropy 의 기본 ``ignore_index``).
 IGNORE_INDEX = -100
 
+#: **토큰 축을 갖는** 입력 키. 배치에서 길이를 맞춰 패딩해야 하는 것들이다.
+#:
+#: 나머지(``pixel_values``, ``image_grid_thw``)는 토큰 축이 없다 — Qwen-VL 의
+#: 프로세서는 패치를 배치 차원 없이 ``(패치수, 차원)`` 으로 납작하게 돌려주고
+#: ``image_grid_thw`` 가 어디부터 어디까지가 몇 번째 이미지인지 알려준다.
+#: 그래서 이 둘을 구분하지 않고 일괄로 ``[0]`` 을 떼면 **패치 하나만 남는다.**
+#: 증상은 학습이 도는데 이미지를 거의 못 보는 것이고, 로그로는 안 보인다.
+TOKEN_AXIS_KEYS: frozenset[str] = frozenset(
+    {"input_ids", "attention_mask", "token_type_ids", "labels"}
+)
+
+
+def pad_fill_value(key: str, pad_id: int) -> int:
+    """패딩 자리에 넣을 값.
+
+    ``labels`` 만 ``IGNORE_INDEX`` 다. 여기에 ``pad_id`` 를 넣으면 **모델이
+    문장 끝에 패딩 토큰을 뱉도록 배운다** — 배치에 길이가 섞여 있을 때만
+    나타나서 재현이 까다롭다.
+
+    Raises:
+        ValueError: 토큰 축이 없는 키를 넘겼을 때. 그런 텐서는 패딩이 아니라
+            이어 붙이는 대상이라 조용히 처리하면 안 된다.
+    """
+    if key not in TOKEN_AXIS_KEYS:
+        raise ValueError(
+            f"'{key}' 는 토큰 축이 없습니다. 패딩이 아니라 연결(cat) 대상입니다."
+        )
+    return IGNORE_INDEX if key == "labels" else (0 if key != "input_ids" else pad_id)
+
 
 @dataclass
 class Example:

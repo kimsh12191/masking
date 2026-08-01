@@ -20,10 +20,12 @@ import pytest
 from pii_pipeline.llm.prompts import SYSTEM_GROUNDING, USER_GROUNDING
 from pii_pipeline.train.sft import (
     IGNORE_INDEX,
+    TOKEN_AXIS_KEYS,
     Example,
     build_messages,
     load_jsonl,
     mask_prompt,
+    pad_fill_value,
     summarize,
 )
 
@@ -73,6 +75,30 @@ class TestMaskPrompt:
         ids = [1, 2, 3, 4]
         mask_prompt(ids, prompt_len=2)
         assert ids == [1, 2, 3, 4]
+
+
+# --------------------------------------------------------------------------
+# 배치 패딩 — 어느 텐서에 토큰 축이 있는가
+# --------------------------------------------------------------------------
+
+
+class TestPadding:
+    def test_labels_pad_with_ignore_not_pad_token(self) -> None:
+        """패딩 자리에 pad_id 를 넣으면 모델이 끝에 패딩을 뱉도록 배운다."""
+        assert pad_fill_value("labels", pad_id=7) == IGNORE_INDEX
+
+    def test_input_ids_pad_with_the_pad_token(self) -> None:
+        assert pad_fill_value("input_ids", pad_id=7) == 7
+
+    def test_attention_mask_pads_with_zero(self) -> None:
+        assert pad_fill_value("attention_mask", pad_id=7) == 0
+
+    def test_image_tensors_are_not_padded(self) -> None:
+        """pixel_values 는 토큰 축이 없다. 일괄 처리하면 패치 하나만 남는다."""
+        for key in ("pixel_values", "image_grid_thw"):
+            assert key not in TOKEN_AXIS_KEYS
+            with pytest.raises(ValueError, match="토큰 축이 없습니다"):
+                pad_fill_value(key, pad_id=7)
 
 
 # --------------------------------------------------------------------------
