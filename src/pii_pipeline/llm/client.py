@@ -156,6 +156,29 @@ class LlmConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
 
 
+def fit_max_side(height: int, width: int, max_side: int) -> tuple[int, int]:
+    """긴 변을 ``max_side`` 로 맞춘 크기. 확대는 하지 않는다.
+
+    **``detect`` 와 여기가 같은 계산을 써야 한다.** 모델이 실제로 본 이미지
+    크기를 알아야 절대 픽셀 좌표를 옳게 환산할 수 있는데, 그 크기는 이 축소를
+    거친 뒤의 값이다. 두 곳에 따로 적어 두면 한쪽만 바뀌었을 때 좌표가 조용히
+    어긋나고, 화면에는 "박스가 전체적으로 밀렸다" 로만 보인다.
+
+    Args:
+        height: 원본 높이 (px).
+        width: 원본 폭 (px).
+        max_side: 긴 변 상한. 0 이하면 축소하지 않는다.
+
+    Returns:
+        ``(높이, 폭)``.
+    """
+    long_side = max(height, width)
+    if max_side <= 0 or long_side <= max_side:
+        return (height, width)
+    scale = max_side / long_side
+    return (max(1, int(height * scale)), max(1, int(width * scale)))
+
+
 class LlmClient:
     """구조화 JSON 응답을 강제하는 얇은 래퍼."""
 
@@ -199,11 +222,9 @@ class LlmClient:
                 arr = arr[:, :, ::-1]  # BGR -> RGB
             image = Image.fromarray(arr)
 
-        max_side = self.config.image_max_side
-        if max(image.size) > max_side:
-            scale = max_side / max(image.size)
-            new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
-            image = image.resize(new_size, Image.LANCZOS)
+        h, w = fit_max_side(image.height, image.width, self.config.image_max_side)
+        if (w, h) != image.size:
+            image = image.resize((w, h), Image.LANCZOS)
 
         buf = io.BytesIO()
         image.convert("RGB").save(buf, format="JPEG", quality=92)

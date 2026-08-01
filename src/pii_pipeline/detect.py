@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from .llm.client import LlmClient
+from .llm.client import LlmClient, fit_max_side
 from .llm.prompts import SYSTEM_VLM, build_user
 from .normalize import canonical_text
 from .schema import VLM_SCHEMA, VlmFinding
@@ -66,6 +66,19 @@ class DetectConfig:
             ``samples == 1`` 이면 무시되고 설정값(0)이 쓰인다 (결정론 유지).
         workers: 동시 호출 수. 0 이면 호출 수만큼 (``_MAX_WORKERS`` 상한).
             타일 호출은 서로 독립이므로 직렬로 돌릴 이유가 없다.
+        image_factor: 비전 인코더의 패치 크기 × merge 크기. **모델을 바꾸면 반드시
+            같이 바꿔야 한다** — Qwen3-VL 은 16×2=32, Qwen2/2.5-VL 은 14×2=28.
+            이미지는 이 값의 배수로 리사이즈되어 인코더에 들어간다.
+        max_pixels: 타일 하나의 픽셀 상한. 0 이면 모델 기본값
+            (``16384 × image_factor²``). **서버(vLLM) 설정과 맞춰야 의미가 있다** —
+            서버가 더 작은 값을 쓰면 타일이 더 축소되고, 작은 한글이 뭉개진다.
+            이 값을 넘는 타일은 축소되므로 경고를 낸다. 미탐의 흔한 원인이다.
+        coord_convention: 좌표 규약을 고정한다. ``"auto"`` 면 응답마다 추론한다
+            (``infer_scale``). **자동 추론에는 원리적 사각지대가 있다** — 타일이
+            1000px 보다 크고 모델이 절대 픽셀로 답했는데 그 값들이 우연히 모두
+            1000 미만이면 per-mille 로 오판한다. 그 오차는 위치에 비례해 커지는
+            밀림으로 나타난다. ``scripts/diagnose.py`` 로 규약을 확인했으면
+            ``"per-mille"`` / ``"pixel"`` / ``"unit"`` 로 고정하는 것이 안전하다.
     """
 
     tiles: int = 3
@@ -75,6 +88,9 @@ class DetectConfig:
     samples: int = 1
     sample_temperature: float = 0.3
     workers: int = 0
+    image_factor: int = 32
+    max_pixels: int = 0
+    coord_convention: str = "auto"
 
 
 # --------------------------------------------------------------------------
@@ -150,27 +166,78 @@ def _numbers(raw: Any) -> list[float] | None:
         return None
 
 
+def round_by_factor(value: float, factor: int) -> int:
+    return int(round(value / factor) * factor)
+
+
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int,
+    max_pixels: int = 0,
+    min_pixels: int = 0,
+) -> tuple[int, int]:
+    """비전 인코더가 실제로 보는 크기를 계산한다 (Qwen 의 ``smart_resize`` 이식).
+
+    출처: ``QwenLM/Qwen3-VL`` 의 ``qwen-vl-utils/src/qwen_vl_utils/vision_process.py``.
+    ``IMAGE_MIN_TOKEN_NUM = 4``, ``IMAGE_MAX_TOKEN_NUM = 16384`` 이고 기본
+    한계는 ``토큰수 × factor²`` 다.
+
+    **이 값을 알아야 하는 이유는 하나다.** Qwen2.5-VL 의 grounding 좌표는
+    "리사이즈된 이미지의 절대 픽셀" 이다. 우리가 보낸 타일 크기로 나누면
+    리사이즈 비율만큼 어긋나고, 그 오차는 위치에 비례해서 커진다 — 화면에는
+    "박스가 전체적으로 밀렸다" 로 보인다. 원본 크기가 아니라 **모델이 본 크기**로
+    나눠야 한다.
+
+    Args:
+        height: 보낼 이미지 높이 (px).
+        width: 보낼 이미지 폭 (px).
+        factor: 패치 크기 × merge 크기. Qwen3-VL 은 16×2=32, Qwen2/2.5-VL 은 14×2=28.
+        max_pixels: 상한. 0 이면 모델 기본값 (``16384 × factor²``).
+        min_pixels: 하한. 0 이면 모델 기본값 (``4 × factor²``).
+
+    Returns:
+        ``(높이, 폭)``. 둘 다 ``factor`` 의 배수다.
+    """
+    factor = max(1, factor)
+    hi = max_pixels or 16384 * factor * factor
+    lo = min_pixels or 4 * factor * factor
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
+    if h_bar * w_bar > hi:
+        beta = ((height * width) / hi) ** 0.5
+        h_bar = max(factor, int(height / beta / factor) * factor)
+        w_bar = max(factor, int(width / beta / factor) * factor)
+    elif h_bar * w_bar < lo:
+        beta = (lo / max(1, height * width)) ** 0.5
+        h_bar = max(factor, -(-int(height * beta) // factor) * factor)
+        w_bar = max(factor, -(-int(width * beta) // factor) * factor)
+    return h_bar, w_bar
+
+
 def infer_scale(
     raws: list[Any], tile_w: int, tile_h: int
 ) -> tuple[float, float, str]:
     """한 응답의 bbox 들을 **함께 보고** 좌표 규약을 정한다.
 
-    이 함수가 없으면 조용히 망가진다. 프롬프트는 0.0~1.0 을 요구하지만
-    **Qwen-VL 계열의 native grounding 형식은 0~1000 스케일**이고, 모델은 종종
-    학습된 습관대로 답한다. 그 값을 0~1 로 알고 잘라내면 모든 항목이 페이지
-    우하단 한 점으로 뭉치고, 크롭이 전부 그 구석에서 떠지고, 뒤 단계 전체가
-    무의미해진다. 출력은 그럴듯한 형식의 쓰레기가 된다.
+    기대값은 **0~1000 (per-mille)** 이다. 그게 Qwen3-VL 의 native 좌표계이고
+    프롬프트도 그것을 요구한다. 이 함수가 하는 일은 규약을 추측하는 것이 아니라
+    **모델이 기대와 다른 규약으로 답했을 때 조용히 망가지지 않게** 하는 것이다.
 
-    JSON Schema 에 ``maximum: 1`` 을 걸어 두었지만 **믿을 수 없다** — 문법 기반
+    Qwen 계열의 규약은 버전마다 다르다 — Qwen2-VL 은 0~1000, Qwen2.5-VL 은
+    리사이즈된 이미지의 절대 픽셀, Qwen3-VL 은 다시 0~1000 이다. 그래서 모델을
+    바꾸면 이 판정이 달라질 수 있고, ``meta["coord_convention"]`` 에 남는다.
+
+    JSON Schema 에 ``maximum: 1000`` 을 걸어 두었지만 **믿을 수 없다** — 문법 기반
     guided decoding 은 숫자 범위를 강제하지 못하는 것이 보통이다.
 
     판정은 항목별이 아니라 **응답 단위**로 한다. 한 항목만 보면 작은 값이
     0~1 인지 0~1000 인지 알 수 없지만, 응답 전체의 최댓값을 보면 갈린다.
 
     Args:
-        raws: 이 응답의 ``bbox_norm`` 원본들.
-        tile_w: 이 호출에 보낸 타일의 폭 (px).
-        tile_h: 타일의 높이 (px).
+        raws: 이 응답의 ``bbox_2d`` 원본들.
+        tile_w: 이 호출에서 **모델이 본** 타일 폭 (px). ``smart_resize`` 적용 후.
+        tile_h: 모델이 본 타일 높이 (px).
 
     Returns:
         ``(x 나눌 값, y 나눌 값, 규약 이름)``. 규약 이름은 경고와 메타에 남는다.
@@ -178,12 +245,53 @@ def infer_scale(
     vals = [abs(v) for raw in raws if (nums := _numbers(raw)) for v in nums]
     hi = max(vals, default=0.0)
     if hi <= 1.0:
+        # 소수로 답했다. 값이 하나뿐이고 작으면 per-mille 과 구분되지 않지만,
+        # 어느 쪽으로 봐도 0~1 구간이므로 결과는 같다.
         return 1.0, 1.0, "unit"
     if hi <= 1000.0:
-        # 0~1000 (Qwen 계열 기본). 타일보다 큰 값이 나오면 픽셀일 수 없으므로
-        # 이쪽이 확실하고, 애매한 구간에서도 이쪽이 더 흔하다.
         return 1000.0, 1000.0, "per-mille"
+    # 1000 을 넘었다 = Qwen2.5-VL 식 절대 픽셀. 나눌 값은 우리가 보낸 크기가
+    # 아니라 **모델이 본 크기**다 (smart_resize 참조).
     return float(max(1, tile_w)), float(max(1, tile_h)), "pixel"
+
+
+def pick_scale(
+    setting: str, raws: list[Any], tile_w: int, tile_h: int
+) -> tuple[float, float, str]:
+    """설정이 규약을 고정했으면 그것을 쓰고, ``"auto"`` 면 추론한다.
+
+    고정할 수 있어야 하는 이유가 있다. ``infer_scale`` 은 응답의 최댓값으로
+    판정하는데, **타일이 1000px 보다 크고 모델이 절대 픽셀로 답했는데 그 값들이
+    우연히 모두 1000 미만이면** per-mille 로 오판한다 (페이지 왼쪽 위에만 항목이
+    있는 경우). 오판의 결과는 위치에 비례해 커지는 밀림이라 눈으로는 그냥
+    "박스가 밀렸다" 로만 보인다. 한 번 측정해 확정했으면 추론에 맡기지 않는 것이
+    맞다.
+
+    Args:
+        setting: ``"auto"`` / ``"unit"`` / ``"per-mille"`` / ``"pixel"``.
+        raws: 이 응답의 ``bbox_2d`` 원본들.
+        tile_w: 모델이 본 타일 폭 (px).
+        tile_h: 모델이 본 타일 높이 (px).
+
+    Returns:
+        ``(x 나눌 값, y 나눌 값, 규약 이름)``.
+
+    Raises:
+        ValueError: 알 수 없는 규약 이름. 오타를 조용히 ``auto`` 로 넘기면
+            고정한 줄 알고 쓰게 된다.
+    """
+    if setting == "auto":
+        return infer_scale(raws, tile_w, tile_h)
+    if setting == "unit":
+        return 1.0, 1.0, "unit"
+    if setting == "per-mille":
+        return 1000.0, 1000.0, "per-mille"
+    if setting == "pixel":
+        return float(max(1, tile_w)), float(max(1, tile_h)), "pixel"
+    raise ValueError(
+        f"detect.coord_convention 값이 잘못되었습니다: {setting!r} "
+        "(auto / unit / per-mille / pixel 중 하나)"
+    )
 
 
 def _sane_bbox(
@@ -299,6 +407,28 @@ def detect(
     tile_imgs = [
         crop_norm(image, rect) if len(rects) > 1 else image for rect in rects
     ]
+    # 비전 인코더가 실제로 보게 될 크기. 좌표 환산의 기준이고, 축소가 일어나면
+    # 작은 한글이 뭉개져 **미탐**으로 이어진다. 그래서 조용히 넘기지 않는다.
+    #
+    # 순서가 중요하다: 클라이언트가 image_max_side 로 먼저 줄이고, 그 다음
+    # 서버의 비전 프로세서가 smart_resize 를 적용한다. 원본 타일 크기로
+    # 계산하면 절대 픽셀 좌표가 그 비율만큼 어긋난다.
+    seen = [
+        smart_resize(
+            *fit_max_side(t.shape[0], t.shape[1], client.config.image_max_side),
+            cfg.image_factor,
+            cfg.max_pixels,
+        )
+        for t in tile_imgs
+    ]
+    for i, (tile, (sh, sw)) in enumerate(zip(tile_imgs, seen, strict=True)):
+        th, tw = tile.shape[:2]
+        if sh * sw < th * tw * 0.81:  # 한 변 10% 이상 줄어든다
+            warn.append(
+                f"VLM 타일 {i}: {tw}x{th} -> {sw}x{sh} 로 축소되어 인코더에 들어갑니다 "
+                f"(max_pixels 한계). 작은 글씨가 뭉개져 미탐이 늘 수 있습니다 — "
+                f"detect.tiles 를 늘리거나 서버의 max_pixels 를 올릴 것"
+            )
 
     def one(job: tuple[int, int]) -> dict[str, Any]:
         tile_no, sample_no = job
@@ -345,16 +475,20 @@ def detect(
         raw_items = [i for i in (payload.get("findings") or []) if isinstance(i, dict)]
 
         # 좌표 규약을 먼저 정한다. 항목별로 판단하면 알 수 없다 (infer_scale).
-        tile_h_px, tile_w_px = tile_imgs[tile_no].shape[:2]
-        scale_x, scale_y, convention = infer_scale(
-            [i.get("bbox_norm") for i in raw_items], tile_w_px, tile_h_px
+        # 나눌 기준은 우리가 보낸 크기가 아니라 **모델이 본 크기**다.
+        seen_h, seen_w = seen[tile_no]
+        scale_x, scale_y, convention = pick_scale(
+            cfg.coord_convention,
+            [i.get("bbox_2d") for i in raw_items],
+            seen_w,
+            seen_h,
         )
         meta["coord_convention"] = convention
-        if convention != "unit":
+        if convention == "pixel":
             warn.append(
-                f"VLM {where}: bbox 가 0.0~1.0 이 아니라 '{convention}' 규약으로 "
-                f"왔습니다 (÷{scale_x:g},{scale_y:g} 로 환산). 프롬프트가 요구한 "
-                f"형식이 아닙니다 — 모델을 바꾸면 다시 확인할 것"
+                f"VLM {where}: bbox 가 0~1000 이 아니라 절대 픽셀로 왔습니다 "
+                f"(Qwen2.5-VL 식. 모델이 본 크기 {seen_w}x{seen_h} 로 환산). "
+                f"프롬프트가 요구한 형식이 아닙니다 — 모델을 바꾸면 다시 확인할 것"
             )
 
         n_before = len(findings)
@@ -362,10 +496,10 @@ def detect(
             label = item.get("type")
             if not label:
                 continue
-            bbox = _sane_bbox(item.get("bbox_norm"), scale_x, scale_y)
+            bbox = _sane_bbox(item.get("bbox_2d"), scale_x, scale_y)
             if bbox is None:
                 warn.append(
-                    f"VLM {where}: bbox_norm 이 없거나 잘못된 항목 폐기 "
+                    f"VLM {where}: bbox_2d 가 없거나 잘못된 항목 폐기 "
                     f"(type={label}, text={str(item.get('text'))[:20]!r})"
                 )
                 continue

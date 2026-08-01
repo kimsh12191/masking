@@ -329,15 +329,21 @@ VLM_SCHEMA: dict[str, Any] = {
                     "text": {"type": "string", "maxLength": 120},
                     "type": {"type": "string", "enum": list(PII_LABELS)},
                     "field": {"type": "string", "maxLength": 40},
-                    "bbox_norm": {
+                    # 키 이름과 스케일 모두 **Qwen-VL 의 native grounding 형식**이다.
+                    # 공식 쿡북(cookbooks/2d_grounding.ipynb)의 출력이
+                    # ``{"bbox_2d": [x1,y1,x2,y2], "label": ...}`` 이고 좌표는
+                    # 0~1000 정수다. 우리 형식(0.0~1.0 소수 + bbox_norm)을 쓰면
+                    # grounding 과제에서 학습 분포와 싸우게 된다 — 9B 급에서
+                    # 그 대가는 좌표 정확도로 나온다.
+                    "bbox_2d": {
                         "type": "array",
-                        "items": {"type": "number", "minimum": 0, "maximum": 1},
+                        "items": {"type": "integer", "minimum": 0, "maximum": 1000},
                         "minItems": 4,
                         "maxItems": 4,
                     },
                     "conf": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["text", "type", "field", "bbox_norm", "conf"],
+                "required": ["text", "type", "field", "bbox_2d", "conf"],
                 "additionalProperties": False,
             },
         }

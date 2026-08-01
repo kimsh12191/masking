@@ -21,8 +21,10 @@ from pii_pipeline.detect import (
     detect,
     infer_scale,  # noqa: E402
     match_key,
+    smart_resize,
     tile_rects,
 )
+from pii_pipeline.llm.client import LlmConfig
 from pii_pipeline.schema import VlmFinding
 
 np = pytest.importorskip("numpy", reason="numpy 미설치 환경에서는 건너뛴다")
@@ -44,6 +46,8 @@ class FakeClient:
 
     #: ``detect()`` 가 병렬 실행 전에 지연 초기화를 미리 건드린다.
     client = None
+    #: ``detect()`` 가 '모델이 본 크기' 를 계산할 때 image_max_side 를 읽는다.
+    config = LlmConfig()
 
     def complete_json(
         self,
@@ -63,7 +67,20 @@ class FakeClient:
 
 
 def item(text: str, label: str = "NAME", bbox=(0.1, 0.1, 0.3, 0.2), conf: float = 0.9) -> dict:
-    return {"text": text, "type": label, "field": "성명", "bbox_norm": list(bbox), "conf": conf}
+    """VLM 응답 항목 하나.
+
+    ``bbox`` 는 편의상 0.0~1.0 으로 받지만 **payload 에는 0~1000 정수로 넣는다** —
+    그게 Qwen-VL 의 native 형식이고 프롬프트가 요구하는 것이다. 테스트가
+    0.0~1.0 소수를 보내면 프로덕션에서 실제로 오는 형식을 한 번도 검증하지
+    않게 된다.
+    """
+    return {
+        "text": text,
+        "type": label,
+        "field": "성명",
+        "bbox_2d": [int(round(v * 1000)) for v in bbox],
+        "conf": conf,
+    }
 
 
 def cfg(**kw: Any) -> DetectConfig:
@@ -290,10 +307,10 @@ class TestDetect:
         ])
         findings, _ = detect(blank_page(), client, cfg(tiles=1), warnings)
         assert findings == []
-        assert any("bbox_norm" in w for w in warnings)
+        assert any("bbox_2d" in w for w in warnings)
 
     def test_item_without_type_is_skipped(self) -> None:
-        client = FakeClient([{"findings": [{"text": "x", "bbox_norm": [0, 0, 1, 1]}]}])
+        client = FakeClient([{"findings": [{"text": "x", "bbox_2d": [0, 0, 1, 1]}]}])
         findings, _ = detect(blank_page(), client, cfg(tiles=1))
         assert findings == []
 
@@ -420,6 +437,7 @@ class ByImageClient:
         self.seen: list[int] = []
 
     client = None
+    config = LlmConfig()
 
     def complete_json(self, system, user, schema, image=None, temperature=None):
         # 밴드 중앙을 보고 어느 타일인지 알아낸다 (겹침 구간을 피한다).
@@ -497,37 +515,159 @@ class TestInferScale:
         assert infer_scale([None, "x", [1, 2]], 1748, 826) == (1.0, 1.0, "unit")
 
 
-class TestCoordConventionEndToEnd:
-    def test_thousand_scale_lands_where_it_should(self) -> None:
-        """이 테스트가 없어서 출력이 통째로 쓰레기였다.
+class TestSmartResize:
+    """``qwen-vl-utils`` 의 ``smart_resize`` 와 같은 값을 내야 한다.
 
-        [310,420,440,450] 은 페이지의 왼쪽 중간이다. 환산 없이 잘라내면
-        (0.996,0.996,1.0,1.0) — 우하단 한 점이 된다.
-        """
+    이 값이 틀리면 절대 픽셀 좌표를 잘못된 값으로 나눠서, 오차가 위치에 비례해
+    커지는 밀림이 생긴다 — 정확히 진단하기 어려운 모양의 고장이다.
+    """
+
+    def test_dimensions_become_multiples_of_the_factor(self) -> None:
+        h, w = smart_resize(2480, 1748, 32)
+        assert h % 32 == 0 and w % 32 == 0
+
+    def test_a4_page_is_not_downscaled_by_default(self) -> None:
+        """기본 상한(16384 토큰)은 A4 300dpi 를 줄이지 않는다."""
+        assert smart_resize(2480, 1748, 32) == (2496, 1760)
+
+    def test_qwen25_factor_differs(self) -> None:
+        """Qwen2/2.5-VL 은 14x2=28 이다. 모델을 바꾸면 이 값도 바뀐다."""
+        h, w = smart_resize(2480, 1748, 28)
+        assert h % 28 == 0 and w % 28 == 0
+        assert (h, w) == (2492, 1736)
+
+    def test_max_pixels_shrinks_and_keeps_the_aspect_ratio(self) -> None:
+        h, w = smart_resize(2480, 1748, 32, max_pixels=256 * 32 * 32)
+        assert h * w <= 256 * 32 * 32
+        assert abs((w / h) - (1748 / 2480)) < 0.05
+
+    def test_min_pixels_grows_a_tiny_crop(self) -> None:
+        h, w = smart_resize(10, 8, 32)
+        assert h >= 32 and w >= 32
+
+    def test_never_returns_zero(self) -> None:
+        h, w = smart_resize(1, 1, 32)
+        assert h >= 32 and w >= 32
+
+
+class TestCoordConventionEndToEnd:
+    """세 규약이 모두 제자리에 떨어져야 한다.
+
+    Qwen 계열의 grounding 좌표계는 버전마다 다르다 — Qwen2-VL 0~1000,
+    Qwen2.5-VL 리사이즈 이미지의 절대 픽셀, Qwen3-VL 다시 0~1000. 모델을 바꿨을
+    때 조용히 어긋나는 것이 최악이므로 세 경로를 다 고정해 둔다.
+    """
+
+    def test_per_mille_is_the_expected_native_format(self) -> None:
+        """[310,420,440,450] 은 페이지의 왼쪽 중간이다. 이게 native 형식이다."""
         client = FakeClient([{"findings": [
             {"text": "김수현", "type": "NAME", "field": "신청인",
-             "bbox_norm": [310, 420, 440, 450], "conf": 0.9}
+             "bbox_2d": [310, 420, 440, 450], "conf": 0.9}
         ]}])
-        findings, _ = detect(blank_page(), client, cfg(tiles=1))
+        findings, metas = detect(blank_page(), client, cfg(tiles=1))
         assert len(findings) == 1
         x1, y1, x2, y2 = findings[0].bbox_norm
         assert 0.30 < x1 < 0.32 and 0.41 < y1 < 0.43
         assert 0.43 < x2 < 0.45 and 0.44 < y2 < 0.46
-
-    def test_the_conversion_is_warned_not_silent(self) -> None:
-        """조용히 고치면 모델을 바꿨을 때 아무도 모른다."""
-        warnings: list[str] = []
-        client = FakeClient([{"findings": [
-            {"text": "김수현", "type": "NAME", "field": "",
-             "bbox_norm": [310, 420, 440, 450], "conf": 0.9}
-        ]}])
-        _, metas = detect(blank_page(), client, cfg(tiles=1), warnings)
-        assert any("per-mille" in w for w in warnings)
         assert metas[0]["coord_convention"] == "per-mille"
 
-    def test_normal_response_says_nothing(self) -> None:
+    def test_the_expected_format_is_not_warned_about(self) -> None:
+        """기대한 형식으로 왔으면 조용해야 한다. 안 그러면 경고가 소음이 된다."""
         warnings: list[str] = []
         client = FakeClient([{"findings": [item("김수현")]}])
-        _, metas = detect(blank_page(), client, cfg(tiles=1), warnings)
+        _, metas = detect(blank_page(1000, 1400), client, cfg(tiles=1), warnings)
         assert warnings == []
+        assert metas[0]["coord_convention"] == "per-mille"
+
+    def test_decimals_still_work(self) -> None:
+        """모델이 0.0~1.0 소수로 답해도 같은 자리에 떨어져야 한다."""
+        client = FakeClient([{"findings": [
+            {"text": "김수현", "type": "NAME", "field": "",
+             "bbox_2d": [0.31, 0.42, 0.44, 0.45], "conf": 0.9}
+        ]}])
+        findings, metas = detect(blank_page(), client, cfg(tiles=1))
+        x1, y1, _, _ = findings[0].bbox_norm
+        assert 0.30 < x1 < 0.32 and 0.41 < y1 < 0.43
         assert metas[0]["coord_convention"] == "unit"
+
+    def test_absolute_pixels_divide_by_what_the_model_saw(self) -> None:
+        """Qwen2.5-VL 식 절대 픽셀. **우리가 보낸 크기가 아니라 모델이 본 크기**다.
+
+        1000x1400 은 클라이언트 축소를 거치지 않고 factor 32 로 992x1408 이 되어
+        인코더에 들어간다. 보낸 크기로 나누면 그 비율만큼 어긋나고, 오차가
+        위치에 비례해 커져서 "박스가 전체적으로 밀렸다" 로 보인다.
+        """
+        seen_w, seen_h = 992, 1408
+        client = FakeClient([{"findings": [
+            {"text": "김수현", "type": "NAME", "field": "",
+             "bbox_2d": [
+                 int(0.31 * seen_w), int(0.80 * seen_h),
+                 int(0.44 * seen_w), int(0.83 * seen_h),
+             ], "conf": 0.9}
+        ]}])
+        warnings: list[str] = []
+        findings, metas = detect(blank_page(1000, 1400), client, cfg(tiles=1), warnings)
+        x1, y1, x2, y2 = findings[0].bbox_norm
+        assert 0.305 < x1 < 0.315 and 0.795 < y1 < 0.805
+        assert 0.435 < x2 < 0.445 and 0.825 < y2 < 0.835
+        assert metas[0]["coord_convention"] == "pixel"
+        assert any("절대 픽셀" in w for w in warnings)
+
+    def test_auto_detection_has_a_real_blind_spot(self) -> None:
+        """**자동 추론으로는 못 가르는 경우가 있다.** 이게 고정 옵션이 있는 이유다.
+
+        절대 픽셀인데 그 값들이 우연히 모두 1000 미만이면 (페이지 위쪽에만
+        항목이 있는 경우) per-mille 로 오판한다. 결과는 위치에 비례해 커지는
+        밀림이고, 눈으로는 그냥 "박스가 밀렸다" 로만 보인다.
+        """
+        seen_w, seen_h = 992, 1408
+        payload = {"findings": [
+            {"text": "김수현", "type": "NAME", "field": "",
+             "bbox_2d": [
+                 int(0.31 * seen_w), int(0.42 * seen_h),
+                 int(0.44 * seen_w), int(0.45 * seen_h),
+             ], "conf": 0.9}
+        ]}
+        page = blank_page(1000, 1400)
+
+        auto, metas = detect(page, FakeClient([payload]), cfg(tiles=1))
+        assert metas[0]["coord_convention"] == "per-mille"
+        assert auto[0].bbox_norm[1] > 0.5          # 실제 0.42 인데 0.59 로 밀렸다
+
+        pinned, metas = detect(
+            page, FakeClient([payload]), cfg(tiles=1, coord_convention="pixel")
+        )
+        assert metas[0]["coord_convention"] == "pixel"
+        assert 0.415 < pinned[0].bbox_norm[1] < 0.425
+
+    def test_a_typo_in_the_pinned_convention_is_not_silently_ignored(self) -> None:
+        """조용히 auto 로 넘기면 고정한 줄 알고 쓴다."""
+        with pytest.raises(ValueError, match="coord_convention"):
+            detect(
+                blank_page(1000, 1400),
+                FakeClient([{"findings": [item("김수현")]}]),
+                cfg(tiles=1, coord_convention="permille"),
+            )
+
+    def test_max_pixels_downscale_is_warned(self) -> None:
+        """축소는 작은 한글을 뭉개고 그건 미탐이 된다. 조용히 넘기면 안 된다."""
+        warnings: list[str] = []
+        client = FakeClient([{"findings": []}])
+        detect(blank_page(), client, cfg(tiles=1, max_pixels=256 * 32 * 32), warnings)
+        assert any("축소되어 인코더에" in w for w in warnings)
+
+    def test_whole_page_in_one_tile_is_warned_as_downscaled(self) -> None:
+        """타일 1개로 A4 를 보내면 image_max_side 에서 0.64배로 줄어든다.
+
+        타일링을 하는 이유가 바로 이것이다. 예전에는 이 축소가 설정 요약에만
+        나왔고 실행 중에는 조용했다 — 미탐의 가장 흔한 원인인데.
+        """
+        warnings: list[str] = []
+        detect(blank_page(), FakeClient([{"findings": []}]), cfg(tiles=1), warnings)
+        assert any("축소되어 인코더에" in w for w in warnings)
+
+    def test_tiled_page_is_not_downscaled(self) -> None:
+        """타일 3개면 긴 변이 1748 이라 image_max_side(2000) 에 걸리지 않는다."""
+        warnings: list[str] = []
+        detect(blank_page(), FakeClient([{"findings": []}] * 3), cfg(tiles=3), warnings)
+        assert not any("축소" in w for w in warnings)

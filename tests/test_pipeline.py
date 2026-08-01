@@ -15,6 +15,7 @@ import pytest
 
 from pii_pipeline import pipeline as pipeline_mod
 from pii_pipeline.detect import DetectConfig
+from pii_pipeline.llm.client import LlmConfig
 from pii_pipeline.locate import LocateConfig
 from pii_pipeline.pipeline import PiiPipeline, PipelineConfig
 from pii_pipeline.preprocess import PreprocessResult
@@ -35,7 +36,7 @@ def blank_page(w: int = PAGE_W, h: int = PAGE_H) -> Any:
 def vlm_item(text: str, label: str, bbox, conf: float = 0.9, field: str = "") -> dict:
     return {
         "text": text, "type": label, "field": field,
-        "bbox_norm": list(bbox), "conf": conf,
+        "bbox_2d": list(bbox), "conf": conf,
     }
 
 
@@ -48,6 +49,8 @@ class FakeClient:
         self.calls = 0
 
     client = None  # detect() 의 지연 초기화 프라이밍 대상
+    #: detect() 가 '모델이 본 크기' 를 계산할 때 image_max_side 를 읽는다.
+    config = LlmConfig()
 
     def complete_json(
         self,

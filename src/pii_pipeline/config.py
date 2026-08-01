@@ -272,6 +272,18 @@ def describe(config: AppConfig) -> str:
                 if tile_side
                 else ""
             ),
+            "   좌표 규약  bbox_2d "
+            + (
+                "0~1000 native (응답마다 자동 판정)"
+                if pipe.detect.coord_convention == "auto"
+                else f"{pipe.detect.coord_convention} 고정"
+            )
+            + f"  image_factor={pipe.detect.image_factor}"
+            + (
+                f"  max_pixels={pipe.detect.max_pixels}"
+                if pipe.detect.max_pixels
+                else "  max_pixels=모델 기본값"
+            ),
             f"③ 좌표 확정  크롭 패딩 {pipe.locate.pad_ratio:.0%}"
             f" (최소 {pipe.locate.min_pad_px}px)"
             f"  업샘플 x{pipe.locate.upscale}"
