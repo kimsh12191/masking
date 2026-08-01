@@ -41,6 +41,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from pii_pipeline.config import load_config  # noqa: E402
 from pii_pipeline.detect import crop_norm, tile_rects  # noqa: E402
+from pii_pipeline.llm.client import fit_max_side  # noqa: E402
 from pii_pipeline.ocr.paddle_runner import PaddleOcrRunner  # noqa: E402
 from pii_pipeline.pdf import is_pdf, render_pages  # noqa: E402
 from pii_pipeline.pipeline import PipelineConfig  # noqa: E402
@@ -103,9 +104,42 @@ def page_samples(
             continue
 
         tile_img = crop_norm(image, rect) if len(rects) > 1 else image
-        out.append((sample, tile_img))
+        out.append((sample, as_model_sees(tile_img, cfg.llm.image_max_side)))
 
     return out, problems
+
+
+def as_model_sees(tile, max_side: int):
+    """추론에서 vLLM 으로 보내는 것과 **같은 픽셀**로 만든다.
+
+    ``LlmClient.encode_image`` 가 보내기 직전에 긴 변을 ``image_max_side`` 로
+    한 번 더 줄인다 (PIL LANCZOS). 학습에서 이 단계를 빼면 모델이 학습 때와
+    추론 때 **다른 이미지**를 보게 된다.
+
+    지금 기본 설정에서는 타일 긴 변이 1760, 상한이 1984 라 축소가 일어나지
+    않는다. 그래서 빼먹어도 당장은 티가 안 나고, ``target_long_side`` 를 올리는
+    순간 조용히 갈라진다. 우연히 맞는 것에 기대지 않는다.
+
+    **좌표는 손대지 않는다.** per-mille 은 이미지 크기에 불변이라 리사이즈해도
+    같은 값이다.
+
+    Returns:
+        BGR numpy 배열. 축소가 없으면 입력을 그대로 돌려준다.
+    """
+    h, w = tile.shape[:2]
+    new_h, new_w = fit_max_side(h, w, max_side)
+    if (new_h, new_w) == (h, w):
+        return tile
+
+    # 축소가 실제로 필요할 때만 PIL 을 부른다. 기본 설정에서는 여기까지 오지
+    # 않으므로 --overlay 0 이면 Pillow 없이도 데이터를 만들 수 있다.
+    import numpy as np  # type: ignore[import-not-found]
+    from PIL import Image  # type: ignore[import-not-found]
+
+    # 추론과 같은 보간을 쓴다. cv2.INTER_AREA 로 대신하면 미세하게 다른
+    # 픽셀이 나오고, 작은 글씨에서는 그 차이가 무의미하지 않다.
+    rgb = Image.fromarray(tile[:, :, ::-1]).resize((new_w, new_h), Image.LANCZOS)
+    return np.asarray(rgb)[:, :, ::-1]
 
 
 def load_pages(path: str, cfg: PipelineConfig):
@@ -151,10 +185,23 @@ def save_overlay(tile_img, sample: TileSample, path: Path, page_w: int, page_h: 
     draw = ImageDraw.Draw(canvas)
 
     ox, oy = sample.rect[0] * page_w, sample.rect[1] * page_h
+    # 타일이 image_max_side 로 축소됐을 수 있다 (as_model_sees). 그림도 같은
+    # 배율로 줄여야 박스가 글자에 맞는다. 축소가 없으면 1.0 이다.
+    scale = canvas.width / max(1.0, (sample.rect[2] - sample.rect[0]) * page_w)
+
     for item in sample.items:
         x1, y1, x2, y2 = roundtrip(item["bbox_2d"], sample.rect, page_w, page_h)
         color = (0, 168, 89) if item["text"] else (214, 45, 32)  # 초록: 글자 / 빨강: 좌표만
-        draw.rectangle((x1 - ox, y1 - oy, x2 - ox, y2 - oy), outline=color, width=2)
+        draw.rectangle(
+            (
+                (x1 - ox) * scale,
+                (y1 - oy) * scale,
+                (x2 - ox) * scale,
+                (y2 - oy) * scale,
+            ),
+            outline=color,
+            width=2,
+        )
 
     canvas.save(path)
 
