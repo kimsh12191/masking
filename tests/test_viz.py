@@ -7,7 +7,15 @@ from __future__ import annotations
 
 import pytest
 
-from pii_pipeline.schema import OcrBox, OcrStatus, PageResult, PiiRegion, Source
+from pii_pipeline.schema import (
+    Agreement,
+    OcrBox,
+    OcrStatus,
+    PageResult,
+    PiiRegion,
+    Source,
+    VlmFinding,
+)
 from pii_pipeline.viz import SOURCE_COLORS, draw_overlay, legend_text
 
 pytest.importorskip("PIL", reason="Pillow 미설치 환경에서는 건너뛴다")
@@ -25,24 +33,46 @@ def sample_result() -> PageResult:
             OcrBox(index=1, bbox=(220, 40, 380, 70), text="홍길동"),
             OcrBox(index=2, bbox=(220, 300, 380, 330), text="", status=OcrStatus.FAILED),
         ],
+        findings=[
+            VlmFinding(text="901231-1234563", type="RRN", bbox_norm=(0.06, 0.12, 0.5, 0.17)),
+            VlmFinding(text="홍길동", type="NAME", bbox_norm=(0.36, 0.05, 0.63, 0.09)),
+            VlmFinding(text="김철수", type="NAME", bbox_norm=(0.36, 0.37, 0.63, 0.42)),
+            VlmFinding(text="", type="SIGNATURE", bbox_norm=(0.36, 0.62, 0.76, 0.71)),
+        ],
         regions=[
+            # 체크섬 통과 + 두 엔진 일치 — 검수자가 넘겨도 되는 건
             PiiRegion(
-                id="r001", type="RULE_ITEM_RRN", bbox=(40, 100, 300, 132),
-                source=Source.RULE, confidence=1.0, member_index=[1],
+                id="r001", type="RRN", bbox=(40, 100, 300, 132),
+                source=Source.OCR_REFINED, confidence=1.0, member_index=[1],
+                text="901231-1234563", vlm_text="901231-1234563",
+                verified=True, checksum="ok", agreement=Agreement.EXACT,
             ),
+            # 좌표는 확정, 체크섬 없는 라벨
             PiiRegion(
                 id="r002", type="NAME", bbox=(220, 40, 380, 70),
-                source=Source.LLM_PASS1, confidence=0.93, member_index=[1],
+                source=Source.OCR_REFINED, confidence=0.93, member_index=[1],
+                text="홍길동", vlm_text="홍길동", agreement=Agreement.EXACT,
             ),
+            # 두 엔진 불일치 — 검토 필요
             PiiRegion(
                 id="r003", type="NAME", bbox=(220, 300, 380, 330),
-                source=Source.VLM_PASS2, confidence=0.85, member_index=[2],
-                ocr_status=OcrStatus.FAILED, needs_review=True,
+                source=Source.OCR_REFINED, confidence=0.85, member_index=[2],
+                text="김철둥", vlm_text="김철수",
+                ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.NONE,
+                needs_review=True,
             ),
+            # 좌표 근사 (서명·인영)
             PiiRegion(
                 id="r004", type="SIGNATURE", bbox=(220, 500, 460, 570),
-                source=Source.VLM_GROUNDING, confidence=0.61,
-                coarse=True, needs_review=True, low_confidence=False,
+                source=Source.VLM_COARSE, confidence=0.61,
+                coarse=True, agreement=Agreement.NONE,
+            ),
+            # 체크섬 미통과 — 오독 의심
+            PiiRegion(
+                id="r005", type="RRN", bbox=(40, 620, 300, 652),
+                source=Source.OCR_REFINED, confidence=0.7,
+                text="901231-1234561", vlm_text="901231-1234561",
+                checksum="failed", needs_review=True, agreement=Agreement.EXACT,
             ),
         ],
     )

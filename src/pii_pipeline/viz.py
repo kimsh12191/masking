@@ -14,13 +14,14 @@ from typing import Any
 
 from .schema import PageResult, Source
 
-#: 출처별 색상 (RGB). 티어를 한눈에 구분하기 위한 것.
+#: 좌표 획득 경로별 색상 (RGB).
+#:
+#: 색이 두 개뿐인 것은 의도한 것이다. 검수자가 눈으로 판단해야 하는 것은
+#: **"이 박스 좌표를 믿어도 되나"** 하나이고, 그건 이 두 갈래로 끝난다.
+#: 판단 근거(체크섬 통과 여부, 두 엔진 일치 여부)는 라벨 접미사로 붙인다.
 SOURCE_COLORS: dict[Source, tuple[int, int, int]] = {
-    Source.RULE: (0, 168, 89),           # 초록 — 체크섬 확정
-    Source.LLM_PASS1: (0, 122, 214),     # 파랑 — 텍스트 pass
-    Source.VLM_PASS2: (255, 149, 0),     # 주황 — 이미지 pass 회수
-    Source.VLM_GROUNDING: (214, 45, 32), # 빨강 — 좌표 근사, 검토 필수
-    Source.PROPAGATED: (148, 82, 214),   # 보라 — 같은 값이라 전파됨
+    Source.OCR_REFINED: (0, 168, 89),   # 초록 — 크롭 OCR 이 좌표 확정. 정확.
+    Source.VLM_COARSE: (214, 45, 32),   # 빨강 — VLM 좌표 근사. 검토 필수.
 }
 
 
@@ -91,6 +92,10 @@ def draw_overlay(
             draw.rectangle((x1 + 3, y1 + 3, x2 - 3, y2 - 3), outline=color, width=1)
 
         label = f"{region.id} {region.type} {region.confidence:.2f}"
+        if region.verified:
+            label += " OK"          # 체크섬 통과
+        elif region.checksum == "failed":
+            label += " X"           # 체크섬 미통과 — 오독 의심
         if region.needs_review:
             label += " !"
 
@@ -146,10 +151,10 @@ def legend_text() -> str:
     return "\n".join(
         [
             "색상 범례:",
-            "  초록  rule           체크섬 통과. 검토 불필요.",
-            "  파랑  llm_pass1      OCR 텍스트 기반 분류.",
-            "  주황  vlm_pass2      이미지 pass 에서 회수. OCR 좌표 사용.",
-            "  빨강  vlm_grounding  VLM 좌표 근사. 검토 필수.",
+            "  초록  ocr_refined  크롭 OCR 이 좌표를 확정. 픽셀 단위로 정확.",
+            "  빨강  vlm_coarse   크롭 OCR 이 값을 못 찾아 VLM 좌표 사용. 검토 필수.",
+            "  'OK'  체크섬 통과",
+            "  'X'   체크섬 미통과 — OCR 오독 또는 형식 오류 의심",
             "  '!'   needs_review 플래그",
         ]
     )

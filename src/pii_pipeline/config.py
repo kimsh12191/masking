@@ -22,10 +22,12 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from .detect import DetectConfig
 from .llm.client import LlmConfig
+from .locate import LocateConfig
 from .ocr.paddle_runner import OcrConfig, parse_gpu_id
 from .pipeline import PipelineConfig
-from .propagate import PropagateConfig
+from .verify import VerifyConfig
 
 log = logging.getLogger(__name__)
 
@@ -149,9 +151,10 @@ def read_yaml(path: Path) -> dict[str, Any]:
 # 진입점
 # --------------------------------------------------------------------------
 
-#: YAML 최상위 섹션. ``ocr``/``llm``/``propagate`` 는 코드상 ``PipelineConfig``
-#: 안에 있지만, 설정 파일에서는 평평하게 두는 편이 읽기 쉬워 최상위로 뺀다.
-SECTIONS = ("pipeline", "ocr", "llm", "propagate", "output")
+#: YAML 최상위 섹션. ``ocr``/``llm``/``detect``/``locate``/``verify`` 는 코드상
+#: ``PipelineConfig`` 안에 있지만, 설정 파일에서는 평평하게 두는 편이 읽기 쉬워
+#: 최상위로 뺀다. 섹션 이름이 파이프라인 단계 이름과 1:1 이다.
+SECTIONS = ("pipeline", "ocr", "llm", "detect", "locate", "verify", "output")
 
 
 def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConfig:
@@ -170,7 +173,11 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
     """
     config = AppConfig(
         pipeline=PipelineConfig(
-            ocr=OcrConfig(), llm=LlmConfig(), propagate=PropagateConfig()
+            ocr=OcrConfig(),
+            llm=LlmConfig(),
+            detect=DetectConfig(),
+            locate=LocateConfig(),
+            verify=VerifyConfig(),
         ),
         output=OutputConfig(),
     )
@@ -189,7 +196,9 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             "pipeline": config.pipeline,
             "ocr": config.pipeline.ocr,
             "llm": config.pipeline.llm,
-            "propagate": config.pipeline.propagate,
+            "detect": config.pipeline.detect,
+            "locate": config.pipeline.locate,
+            "verify": config.pipeline.verify,
             "output": config.output,
         }
         for section in SECTIONS:
@@ -221,13 +230,20 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
 
 
 def describe(config: AppConfig) -> str:
-    """현재 적용된 설정 요약 (실행 로그에 남길 용도)."""
+    """현재 적용된 설정 요약 (실행 로그에 남길 용도).
+
+    ``image_max_side`` 와 타일 수를 **같은 줄에** 적는다. 둘의 조합이 VLM 이
+    실제로 보는 글자 크기를 결정하는데, 따로 적어 두면 한쪽만 바꿔 놓고
+    "왜 작은 글씨를 못 읽지" 로 헤매게 된다.
+    """
     llm, ocr, pipe, out = (
         config.pipeline.llm,
         config.pipeline.ocr,
         config.pipeline,
         config.output,
     )
+    long_side = pipe.target_long_side or 0
+    tile_side = int(long_side / max(1, pipe.detect.tiles)) if long_side else 0
     return "\n".join(
         [
             f"설정 파일   {config.source_path or '(없음 — 기본값 사용)'}",
@@ -240,11 +256,29 @@ def describe(config: AppConfig) -> str:
                 if ocr.use_gpu and (visible := os.getenv('CUDA_VISIBLE_DEVICES'))
                 else ""
             ),
-            f"pass2       {'ON' if pipe.enable_pass2 else 'OFF'}"
-            f"{' (blind)' if pipe.pass2_blind else ''}"
-            f"  image_max_side={llm.image_max_side}",
-            f"값 전파     {'ON' if pipe.propagate.enabled else 'OFF'}"
-            f"  min_similarity={pipe.propagate.min_similarity}",
+            f"② VLM 탐지  타일 {pipe.detect.tiles}개 (겹침 {pipe.detect.overlap:.0%})"
+            + (
+                f" × 샘플 {pipe.detect.samples}회"
+                f" (T={pipe.detect.sample_temperature}, 합집합)"
+                if pipe.detect.samples > 1
+                else ""
+            )
+            + f"  호출 {pipe.detect.tiles * max(1, pipe.detect.samples)}회"
+            f"  image_max_side={llm.image_max_side}"
+            + (
+                f"  타일 세로 약 {tile_side}px"
+                + (" — 축소 없음" if tile_side and tile_side <= llm.image_max_side
+                   else " — 축소 발생, 타일을 늘리거나 image_max_side 를 올릴 것")
+                if tile_side
+                else ""
+            ),
+            f"③ 좌표 확정  크롭 패딩 {pipe.locate.pad_ratio:.0%}"
+            f" (최소 {pipe.locate.min_pad_px}px)"
+            f"  업샘플 x{pipe.locate.upscale}"
+            f"  기하 fallback={'ON' if pipe.locate.geometry_fallback else 'OFF'}",
+            f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}",
+            f"전처리      긴 변 {pipe.target_long_side or '원본'}"
+            f"  deskew={'ON' if pipe.deskew else 'OFF'}",
             f"출력        {out.out_dir}  이미지={'ON' if out.write_image else 'OFF'}",
         ]
     )

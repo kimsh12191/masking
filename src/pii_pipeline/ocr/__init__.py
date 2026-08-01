@@ -1,11 +1,12 @@
-"""OCR 계층."""
+"""OCR 계층. 페이지 전체가 아니라 **크롭**을 인식한다."""
 
 from .layout import (
-    assign_reading_order,
     denorm_bbox,
+    median_height,
+    norm_bbox,
     pad_bbox,
     quad_to_bbox,
-    spatially_split,
+    sort_reading_order,
     union_bbox,
 )
 from .paddle_runner import OcrConfig, PaddleOcrRunner
@@ -13,10 +14,11 @@ from .paddle_runner import OcrConfig, PaddleOcrRunner
 __all__ = [
     "OcrConfig",
     "PaddleOcrRunner",
-    "assign_reading_order",
+    "sort_reading_order",
     "quad_to_bbox",
     "union_bbox",
     "pad_bbox",
-    "spatially_split",
     "denorm_bbox",
+    "norm_bbox",
+    "median_height",
 ]

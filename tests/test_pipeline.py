@@ -1,7 +1,10 @@
 """파이프라인 통합 테스트.
 
 OCR 엔진과 vLLM 서버 없이 오케스트레이션 배선을 검증한다.
-전처리/OCR/LLM 을 가짜 구현으로 갈아끼우고 ③→④→④'→⑤ 흐름이 맞물리는지 본다.
+전처리/VLM/OCR 을 가짜 구현으로 갈아끼우고 ①→②→③→④ 가 맞물리는지 본다.
+
+특히 **무음 실패가 없는지**를 본다. 이 파이프라인에서 가장 위험한 결과는
+"개인정보 없음" 처럼 보이는 실패다.
 """
 
 from __future__ import annotations
@@ -11,553 +14,340 @@ from typing import Any
 import pytest
 
 from pii_pipeline import pipeline as pipeline_mod
-from pii_pipeline.ocr.layout import assign_reading_order
+from pii_pipeline.detect import DetectConfig
+from pii_pipeline.locate import LocateConfig
 from pii_pipeline.pipeline import PiiPipeline, PipelineConfig
 from pii_pipeline.preprocess import PreprocessResult
-from pii_pipeline.schema import OcrBox, OcrStatus, Source
+from pii_pipeline.schema import Agreement, OcrBox, OcrStatus, Source
 
-PAGE_W, PAGE_H = 1748, 2480
+np = pytest.importorskip("numpy", reason="numpy 미설치 환경에서는 건너뛴다")
+
+PAGE_W, PAGE_H = 1000, 2000
+
+#: 체크섬을 통과하는 가짜 주민등록번호.
+VALID_RRN = "901231-1234563"
 
 
-def fake_boxes() -> list[OcrBox]:
-    """서식 한 장 분량의 가짜 OCR 결과.
+def blank_page(w: int = PAGE_W, h: int = PAGE_H) -> Any:
+    return np.zeros((h, w, 3), dtype=np.uint8)
 
-    행 구성:
-      0: 성명           | 홍길동
-      1: 주민등록번호   | 901231-1234563   (규칙 레이어가 확정)
-      2: 주소           | 서울특별시 강남구 | 테헤란로 123
-      3: (빈칸)         | ○○빌딩 5층
-      4: 보증인 성명    | ???  <OCR_FAILED>  (손글씨 → pass2 가 회수)
-    """
-    rows: list[list[tuple[str, OcrStatus]]] = [
-        [("성명", OcrStatus.OK), ("홍길동", OcrStatus.OK)],
-        [("주민등록번호", OcrStatus.OK), ("901231-1234563", OcrStatus.OK)],
-        [("주소", OcrStatus.OK), ("서울특별시 강남구", OcrStatus.OK),
-         ("테헤란로 123", OcrStatus.OK)],
-        [("", OcrStatus.OK), ("○○빌딩 5층", OcrStatus.OK)],
-        [("보증인 성명", OcrStatus.OK), ("", OcrStatus.FAILED)],
-    ]
-    boxes: list[OcrBox] = []
-    for r, row in enumerate(rows):
-        for c, (text, status) in enumerate(row):
-            if not text and status is OcrStatus.OK:
-                continue  # 빈칸은 박스가 없다
-            x1 = 200 + c * 420
-            y1 = 300 + r * 90
-            boxes.append(
-                OcrBox(
-                    index=-1,
-                    bbox=(x1, y1, x1 + 400, y1 + 50),
-                    text=text,
-                    status=status,
-                    rec_conf=0.2 if status is OcrStatus.FAILED else 0.95,
-                )
-            )
-    return assign_reading_order(boxes)
+
+def vlm_item(text: str, label: str, bbox, conf: float = 0.9, field: str = "") -> dict:
+    return {
+        "text": text, "type": label, "field": field,
+        "bbox_norm": list(bbox), "conf": conf,
+    }
+
+
+class FakeClient:
+    """타일 호출마다 payload 를 순서대로 돌려준다."""
+
+    def __init__(self, payloads: list[dict], metas: list[dict] | None = None) -> None:
+        self.payloads = payloads
+        self.metas = metas
+        self.calls = 0
+
+    client = None  # detect() 의 지연 초기화 프라이밍 대상
+
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        schema: dict,
+        image: Any = None,
+        temperature: float | None = None,
+    ):
+        n = self.calls
+        self.calls += 1
+        payload = self.payloads[n] if n < len(self.payloads) else {"findings": []}
+        meta = (self.metas[n] if self.metas and n < len(self.metas) else {}) or {}
+        return payload, dict(meta)
 
 
 class FakeOcr:
-    def __init__(self, boxes: list[OcrBox]) -> None:
-        self._boxes = boxes
+    """크롭 순서대로 박스를 돌려준다. 좌표는 크롭 기준이다."""
+
+    def __init__(self, results: list[list[OcrBox]]) -> None:
+        self.results = results
         self.calls = 0
 
-    def run(self, image: Any) -> list[OcrBox]:
-        self.calls += 1
-        return self._boxes
+    def run_many(self, images: list[Any]) -> list[list[OcrBox]]:
+        out = []
+        for _ in images:
+            out.append(self.results[self.calls] if self.calls < len(self.results) else [])
+            self.calls += 1
+        return out
 
 
-class FakeLlm:
-    """pass1/pass2 응답을 미리 정해두는 가짜 클라이언트."""
-
-    def __init__(self, pass1: dict[str, Any], pass2: dict[str, Any]) -> None:
-        self._responses = [pass1, pass2]
-        self.calls: list[dict[str, Any]] = []
-
-    def complete_json(
-        self, system: str, user: str, schema: dict[str, Any], image: Any | None = None
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        self.calls.append({"system": system, "user": user, "has_image": image is not None})
-        payload = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
-        return payload, {"raw": "", "attempt": 0, "finish_reason": "stop"}
+def box(text: str, x1=5, y1=5, x2=200, y2=45, status=OcrStatus.OK) -> OcrBox:
+    return OcrBox(index=-1, bbox=(x1, y1, x2, y2), text=text, status=status, rec_conf=0.95)
 
 
 @pytest.fixture
-def wired(monkeypatch: pytest.MonkeyPatch):
-    """전처리/OCR/LLM 을 가짜로 교체한 파이프라인 팩토리를 돌려준다."""
-    boxes = fake_boxes()
+def no_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """전처리를 항등 함수로 만든다 (opencv 의존 제거)."""
 
-    def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
-        return PreprocessResult(
-            image=object(), width=PAGE_W, height=PAGE_H, applied=["fake"]
+    def fake(img: Any, target_long_side: Any = None, deskew: bool = True) -> PreprocessResult:
+        h, w = img.shape[:2]
+        return PreprocessResult(image=img, width=w, height=h, applied=[])
+
+    def fake_path(path: str, target_long_side: Any = None, deskew: bool = True):
+        return fake(blank_page())
+
+    monkeypatch.setattr(pipeline_mod, "preprocess_array", fake)
+    monkeypatch.setattr(pipeline_mod, "preprocess", fake_path)
+
+
+def build(
+    payloads: list[dict],
+    ocr_results: list[list[OcrBox]],
+    metas: list[dict] | None = None,
+    **cfg_kw: Any,
+) -> PiiPipeline:
+    cfg_kw.setdefault("detect", DetectConfig(tiles=1, workers=1))
+    cfg_kw.setdefault("locate", LocateConfig(upscale=1.0))
+    config = PipelineConfig(**cfg_kw)
+    pipe = PiiPipeline(config)
+    pipe.llm = FakeClient(payloads, metas)  # type: ignore[assignment]
+    pipe.ocr = FakeOcr(ocr_results)  # type: ignore[assignment]
+    return pipe
+
+
+class TestHappyPath:
+    def test_end_to_end(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [
+                vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14), field="성명"),
+                vlm_item(VALID_RRN, "RRN", (0.1, 0.2, 0.5, 0.24)),
+            ]}],
+            [[box("홍길동")], [box(VALID_RRN)]],
         )
+        result = pipe.run("x.png", image=blank_page())
 
-    monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
+        assert len(result.findings) == 2
+        assert len(result.regions) == 2
+        assert {r.type for r in result.regions} == {"NAME", "RRN"}
+        assert all(r.source is Source.OCR_REFINED for r in result.regions)
 
-    def build(pass1: dict[str, Any], pass2: dict[str, Any], **cfg: Any):
-        pipe = PiiPipeline(PipelineConfig(**cfg))
-        pipe.ocr = FakeOcr(boxes)          # type: ignore[assignment]
-        pipe.llm = FakeLlm(pass1, pass2)   # type: ignore[assignment]
-        return pipe, boxes
-
-    return build
-
-
-# 박스 인덱스: 0 성명 / 1 홍길동 / 2 주민등록번호 / 3 901231-... /
-#              4 주소 / 5 서울특별시 강남구 / 6 테헤란로 123 /
-#              7 ○○빌딩 5층 / 8 보증인 성명 / 9 <OCR_FAILED>
-PASS1_OK = {
-    "regions": [
-        {"idx": [1], "type": "NAME", "conf": 0.97},
-        {"idx": [5, 6, 7], "type": "ADDRESS", "conf": 0.94},
-    ]
-}
-PASS2_OK = {
-    "missed": [
-        {"idx": [9], "type": "NAME", "conf": 0.85, "reason": "손글씨 보증인 성명"}
-    ]
-}
-
-
-class TestBoxFixture:
-    def test_indices_match_expectation(self, wired) -> None:
-        _, boxes = wired(PASS1_OK, PASS2_OK)
-        assert [b.text for b in boxes][:4] == ["성명", "홍길동", "주민등록번호", "901231-1234563"]
-        assert boxes[9].status is OcrStatus.FAILED
-
-
-class TestFullRun:
-    def test_all_three_layers_contribute(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-
-        by_source = result.stats()["by_source"]
-        assert by_source["rule"] == 1        # 주민등록번호
-        assert by_source["llm_pass1"] == 2   # 성명 + 주소
-        assert by_source["vlm_pass2"] == 1   # 손글씨 성명
-
-    def test_rule_layer_wins_and_llm_sees_confirmed_tag(self, wired) -> None:
-        """규칙이 확정한 박스는 프롬프트에 CONFIRMED 로 표시되어야 한다."""
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        pipe.run("fake.png")
-        pass1_user = pipe.llm.calls[0]["user"]  # type: ignore[attr-defined]
-        assert "<CONFIRMED:RRN>" in pass1_user
-        assert "901231-1234563" in pass1_user  # 지우지 않고 남긴다
-
-    def test_pass2_receives_image_and_pass1_does_not(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        pipe.run("fake.png")
-        calls = pipe.llm.calls  # type: ignore[attr-defined]
-        assert calls[0]["has_image"] is False
-        assert calls[1]["has_image"] is True
-
-    def test_pass2_prompt_lists_already_detected_indices(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        pipe.run("fake.png")
-        pass2_user = pipe.llm.calls[1]["user"]  # type: ignore[attr-defined]
-        assert "이미 탐지된 박스 번호" in pass2_user
-        assert "<OCR_FAILED>" in pass2_user
-
-    def test_address_is_merged_into_one_region(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        addr = [r for r in result.regions if r.type == "ADDRESS"]
-        assert len(addr) == 1
-        assert addr[0].member_index == [5, 6, 7]
-        assert addr[0].text == "서울특별시 강남구 테헤란로 123 ○○빌딩 5층"
-
-    def test_ocr_failed_box_recovered_with_precise_coords(self, wired) -> None:
-        pipe, boxes = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        recovered = [r for r in result.regions if r.source is Source.VLM_PASS2]
-        assert len(recovered) == 1
-        assert recovered[0].coarse is False           # OCR 좌표를 썼다
-        assert recovered[0].needs_review is True      # 그래도 검토 대상
-        assert recovered[0].member_boxes == [boxes[9].bbox]
-
-    def test_ids_are_assigned_and_unique(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        ids = [r.id for r in result.regions]
-        assert all(ids)
-        assert len(ids) == len(set(ids))
-
-    def test_timings_recorded_for_every_stage(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        for key in (
-            "preprocess",
-            "ocr",
-            "rules",
-            "llm_pass1",
-            "llm_pass2",
-            "propagate",
-            "merge",
-            "total",
-        ):
-            assert key in result.timings
-
-    def test_run_is_deterministic(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        first = pipe.run("fake.png")
-        pipe2, _ = wired(PASS1_OK, PASS2_OK)
-        second = pipe2.run("fake.png")
-        assert [(r.id, r.type, r.bbox) for r in first.regions] == [
-            (r.id, r.type, r.bbox) for r in second.regions
-        ]
-
-
-class TestPass2Disabled:
-    def test_no_second_call_and_handwriting_is_missed(self, wired) -> None:
-        """텍스트 pass 만으로는 OCR 실패 박스를 구조적으로 회수할 수 없다."""
-        pipe, _ = wired(PASS1_OK, PASS2_OK, enable_pass2=False)
-        result = pipe.run("fake.png")
-        assert len(pipe.llm.calls) == 1  # type: ignore[attr-defined]
-        assert "llm_pass2" not in result.timings
-        assert all(r.source is not Source.VLM_PASS2 for r in result.regions)
-
-
-class TestPass2Blind:
-    def test_blind_prompt_hides_first_pass_results(self, wired) -> None:
-        pipe, _ = wired(PASS1_OK, PASS2_OK, pass2_blind=True)
-        pipe.run("fake.png")
-        pass2_user = pipe.llm.calls[1]["user"]  # type: ignore[attr-defined]
-        assert "이미 탐지된 박스 번호" not in pass2_user
-
-
-# --------------------------------------------------------------------------
-# 한 박스에 여러 종류가 섞이는 경우 + 값 전파
-# --------------------------------------------------------------------------
-
-
-def mixed_boxes() -> list[OcrBox]:
-    """같은 박스에 이름+주민번호가 섞이고, 같은 이름이 아래에 또 나오는 서식.
-
-    행 구성:
-      0: 성명 및 주민등록번호 | 홍길동 901231-1234563   <- 한 박스에 두 종류
-      1: 위 본인은 동의합니다  | 확인자 홍길동            <- 같은 이름 재등장
-      2: 담당자                | 하나은행 강남지점
-    """
-    rows = [
-        ["성명 및 주민등록번호", "홍길동 901231-1234563"],
-        ["위 본인은 동의합니다", "확인자 홍길동"],
-        ["담당자", "하나은행 강남지점"],
-    ]
-    boxes: list[OcrBox] = []
-    for r, row in enumerate(rows):
-        for c, text in enumerate(row):
-            x1 = 200 + c * 500
-            y1 = 300 + r * 90
-            boxes.append(
-                OcrBox(index=-1, bbox=(x1, y1, x1 + 480, y1 + 50), text=text, rec_conf=0.95)
-            )
-    return assign_reading_order(boxes)
-
-
-@pytest.fixture
-def wired_mixed(monkeypatch: pytest.MonkeyPatch):
-    boxes = mixed_boxes()
-
-    def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
-        return PreprocessResult(
-            image=object(), width=PAGE_W, height=PAGE_H, applied=["fake"]
+    def test_checksum_verified_region_is_final(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item(VALID_RRN, "RRN", (0.1, 0.2, 0.5, 0.24))]}],
+            [[box(VALID_RRN)]],
         )
+        region = pipe.run("x.png", image=blank_page()).regions[0]
+        assert region.verified is True
+        assert region.confidence == 1.0
+        assert region.needs_review is False
+        assert region.agreement is Agreement.EXACT
 
-    monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
-
-    def build(pass1: dict[str, Any], pass2: dict[str, Any], **cfg: Any):
-        pipe = PiiPipeline(PipelineConfig(**cfg))
-        pipe.ocr = FakeOcr(boxes)          # type: ignore[assignment]
-        pipe.llm = FakeLlm(pass1, pass2)   # type: ignore[assignment]
-        return pipe, boxes
-
-    return build
-
-
-# 박스: 0 라벨 / 1 "홍길동 901231-1234563" / 2 문구 / 3 "확인자 홍길동" /
-#       4 "담당자" / 5 "하나은행 강남지점"
-MIXED_PASS1 = {"regions": [{"idx": [1], "type": "NAME", "conf": 0.9}]}
-MIXED_PASS2: dict[str, Any] = {"missed": []}
-
-
-class TestMixedLabelBox:
-    def test_rule_rrn_and_llm_name_coexist_in_one_box(self, wired_mixed) -> None:
-        """박스 단위로 차단하면 규칙이 RRN 을 확정한 순간 이름이 사라진다.
-
-        영역 bbox 는 어차피 박스 전체라 전부 마스킹하는 다운스트림은 무사하지만,
-        ``char_span`` 으로 부분 마스킹(``901231-1******``)을 구현하면 이름이
-        그대로 노출된다.
-        """
-        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
-        result = pipe.run("fake.png")
-
-        on_box1 = [r for r in result.regions if r.member_index == [1]]
-        types = {r.type for r in on_box1}
-        assert "RRN" in types, "규칙 레이어의 주민번호"
-        assert "NAME" in types, "같은 박스의 이름도 살아남아야 한다"
-
-    def test_confirmed_tag_still_shown_to_model(self, wired_mixed) -> None:
-        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
-        pipe.run("fake.png")
-        pass1_user = pipe.llm.calls[0]["user"]  # type: ignore[attr-defined]
-        assert "<CONFIRMED:RRN>" in pass1_user
-
-
-class TestValuePropagation:
-    def test_repeated_name_is_recovered_without_llm_reporting_it(
-        self, wired_mixed
-    ) -> None:
-        """pass1 은 박스 1 만 보고했다. 박스 3 의 같은 이름도 회수돼야 한다."""
-        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
-        result = pipe.run("fake.png")
-
-        propagated = [r for r in result.regions if r.source is Source.PROPAGATED]
-        assert [r.member_index for r in propagated] == [[3]]
-        assert propagated[0].type == "NAME"
-        assert "홍길동" in (propagated[0].reason or "")
-
-    def test_propagated_span_points_at_the_value_only(self, wired_mixed) -> None:
-        pipe, boxes = wired_mixed(MIXED_PASS1, MIXED_PASS2)
-        result = pipe.run("fake.png")
-        hit = next(r for r in result.regions if r.source is Source.PROPAGATED)
-        start, end = hit.char_span
-        assert boxes[3].text[start:end] == "홍길동"
-
-    def test_rrn_propagates_too(self, wired_mixed) -> None:
-        """규칙 레이어 값도 씨앗이 된다 (같은 번호가 다른 칸에 또 있으면)."""
-        pipe, _ = wired_mixed(MIXED_PASS1, MIXED_PASS2)
-        result = pipe.run("fake.png")
-        # 이 서식에는 주민번호가 한 번만 나오므로 전파 대상이 없어야 한다
-        assert not [
-            r
-            for r in result.regions
-            if r.source is Source.PROPAGATED and r.type == "RRN"
-        ]
-
-    def test_institution_name_is_not_propagated(self, wired_mixed) -> None:
-        """ORG 는 기본 전파 제외 — 은행명이 서식 전체에 깔려 있다."""
-        pipe, _ = wired_mixed(
-            {"regions": [{"idx": [5], "type": "ORG", "conf": 0.8}]}, MIXED_PASS2
+    def test_ids_are_assigned(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [
+                vlm_item("홍길동", "NAME", (0.1, 0.5, 0.3, 0.54)),
+                vlm_item("김철수", "NAME", (0.1, 0.1, 0.3, 0.14)),
+            ]}],
+            [[box("홍길동")], [box("김철수")]],
         )
-        result = pipe.run("fake.png")
-        assert not [r for r in result.regions if r.source is Source.PROPAGATED]
+        ids = [r.id for r in pipe.run("x.png", image=blank_page()).regions]
+        assert ids == ["r001", "r002"]
 
-    def test_can_be_disabled(self, wired_mixed) -> None:
-        from pii_pipeline.propagate import PropagateConfig
-
-        pipe, _ = wired_mixed(
-            MIXED_PASS1, MIXED_PASS2, propagate=PropagateConfig(enabled=False)
+    def test_timings_cover_every_stage(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14))]}],
+            [[box("홍길동")]],
         )
-        result = pipe.run("fake.png")
-        assert not [r for r in result.regions if r.source is Source.PROPAGATED]
+        timings = pipe.run("x.png", image=blank_page()).timings
+        assert set(timings) == {"preprocess", "detect", "locate", "verify", "total"}
+        assert timings["total"] > 0
+
+    def test_page_dimensions_come_from_preprocess(self, no_preprocess: None) -> None:
+        pipe = build([{"findings": []}], [])
+        result = pipe.run("x.png", image=blank_page(640, 480))
+        assert (result.width, result.height) == (640, 480)
 
 
-class TestFailureHandling:
-    def test_llm_error_is_recorded_but_rules_survive(self, wired) -> None:
-        """LLM 이 죽어도 규칙 레이어 결과는 남아야 한다."""
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
+class TestOldBugRegressions:
+    """이전 구조에서 스크린샷으로 관측된 오류들."""
 
-        def failing(system, user, schema, image=None):
-            return {}, {"error": "connection refused"}
-
-        pipe.llm.complete_json = failing  # type: ignore[assignment]
-        result = pipe.run("fake.png")
-
-        assert any("pass1 실패" in w for w in result.warnings)
-        assert any("pass2 실패" in w for w in result.warnings)
-        assert [r.type for r in result.regions] == ["RRN"]
-
-    def test_hallucinated_index_is_dropped_with_warning(self, wired) -> None:
-        pipe, _ = wired(
-            {"regions": [{"idx": [999], "type": "NAME", "conf": 0.9}]},
-            {"missed": []},
+    def test_rrn_mislabelled_as_license_is_corrected(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item(VALID_RRN, "DRIVER_LICENSE", (0.1, 0.2, 0.5, 0.24))]}],
+            [[box(VALID_RRN)]],
         )
-        result = pipe.run("fake.png")
-        assert any("999" in w for w in result.warnings)
-        assert all(r.type != "NAME" for r in result.regions)
+        region = pipe.run("x.png", image=blank_page()).regions[0]
+        assert region.type == "RRN"
 
-    def test_no_ocr_boxes_returns_early(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
-            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
-
-        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
-        pipe = PiiPipeline(PipelineConfig())
-        pipe.ocr = FakeOcr([])  # type: ignore[assignment]
-        pipe.llm = FakeLlm({}, {})  # type: ignore[assignment]
-
-        result = pipe.run("fake.png")
+    def test_header_cell_is_not_reported_as_a_name(self, no_preprocess: None) -> None:
+        """VLM 이 인쇄된 헤더를 값으로 보고한 경우 — 판단 자체가 틀렸으므로 버린다."""
+        pipe = build(
+            [{"findings": [vlm_item("성명", "NAME", (0.05, 0.1, 0.15, 0.14))]}],
+            [[box("성 명")]],
+        )
+        result = pipe.run("x.png", image=blank_page())
         assert result.regions == []
-        assert any("검출되지 않았" in w for w in result.warnings)
-        assert pipe.llm.calls == []  # type: ignore[attr-defined]
+        assert any("항목명만" in w for w in result.warnings)
 
-    def test_batch_continues_after_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        boxes = fake_boxes()
+    def test_geometry_landing_on_a_header_is_kept_not_dropped(
+        self, no_preprocess: None
+    ) -> None:
+        """미탐 확정을 막는다.
+
+        VLM 은 실제 이름을 봤는데 박스 선택이 옆 헤더 셀에 떨어진 상황이다.
+        여기서 버리면 그 이름은 마스킹되지 않은 채 남는다. 헤더를 덧칠하는
+        손해가 이름을 놓치는 손해보다 작다.
+        """
+        pipe = build(
+            [{"findings": [vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14))]}],
+            [[box("성 명")], [box("성 명")]],
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.regions) == 1
+        r = result.regions[0]
+        assert r.vlm_text == "홍길동"
+        assert r.needs_review is True
+        assert "박스 선택 오류 의심" in (r.reason or "")
+
+    def test_a_missed_value_is_never_silently_dropped(self, no_preprocess: None) -> None:
+        """좌표를 못 잡아도 개인정보는 결과에 남아야 한다."""
+        pipe = build(
+            [{"findings": [vlm_item("901112-2846261", "RRN", (0.1, 0.2, 0.5, 0.24))]}],
+            [[], []],  # 1차·2차 배치 모두 아무것도 못 읽음
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.regions) == 1
+        region = result.regions[0]
+        assert region.source is Source.VLM_COARSE
+        assert region.needs_review is True
+        assert region.vlm_text == "901112-2846261"
+
+
+class TestSilentFailureGuards:
+    def test_empty_result_from_a_failed_call_is_labelled_as_such(
+        self, no_preprocess: None
+    ) -> None:
+        """'개인정보 없음' 과 '호출이 죽었음' 은 반드시 구분되어야 한다."""
+        pipe = build([{}], [], metas=[{"error": "connection refused"}])
+        result = pipe.run("x.png", image=blank_page())
+        assert result.regions == []
+        assert any("개인정보 없음이 아님" in w for w in result.warnings)
+
+    def test_genuinely_empty_page_says_so(self, no_preprocess: None) -> None:
+        pipe = build([{"findings": []}], [])
+        result = pipe.run("x.png", image=blank_page())
+        assert any("찾지 못했습니다" in w for w in result.warnings)
+        assert not any("개인정보 없음이 아님" in w for w in result.warnings)
+
+    def test_coarse_count_is_warned(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14))]}],
+            [[], []],
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert any("좌표 확정 실패" in w for w in result.warnings)
+
+    def test_disagreement_is_recorded_not_hidden(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item("901112-2846261", "RRN", (0.1, 0.2, 0.5, 0.24))]}],
+            [[box("9O1112-284626")], [box("9O1112-284626")]],
+        )
+        region = pipe.run("x.png", image=blank_page()).regions[0]
+        assert region.needs_review is True
+        assert "9O1112-284626" in (region.reason or "")
+
+
+class TestDiagnostics:
+    def test_findings_survive_for_recall_measurement(self, no_preprocess: None) -> None:
+        """findings 가 recall 의 분모다. finalize 가 버린 건도 여기 남는다.
+
+        주의: ``detect._dedup`` 이 findings 를 읽기 순서로 재정렬하므로,
+        가짜 OCR 결과의 순서도 **읽기 순서**에 맞춰야 한다.
+        """
+        pipe = build(
+            [{"findings": [
+                vlm_item("성명", "NAME", (0.05, 0.1, 0.25, 0.14)),   # 위 — finalize 가 버린다
+                vlm_item("홍길동", "NAME", (0.1, 0.5, 0.3, 0.54)),   # 아래
+            ]}],
+            [[box("성 명")], [box("홍길동")]],
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.findings) == 2
+        assert [r.vlm_text for r in result.regions] == ["홍길동"]
+
+    def test_localized_rate_reflects_the_geometry_stage(self, no_preprocess: None) -> None:
+        """두 번째는 크롭에 박스가 아예 없어 vlm_coarse 로 떨어진다."""
+        pipe = build(
+            [{"findings": [
+                vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14)),
+                vlm_item("김철수", "NAME", (0.1, 0.5, 0.3, 0.54)),
+            ]}],
+            [[box("홍길동")], [], []],
+        )
+        assert pipe.run("x.png", image=blank_page()).stats()["localized_rate"] == 0.5
+
+    def test_raw_llm_keeps_every_tile_meta(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": []}, {"findings": []}, {"findings": []}],
+            [],
+            detect=DetectConfig(tiles=3, workers=1),
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.raw_llm["vlm"]) == 3
+
+    def test_crop_ocr_boxes_are_exposed(self, no_preprocess: None) -> None:
+        pipe = build(
+            [{"findings": [vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14))]}],
+            [[box("홍길동"), box("성명", 210, 5, 300, 45)]],
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.ocr_boxes) == 2
+
+
+class TestTiling:
+    def test_one_call_per_tile(self, no_preprocess: None) -> None:
+        pipe = build([{"findings": []}] * 4, [], detect=DetectConfig(tiles=4, workers=1))
+        pipe.run("x.png", image=blank_page())
+        assert pipe.llm.calls == 4  # type: ignore[attr-defined]
+
+    def test_findings_from_later_tiles_land_lower_on_the_page(
+        self, no_preprocess: None
+    ) -> None:
+        pipe = build(
+            [{"findings": []}, {"findings": [vlm_item("홍길동", "NAME", (0.1, 0.0, 0.3, 0.2))]}],
+            [[box("홍길동")]],
+            detect=DetectConfig(tiles=2, overlap=0.0, workers=1),
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert result.findings[0].bbox_norm[1] >= 0.5
+
+
+class TestImagePassthrough:
+    def test_image_is_attached_for_overlay(self, no_preprocess: None) -> None:
+        pipe = build([{"findings": []}], [])
+        assert pipe.run("x.png", image=blank_page()).image is not None
+
+    def test_release_clears_it(self, no_preprocess: None) -> None:
+        pipe = build([{"findings": []}], [])
+        result = pipe.run("x.png", image=blank_page())
+        result.release_image()
+        assert result.image is None
+
+
+class TestBatch:
+    def test_one_failure_does_not_stop_the_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pipe = build([{"findings": []}], [])
+
         calls: list[str] = []
 
-        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
+        def flaky(path: str, out_dir: Any = None, **kw: Any):
             calls.append(path)
             if path == "bad.png":
-                raise RuntimeError("이미지를 읽을 수 없습니다")
-            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
+                raise RuntimeError("깨진 파일")
+            from pii_pipeline.schema import PageResult
 
-        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
-        pipe = PiiPipeline(PipelineConfig(enable_pass2=False))
-        pipe.ocr = FakeOcr(boxes)  # type: ignore[assignment]
-        pipe.llm = FakeLlm(PASS1_OK, PASS2_OK)  # type: ignore[assignment]
+            return [PageResult(image_path=path, width=1, height=1)]
 
-        results = pipe.run_batch(["ok1.png", "bad.png", "ok2.png"])
+        monkeypatch.setattr(pipe, "run_any", flaky)
+        results = pipe.run_batch(["a.png", "bad.png", "c.png"])
+        assert calls == ["a.png", "bad.png", "c.png"]
         assert len(results) == 3
-        assert calls == ["ok1.png", "bad.png", "ok2.png"]
-        assert results[1].regions == []
-        assert any("처리 실패" in w for w in results[1].warnings)
-        assert results[2].regions  # 실패 후에도 계속 처리된다
-
-
-class TestPdfInput:
-    """PDF 1개 -> 페이지별 결과. 렌더링은 실제 pypdfium2 를 쓴다."""
-
-    @pytest.fixture
-    def pdf_wired(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
-        pytest.importorskip("pypdfium2")
-        pytest.importorskip("PIL")
-        pytest.importorskip("numpy")
-        from PIL import Image
-
-        boxes = fake_boxes()
-
-        def fake_preprocess_array(img: Any, **kwargs: Any) -> PreprocessResult:
-            h, w = img.shape[:2]
-            return PreprocessResult(image=img, width=w, height=h, applied=["fake"])
-
-        monkeypatch.setattr(pipeline_mod, "preprocess_array", fake_preprocess_array)
-
-        pages = [Image.new("RGB", (620, 877), (255, 255 - 20 * i, 255)) for i in range(3)]
-        pdf_path = tmp_path / "계약서.pdf"
-        pages[0].save(pdf_path, save_all=True, append_images=pages[1:], resolution=150)
-
-        def build(**cfg: Any):
-            pipe = PiiPipeline(PipelineConfig(**cfg))
-            pipe.ocr = FakeOcr(boxes)                    # type: ignore[assignment]
-            pipe.llm = FakeLlm(PASS1_OK, {"missed": []})  # type: ignore[assignment]
-            return pipe, pdf_path
-
-        return build
-
-    def test_one_result_per_page(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path))
-        assert [r.page_no for r in results] == [1, 2, 3]
-
-    def test_each_page_is_processed(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path))
-        assert all(r.regions for r in results)
-
-    def test_image_path_stays_the_pdf(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path))
-        assert all(r.image_path == str(pdf_path) for r in results)
-
-    def test_page_range(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path), pages="2-3")
-        assert [r.page_no for r in results] == [2, 3]
-
-    def test_render_info_recorded_in_warnings(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path))
-        assert any("PDF 렌더링" in w for w in results[0].warnings)
-
-    def test_saves_per_page_files(self, pdf_wired, tmp_path) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        out = tmp_path / "out"
-        pipe.run_pdf(str(pdf_path), out_dir=str(out))
-
-        names = sorted(p.name for p in out.iterdir())
-        assert names == [
-            "계약서_p001.boxes.png", "계약서_p001.json",
-            "계약서_p002.boxes.png", "계약서_p002.json",
-            "계약서_p003.boxes.png", "계약서_p003.json",
-        ]
-
-    def test_saving_releases_images(self, pdf_wired, tmp_path) -> None:
-        """페이지가 많은 문서에서 메모리가 터지지 않아야 한다."""
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_pdf(str(pdf_path), out_dir=str(tmp_path / "out"))
-        assert all(r.image is None for r in results)
-
-    def test_json_records_page_number(self, pdf_wired, tmp_path) -> None:
-        import json
-
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        out = tmp_path / "out"
-        pipe.run_pdf(str(pdf_path), out_dir=str(out))
-        data = json.loads((out / "계약서_p002.json").read_text(encoding="utf-8"))
-        assert data["page_no"] == 2
-
-    def test_run_any_dispatches_pdf(self, pdf_wired) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        assert len(pipe.run_any(str(pdf_path))) == 3
-
-    def test_run_any_dispatches_image(self, pdf_wired, monkeypatch) -> None:
-        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
-            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
-
-        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
-        pipe, _ = pdf_wired(enable_pass2=False)
-        results = pipe.run_any("page.png")
-        assert len(results) == 1
-        assert results[0].page_no is None
-
-    def test_run_batch_mixes_images_and_pdfs(self, pdf_wired, monkeypatch) -> None:
-        def fake_preprocess(path: str, **kwargs: Any) -> PreprocessResult:
-            return PreprocessResult(image=object(), width=PAGE_W, height=PAGE_H)
-
-        monkeypatch.setattr(pipeline_mod, "preprocess", fake_preprocess)
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        results = pipe.run_batch(["a.png", str(pdf_path)])
-        # 이미지 1장 + PDF 3페이지 = 4개. 입력 개수와 다르다.
-        assert len(results) == 4
-        assert [r.page_no for r in results] == [None, 1, 2, 3]
-
-    def test_unopenable_pdf_raises(self, pdf_wired, tmp_path) -> None:
-        pipe, _ = pdf_wired(enable_pass2=False)
-        bad = tmp_path / "broken.pdf"
-        bad.write_bytes(b"garbage")
-        with pytest.raises(RuntimeError, match="열 수 없습니다"):
-            pipe.run_pdf(str(bad))
-
-    def test_batch_survives_unopenable_pdf(self, pdf_wired, tmp_path) -> None:
-        pipe, pdf_path = pdf_wired(enable_pass2=False)
-        bad = tmp_path / "broken.pdf"
-        bad.write_bytes(b"garbage")
-        results = pipe.run_batch([str(bad), str(pdf_path)])
         assert any("처리 실패" in w for r in results for w in r.warnings)
-        assert sum(1 for r in results if r.regions) == 3
-
-
-class TestOutputContract:
-    def test_json_roundtrip(self, wired) -> None:
-        import json
-
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        parsed = json.loads(result.to_json())
-
-        assert parsed["page"] == {"width": PAGE_W, "height": PAGE_H}
-        assert parsed["regions"]
-        for region in parsed["regions"]:
-            assert set(region) >= {
-                "id", "type", "bbox", "source", "confidence",
-                "member_boxes", "needs_review", "coarse",
-            }
-            assert len(region["bbox"]) == 4
-
-    def test_include_ocr_adds_debug_payload(self, wired) -> None:
-        import json
-
-        pipe, _ = wired(PASS1_OK, PASS2_OK)
-        result = pipe.run("fake.png")
-        parsed = json.loads(result.to_json(include_ocr=True))
-        assert "ocr_boxes" in parsed
-        assert "raw_llm" in parsed
-        assert len(parsed["ocr_boxes"]) == 10

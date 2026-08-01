@@ -1,7 +1,12 @@
-"""읽기 순서 정렬 및 좌표 유틸.
+"""좌표 유틸 및 크롭 내 읽기 순서 정렬.
 
-읽기 순서가 꼬이면 LLM 이 라벨-값 쌍을 잘못 묶는다. 다단 컬럼 금융 서식에서
-단순 y 정렬은 실패하므로, 행 클러스터링 후 행 내부를 x 로 정렬한다.
+이전 구조에서는 이 모듈이 **페이지 전체**의 읽기 순서를 만들어야 했다. 다단
+컬럼 서식에서 라벨과 값을 짝지어 LLM 에 텍스트로 넘기려면 순서가 정확해야
+했고, 순서가 꼬이면 판단이 그대로 틀렸다.
+
+지금은 그 부담이 없다. LLM 은 이미지를 직접 보므로 읽기 순서를 코드가 알려줄
+필요가 없고, 여기서 정렬하는 것은 **크롭 하나 안의 몇 줄**뿐이다. 값이 여러
+줄/여러 박스로 쪼개졌을 때 이어붙일 순서만 맞으면 된다.
 """
 
 from __future__ import annotations
@@ -50,104 +55,67 @@ def pad_bbox(bbox: BBox, pad: int, page_w: int, page_h: int) -> BBox:
     )
 
 
+def denorm_bbox(bbox_norm: tuple[float, ...] | list[float], w: int, h: int) -> BBox:
+    """정규화 좌표 ``[x1,y1,x2,y2]`` 를 픽셀 좌표로 변환한다.
+
+    폭/높이가 0 이 되는 퇴화 케이스는 1px 로 보정한다 — 면적 0 박스는
+    크롭에서 빈 배열이 되어 OCR 이 예외를 던진다.
+    """
+    x1, y1, x2, y2 = bbox_norm
+    px = (
+        int(round(min(x1, x2) * w)),
+        int(round(min(y1, y2) * h)),
+        int(round(max(x1, x2) * w)),
+        int(round(max(y1, y2) * h)),
+    )
+    return (px[0], px[1], max(px[2], px[0] + 1), max(px[3], px[1] + 1))
+
+
+def norm_bbox(bbox: BBox, w: int, h: int) -> tuple[float, float, float, float]:
+    """픽셀 좌표를 정규화 좌표로 변환한다 (``denorm_bbox`` 의 역)."""
+    if w <= 0 or h <= 0:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h)
+
+
 def median_height(boxes: list[OcrBox]) -> float:
     heights = [b.height for b in boxes if b.height > 0]
     return float(median(heights)) if heights else 1.0
 
 
-def assign_reading_order(boxes: list[OcrBox], y_tol_ratio: float = 0.6) -> list[OcrBox]:
-    """행 클러스터링 후 읽기 순서대로 ``index`` 와 ``row`` 를 재부여한다.
+def sort_reading_order(boxes: list[OcrBox], y_tol_ratio: float = 0.6) -> list[OcrBox]:
+    """행 클러스터링 후 읽기 순서로 정렬하고 ``index`` 를 0부터 다시 부여한다.
 
     같은 행 판정은 세로 중심 좌표 차이가 ``중위 글자높이 * y_tol_ratio`` 이내인지로
-    한다. 폰트 크기가 섞인 서식에서도 안정적으로 동작한다.
+    한다. 폰트 크기가 섞여 있어도 안정적이다.
 
     Args:
-        boxes: OCR 박스 목록 (순서 무관).
+        boxes: OCR 박스 목록 (순서 무관). **입력 객체의 ``index`` 가 변경된다.**
         y_tol_ratio: 같은 행으로 볼 세로 허용오차 비율.
 
     Returns:
-        읽기 순서로 정렬되고 ``index``/``row`` 가 채워진 **새** 목록.
+        정렬된 목록. 빈 입력이면 빈 목록.
     """
     if not boxes:
         return []
 
     tol = median_height(boxes) * y_tol_ratio
-    ordered = sorted(boxes, key=lambda b: (b.cy, b.bbox[0]))
+    ordered = sorted(boxes, key=lambda b: ((b.bbox[1] + b.bbox[3]) / 2.0, b.bbox[0]))
 
     rows: list[list[OcrBox]] = [[ordered[0]]]
-    row_ref = ordered[0].cy
+    row_ref = (ordered[0].bbox[1] + ordered[0].bbox[3]) / 2.0
 
     for box in ordered[1:]:
-        if abs(box.cy - row_ref) <= tol:
+        cy = (box.bbox[1] + box.bbox[3]) / 2.0
+        if abs(cy - row_ref) <= tol:
             rows[-1].append(box)
         else:
             rows.append([box])
-            row_ref = box.cy
+            row_ref = cy
 
     result: list[OcrBox] = []
-    idx = 0
-    for row_no, row in enumerate(rows):
-        for box in sorted(row, key=lambda b: b.bbox[0]):
-            box.index = idx
-            box.row = row_no
-            result.append(box)
-            idx += 1
+    for row in rows:
+        result.extend(sorted(row, key=lambda b: b.bbox[0]))
+    for i, box in enumerate(result):
+        box.index = i
     return result
-
-
-def spatially_split(
-    indices: list[int],
-    boxes: list[OcrBox],
-    max_vgap_ratio: float = 1.5,
-    max_hgap_ratio: float = 4.0,
-) -> list[list[int]]:
-    """LLM 이 묶은 인덱스 그룹을 공간적 근접성으로 재검증한다.
-
-    주소처럼 여러 박스에 걸친 항목은 물리적으로 붙어 있어야 한다. 모델이 서식의
-    양 끝에 있는 무관한 박스를 잘못 묶는 경우가 있으므로 여기서 분해한다.
-
-    판정은 **행 번호 차이가 아니라 실제 픽셀 간격**으로 한다. 행 번호는 서식이
-    드문드문한 문서에서 물리적 거리를 반영하지 못한다 (행 2칸 차이가 600px 일 수 있다).
-
-    Args:
-        indices: LLM 이 반환한 박스 인덱스 목록.
-        boxes: 읽기순서 정렬된 전체 박스 목록 (``boxes[i].index == i`` 가정).
-        max_vgap_ratio: 다른 행일 때 허용할 세로 공백 (중위 글자높이 배수).
-        max_hgap_ratio: 같은 행일 때 허용할 가로 공백 (중위 글자높이 배수).
-
-    Returns:
-        분해된 인덱스 그룹 목록. 유효한 인덱스가 없으면 빈 목록.
-    """
-    valid = sorted(i for i in indices if 0 <= i < len(boxes))
-    if not valid:
-        return []
-
-    unit = median_height(boxes)
-    groups: list[list[int]] = [[valid[0]]]
-
-    for prev, cur in zip(valid, valid[1:], strict=False):  # 인접 쌍 순회
-        pb, cb = boxes[prev], boxes[cur]
-        if pb.row == cb.row:
-            too_far = (cb.bbox[0] - pb.bbox[2]) > unit * max_hgap_ratio
-        else:
-            too_far = (cb.bbox[1] - pb.bbox[3]) > unit * max_vgap_ratio
-
-        if too_far:
-            groups.append([cur])
-        else:
-            groups[-1].append(cur)
-
-    return groups
-
-
-def denorm_bbox(bbox_norm: list[float], page_w: int, page_h: int) -> BBox:
-    """정규화 좌표 [x1,y1,x2,y2] 를 픽셀 좌표로 변환한다."""
-    x1, y1, x2, y2 = bbox_norm
-    px = (
-        int(round(min(x1, x2) * page_w)),
-        int(round(min(y1, y2) * page_h)),
-        int(round(max(x1, x2) * page_w)),
-        int(round(max(y1, y2) * page_h)),
-    )
-    # 폭/높이가 0 이 되는 퇴화 케이스 방어
-    return (px[0], px[1], max(px[2], px[0] + 1), max(px[3], px[1] + 1))

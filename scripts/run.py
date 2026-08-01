@@ -29,10 +29,13 @@
     python scripts/run.py data/*.png data/*.pdf -o out/
 
     # 일회성 변경 — 설정 파일을 고치지 않고 덮어쓰기
-    python scripts/run.py sample.png --model Qwen/Qwen3.5-9B --no-pass2
+    python scripts/run.py sample.png --model Qwen/Qwen3.5-9B --tiles 4
 
-    # 적용된 설정만 확인하고 종료
+    # 적용된 설정만 확인하고 종료 (타일 수와 image_max_side 의 조합을 검산해준다)
     python scripts/run.py --print-config
+
+    # 디버깅 — VLM 원본 판단과 크롭 OCR 박스를 JSON 에 함께 남긴다
+    python scripts/run.py sample.png -o out/ --include-ocr --show-ocr-boxes
 """
 
 from __future__ import annotations
@@ -95,12 +98,32 @@ def build_parser() -> argparse.ArgumentParser:
                         "(셸 히스토리에 남으므로 PII_PDF_PASSWORD 환경변수를 권장)")
 
     g = p.add_argument_group("파이프라인")
-    g.add_argument("--pass2", action=BOOL, default=None,
-                   help="이미지 검수 pass (--no-pass2 로 끈다)")
-    g.add_argument("--pass2-blind", action=BOOL, default=None,
-                   help="1차 결과를 감추고 독립 판단")
     g.add_argument("--deskew", action=BOOL, default=None, help="기울기 보정")
     g.add_argument("--long-side", type=int, default=None, help="전처리 긴 변 길이")
+
+    g = p.add_argument_group("② VLM 탐지")
+    g.add_argument("--tiles", type=int, default=None,
+                   help="페이지를 몇 조각으로 나눠 VLM 을 호출할지 (기본 3). "
+                        "밀집한 표 문서는 3~4. 1 이면 전체를 한 번에 (뒤쪽 항목이 잘린다)")
+    g.add_argument("--tile-overlap", type=float, default=None,
+                   help="조각 간 겹침 비율 (기본 0.08). 경계에 걸린 줄을 보호한다")
+    g.add_argument("--hint", default=None,
+                   help="문서 종류 힌트. 비워 두는 것이 기본이다 (prefix caching 유지)")
+    g.add_argument("--samples", type=int, default=None,
+                   help="타일당 호출 횟수 (기본 1). 학습 없이 미탐을 줄이는 유일한 "
+                        "손잡이다 — 여러 번 뽑아 합집합을 만든다. 재현율↑ 정밀도↓, "
+                        "호출은 tiles x samples")
+    g.add_argument("--sample-temperature", type=float, default=None,
+                   help="--samples 2 이상일 때 쓸 온도 (기본 0.3). 0 이면 같은 답만 온다")
+
+    g = p.add_argument_group("③ 좌표 확정")
+    g.add_argument("--crop-pad", type=float, default=None,
+                   help="크롭 여유 비율 (기본 0.35). VLM 좌표가 어긋나므로 넉넉히")
+    g.add_argument("--crop-upscale", type=float, default=None,
+                   help="크롭 업샘플 배율 (기본 2.0). 작은 글씨 대응. 1.0 이면 끈다")
+    g.add_argument("--geometry-fallback", action=BOOL, default=None,
+                   help="텍스트가 안 맞을 때 위치 겹침으로 박스를 고른다 (기본 ON). "
+                        "--no-geometry-fallback 이면 텍스트 불일치 = 좌표 포기. A/B 비교용")
 
     g = p.add_argument_group("OCR")
     g.add_argument("--det-dir", default=None, help="검출 모델 디렉터리 (폐쇄망 필수)")
@@ -115,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--base-url", default=None, help="vLLM 엔드포인트")
     g.add_argument("--model", default=None, help="모델 이름")
     g.add_argument("--image-max-side", type=int, default=None,
-                   help="pass2 이미지 긴 변 길이. 1500 이상 유지할 것")
+                   help="VLM 에 보낼 이미지 긴 변 길이. --tiles 와 함께 볼 것 "
+                        "(--print-config 가 조합을 검산해준다)")
     return p
 
 
@@ -135,7 +159,9 @@ def written_paths(out_dir: Path, result) -> dict[str, Path]:
 
 def apply_cli_overrides(config, args: argparse.Namespace) -> None:
     """``None`` 이 아닌 CLI 인자만 설정에 덮어쓴다 (④ 단계)."""
-    pipe, ocr, llm, out = config.pipeline, config.pipeline.ocr, config.pipeline.llm, config.output
+    pipe = config.pipeline
+    ocr, llm, out = pipe.ocr, pipe.llm, config.output
+    det, loc = pipe.detect, pipe.locate
 
     for value, target, attr in (
         (args.out, out, "out_dir"),
@@ -143,8 +169,6 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.font, out, "font_path"),
         (args.show_ocr_boxes, out, "show_ocr_boxes"),
         (args.include_ocr, out, "include_ocr"),
-        (args.pass2, pipe, "enable_pass2"),
-        (args.pass2_blind, pipe, "pass2_blind"),
         (args.deskew, pipe, "deskew"),
         (args.long_side, pipe, "target_long_side"),
         (args.det_dir, ocr, "det_model_dir"),
@@ -154,6 +178,14 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.base_url, llm, "base_url"),
         (args.model, llm, "model"),
         (args.image_max_side, llm, "image_max_side"),
+        (args.tiles, det, "tiles"),
+        (args.tile_overlap, det, "overlap"),
+        (args.hint, det, "hint"),
+        (args.samples, det, "samples"),
+        (args.sample_temperature, det, "sample_temperature"),
+        (args.crop_pad, loc, "pad_ratio"),
+        (args.crop_upscale, loc, "upscale"),
+        (args.geometry_fallback, loc, "geometry_fallback"),
     ):
         if value is not None:
             setattr(target, attr, value)

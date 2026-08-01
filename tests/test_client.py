@@ -16,7 +16,7 @@ from pii_pipeline.llm.client import (
     root_key_of,
     salvage_json,
 )
-from pii_pipeline.schema import PASS1_SCHEMA, PASS2_SCHEMA
+from pii_pipeline.schema import VLM_SCHEMA
 
 
 def fake_response(content: str, finish_reason: str = "stop"):
@@ -51,7 +51,7 @@ class TestCompleteJsonFailures:
         """인코딩 실패가 예외로 새면 이미 계산된 규칙 레이어 결과까지 날아간다."""
         client = LlmClient(LlmConfig())
         payload, meta = client.complete_json(
-            system="s", user="u", schema=PASS2_SCHEMA, image=object()
+            system="s", user="u", schema=VLM_SCHEMA, image=object()
         )
         assert payload == {}
         assert "이미지 인코딩 실패" in meta["error"]
@@ -62,7 +62,7 @@ class TestCompleteJsonFailures:
         monkeypatch.setattr(
             type(client), "client", property(lambda self: called.append(1))
         )
-        client.complete_json(system="s", user="u", schema=PASS2_SCHEMA, image=object())
+        client.complete_json(system="s", user="u", schema=VLM_SCHEMA, image=object())
         assert called == []
 
     def test_api_failure_returns_error_not_raises(self, monkeypatch) -> None:
@@ -75,7 +75,7 @@ class TestCompleteJsonFailures:
 
         client = LlmClient(LlmConfig(max_retries=0))
         monkeypatch.setattr(type(client), "client", property(lambda self: Boom))
-        payload, meta = client.complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        payload, meta = client.complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert payload == {}
         assert "연결 거부" in meta["error"]
 
@@ -103,7 +103,7 @@ class TestCompleteJsonFailures:
 
         client = LlmClient(LlmConfig(max_retries=2))
         monkeypatch.setattr(type(client), "client", property(lambda self: Fake))
-        payload, meta = client.complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        payload, meta = client.complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert payload == {}
         assert "JSON 파싱 실패" in meta["error"]
         assert len(attempts) == 3  # 최초 1회 + 재시도 2회
@@ -112,7 +112,7 @@ class TestCompleteJsonFailures:
         """max_tokens 에서 잘리면 JSON 이 불완전하므로 성공으로 보지 않는다."""
 
         class Msg:
-            content = '{"missed":'
+            content = '{"findings":'
 
         class Choice:
             message = Msg()
@@ -131,7 +131,7 @@ class TestCompleteJsonFailures:
 
         client = LlmClient(LlmConfig(max_retries=0))
         monkeypatch.setattr(type(client), "client", property(lambda self: Fake))
-        payload, meta = client.complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        payload, meta = client.complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert payload == {}
         assert "max_tokens" in meta["error"]
 
@@ -139,25 +139,21 @@ class TestCompleteJsonFailures:
 class TestSalvage:
     """guided decoding 이 실제로 걸리지 않은 서버에서 관측된 형식 이탈.
 
-    현장 로그: ``pass2 실패: JSON 파싱 실패: Extra data: line 2 column 1``
-    — 모델이 항목을 한 줄에 하나씩 뱉었다. 페이지의 pass2 결과가 전량 날아갔다.
+    현장 로그: ``JSON 파싱 실패: Extra data: line 2 column 1``
+    — 모델이 항목을 한 줄에 하나씩 뱉었다. 그 타일의 결과가 전량 날아갔다.
     """
 
     def test_root_key_from_schema(self) -> None:
-        assert root_key_of(PASS2_SCHEMA) == "missed"
-        assert root_key_of(PASS1_SCHEMA) == "regions"
+        assert root_key_of(VLM_SCHEMA) == "findings"
 
     def test_jsonl_items_are_wrapped(self) -> None:
         raw = (
-            '{"idx":[21],"type":"NAME","conf":0.85,"reason":"성명란에 손글씨"}\n'
-            '{"idx":[30],"type":"PHONE","conf":0.7,"reason":"손글씨 번호"}'
+            '{"text":"홍길동","type":"NAME","field":"성명","bbox_norm":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
+            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_norm":[0.1,0.5,0.4,0.6],"conf":0.8}'
         )
-        assert salvage_json(raw, "missed") == {
-            "missed": [
-                {"idx": [21], "type": "NAME", "conf": 0.85, "reason": "성명란에 손글씨"},
-                {"idx": [30], "type": "PHONE", "conf": 0.7, "reason": "손글씨 번호"},
-            ]
-        }
+        out = salvage_json(raw, "findings")
+        assert out is not None
+        assert [i["text"] for i in out["findings"]] == ["홍길동", "010-1234-5678"]
 
     def test_bare_array_is_wrapped(self) -> None:
         assert salvage_json('[{"idx":[1],"type":"NAME"}]', "missed") == {
@@ -191,17 +187,17 @@ class TestSalvage:
 
     def test_client_recovers_jsonl_and_marks_meta(self, monkeypatch) -> None:
         raw = (
-            '{"idx":[21],"type":"NAME","conf":0.85,"reason":"a"}\n'
-            '{"idx":[30],"type":"PHONE","conf":0.7,"reason":"b"}'
+            '{"text":"홍길동","type":"NAME","field":"성명","bbox_norm":[0.1,0.2,0.3,0.4],"conf":0.9}\n'
+            '{"text":"010-1234-5678","type":"PHONE","field":"연락처","bbox_norm":[0.1,0.5,0.4,0.6],"conf":0.8}'
         )
         client = LlmClient(LlmConfig(max_retries=0))
         monkeypatch.setattr(
             type(client), "client", property(lambda self: fake_response(raw))
         )
         payload, meta = client.complete_json(
-            system="s", user="u", schema=PASS2_SCHEMA
+            system="s", user="u", schema=VLM_SCHEMA
         )
-        assert [i["type"] for i in payload["missed"]] == ["NAME", "PHONE"]
+        assert [i["type"] for i in payload["findings"]] == ["NAME", "PHONE"]
         assert "Extra data" in meta["salvaged"]
         assert "error" not in meta
 
@@ -210,7 +206,7 @@ class TestSalvage:
         monkeypatch.setattr(
             type(client), "client", property(lambda self: fake_response("설명만 있다"))
         )
-        payload, meta = client.complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        payload, meta = client.complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert payload == {}
         assert "JSON 파싱 실패" in meta["error"]
 
@@ -249,21 +245,21 @@ class TestRequestShape:
     def test_thinking_is_disabled(self, captured) -> None:
         """추론 모드가 켜지면 사고 토큰을 수천 개 뱉어 지연시간 예산을 날린다."""
         build, seen = captured
-        build().complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        build().complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert seen["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
 
     def test_temperature_is_zero(self, captured) -> None:
         build, seen = captured
-        build().complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        build().complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert seen["temperature"] == 0.0
 
     def test_schema_is_enforced(self, captured) -> None:
         build, seen = captured
-        build().complete_json(system="s", user="u", schema=PASS2_SCHEMA)
-        assert seen["extra_body"]["guided_json"] == PASS2_SCHEMA
+        build().complete_json(system="s", user="u", schema=VLM_SCHEMA)
+        assert seen["extra_body"]["guided_json"] == VLM_SCHEMA
         assert seen["extra_body"]["guided_decoding_backend"] == "xgrammar"
 
     def test_text_only_request_has_string_content(self, captured) -> None:
         build, seen = captured
-        build().complete_json(system="s", user="u", schema=PASS2_SCHEMA)
+        build().complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert seen["messages"][1]["content"] == "u"

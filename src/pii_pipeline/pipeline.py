@@ -1,18 +1,27 @@
 """파이프라인 오케스트레이션.
 
     이미지
-      ├─① 전처리          기울기 보정 / 해상도 정규화
-      ├─② OCR             det 임계값↓, rec 실패 박스도 번호 부여해 유지
-      ├─③ 규칙 레이어      정규식 + 체크섬으로 정형 식별자 확정
-      │                   (원문 + 회피 표기 정규형을 각각 스캔)
-      ├─④ LLM pass-1      OCR 텍스트만. 문맥 항목 분류.
-      ├─④' VLM pass-2     이미지 직접 확인. OCR 이 구조적으로 놓친 것 회수.
-      ├─⑤ 값 전파          확정된 값과 같은 텍스트를 가진 나머지 박스 회수.
-      ├─⑥ 병합·검증        범위/중복/공간 검사, 제외 훅
-      └─⑦ 결과 JSON
+      ├─① 전처리      기울기 보정 / 해상도 정규화
+      ├─② VLM 탐지    이미지를 보고 개인정보를 **전사**한다 (좌표는 대략)
+      ├─③ 크롭 OCR    지목된 영역을 잘라 배치 인식 → **정밀 좌표**
+      ├─④ 검증        체크섬 · 자리수 · 항목명 필터
+      └─⑤ 결과 JSON
 
-중복 차단은 ``ClaimLedger`` 로 **(박스, 라벨) 단위**로 한다. 박스 단위로 막으면
-``"홍길동 901231-1234567"`` 처럼 한 박스에 두 종류가 섞였을 때 뒤쪽이 사라진다.
+단계가 두 개뿐인 것이 핵심이다 (②와 ③). 그래야 오차를 어느 단계에 귀속시킬 수
+있고, 개선이 측정된다. ``PageResult.stats()`` 의 세 지표가 정확히 그 용도다.
+
+    n_findings      ② 가 몇 건을 찾았나         -> VLM 재현율
+    localized_rate  ③ 이 몇 %의 좌표를 잡았나   -> 기하 성능
+    n_disagreement  두 엔진이 다르게 읽은 건수  -> 신뢰도
+
+이전 구조는 규칙 레이어 + 텍스트 LLM pass + 이미지 VLM pass + 값 전파 + 병합
+다섯 단계였고, 단계 간 계약(``<CONFIRMED>`` 태그, 라벨셋 분리, (박스,라벨) 원장)이
+버그의 원인이었다. 오차를 어디에 귀속시킬 수도 없었다.
+
+**순서가 뒤집혀 있었다는 것이 근본 문제였다.** 개인정보 판단은 의미 문제고
+좌표는 기하 문제다. 예전에는 기하(OCR)를 먼저 돌리고 그 결과를 의미 판단의
+입력 형식으로 강제했기 때문에, VLM 이 "박스 번호 고르기" 를 해야 했다 —
+자기가 가장 못하는 일을. 지금은 판단을 VLM 에, 좌표를 OCR 에 맡긴다.
 """
 
 from __future__ import annotations
@@ -24,27 +33,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+from .detect import DetectConfig, detect
 from .llm.client import LlmClient, LlmConfig
-from .llm.prompts import (
-    SYSTEM_PASS1,
-    SYSTEM_PASS2,
-    build_pass1_user,
-    build_pass2_user,
-)
-from .merge import (
-    claims_from_hits,
-    confirmed_map,
-    finalize,
-    regions_from_pass1,
-    regions_from_pass2,
-    regions_from_rules,
-)
+from .locate import LocateConfig, locate
 from .ocr.paddle_runner import OcrConfig, PaddleOcrRunner
 from .pdf import is_pdf, render_pages
 from .preprocess import preprocess, preprocess_array
-from .propagate import PropagateConfig, propagate_regions
-from .rules.detectors import detect as rule_detect
-from .schema import PASS1_SCHEMA, PASS2_SCHEMA, OcrBox, PageResult
+from .schema import PageResult
+from .verify import VerifyConfig, finalize, verify_regions
 
 log = logging.getLogger(__name__)
 
@@ -54,26 +50,24 @@ class PipelineConfig:
     """파이프라인 설정.
 
     Attributes:
-        enable_pass2: 이미지 검수 pass 사용 여부. 손글씨/도장이 있는 문서에서는
-            반드시 켜야 한다 (OCR 이 못 읽은 것은 텍스트 pass 로 회수 불가).
-        pass2_blind: ``True`` 면 1차 결과를 감춘다. 앵커링 편향은 없지만
-            중복 판단이 늘어난다. 검증셋에서 두 방식을 비교할 것.
-        target_long_side: 전처리 시 긴 변 목표 길이.
+        target_long_side: 전처리 시 긴 변 목표 길이. 결과 좌표계의 기준이 된다.
+            높이면 크롭 해상도가 올라가지만 VLM 입력도 커진다 (타일링이 이를
+            흡수한다 — ``DetectConfig.tiles`` 참조).
         deskew: 기울기 보정 여부.
-        ocr: OCR 설정.
-        llm: LLM 설정.
-        propagate: 값 전파 설정. 한 곳에서 확정된 값과 같은 텍스트를 가진
-            나머지 박스를 회수한다. 같은 이름/번호가 문서에 여러 번 나오는데
-            일부만 탐지되는 상황을 메운다.
+        ocr: OCR 설정. 이제 OCR 은 페이지 전체가 아니라 **크롭에만** 돈다.
+        llm: vLLM 접속/샘플링 설정.
+        detect: ② VLM 탐지 설정 (타일 수 등).
+        locate: ③ 좌표 확정 설정 (크롭 패딩, 업샘플 등).
+        verify: ④ 검증 설정.
     """
 
-    enable_pass2: bool = True
-    pass2_blind: bool = False
     target_long_side: int | None = 2480
     deskew: bool = True
     ocr: OcrConfig = field(default_factory=OcrConfig.from_env)
     llm: LlmConfig = field(default_factory=LlmConfig)
-    propagate: PropagateConfig = field(default_factory=PropagateConfig)
+    detect: DetectConfig = field(default_factory=DetectConfig)
+    locate: LocateConfig = field(default_factory=LocateConfig)
+    verify: VerifyConfig = field(default_factory=VerifyConfig)
 
 
 @contextmanager
@@ -125,28 +119,18 @@ class PiiPipeline:
         with _timed(timings, "preprocess"):
             if image is not None:
                 pre = preprocess_array(
-                    image,
-                    target_long_side=cfg.target_long_side,
-                    deskew=cfg.deskew,
+                    image, target_long_side=cfg.target_long_side, deskew=cfg.deskew
                 )
             else:
                 pre = preprocess(
-                    image_path,
-                    target_long_side=cfg.target_long_side,
-                    deskew=cfg.deskew,
+                    image_path, target_long_side=cfg.target_long_side, deskew=cfg.deskew
                 )
-        page_w, page_h = pre.width, pre.height
-
-        # ── ② OCR ────────────────────────────────────────────────
-        with _timed(timings, "ocr"):
-            boxes: list[OcrBox] = self.ocr.run(pre.image)
 
         result = PageResult(
             image_path=image_path,
             page_no=page_no,
-            width=page_w,
-            height=page_h,
-            ocr_boxes=boxes,
+            width=pre.width,
+            height=pre.height,
             timings=timings,
             warnings=warnings,
             raw_llm=raw_llm,
@@ -154,82 +138,37 @@ class PiiPipeline:
         )
         if pre.applied:
             warnings.append("전처리 적용: " + ", ".join(pre.applied))
-        if not boxes:
-            warnings.append("OCR 박스가 검출되지 않았습니다")
+
+        # ── ② VLM 탐지 ────────────────────────────────────────────
+        with _timed(timings, "detect"):
+            findings, metas = detect(pre.image, self.llm, cfg.detect, warnings)
+            raw_llm["vlm"] = metas
+            result.findings = findings
+
+        if not findings:
+            # 빈 결과와 "호출이 실패해서 빈 결과" 를 구분해야 한다. guided
+            # decoding 은 형식만 보장하므로, 과부하 상태의 모델이 내는 가장 싼
+            # 스키마 적합 응답이 빈 배열이다. 그걸 "개인정보 없음" 으로 조용히
+            # 넘기면 미탐이 무음으로 쌓인다.
+            if any(m.get("error") for m in metas):
+                warnings.append("VLM 호출이 실패해 탐지 결과가 없습니다 (개인정보 없음이 아님)")
+            else:
+                warnings.append("VLM 이 개인정보를 찾지 못했습니다")
             return result
 
-        # ── ③ 규칙 레이어 ─────────────────────────────────────────
-        with _timed(timings, "rules"):
-            hits = rule_detect(boxes)
-            rule_regions = regions_from_rules(hits, boxes, page_w, page_h)
-            confirmed = confirmed_map(hits)
-
-        # (박스, 라벨) 단위 원장. 규칙이 RRN 을 확정한 박스라도 같은 박스의
-        # 이름은 아직 미확정이므로, LLM 이 그 박스를 NAME 으로 보고할 수 있어야
-        # 한다. 박스 단위로 막으면 부분 마스킹 구현 시 그대로 유출된다.
-        claimed = claims_from_hits(hits)
-        regions = list(rule_regions)
-
-        # ── ④ LLM pass-1 (텍스트) ─────────────────────────────────
-        with _timed(timings, "llm_pass1"):
-            payload, meta = self.llm.complete_json(
-                system=SYSTEM_PASS1,
-                user=build_pass1_user(boxes, page_w, page_h, confirmed),
-                schema=PASS1_SCHEMA,
+        # ── ③ 크롭 OCR 로 좌표 확정 ───────────────────────────────
+        with _timed(timings, "locate"):
+            regions, boxes = locate(
+                findings, pre.image, self.ocr, cfg.locate, warnings
             )
-            raw_llm["pass1"] = meta
-            if meta.get("error"):
-                warnings.append(f"pass1 실패: {meta['error']}")
-            regions += regions_from_pass1(
-                payload, boxes, claimed, page_w, page_h, warnings
-            )
+            result.ocr_boxes = boxes
 
-        # ── ④' VLM pass-2 (이미지) ────────────────────────────────
-        if cfg.enable_pass2:
-            with _timed(timings, "llm_pass2"):
-                payload2, meta2 = self.llm.complete_json(
-                    system=SYSTEM_PASS2,
-                    user=build_pass2_user(
-                        boxes,
-                        page_w,
-                        page_h,
-                        confirmed=confirmed,
-                        detected_idx=sorted(claimed.indices()),
-                        blind=cfg.pass2_blind,
-                    ),
-                    schema=PASS2_SCHEMA,
-                    image=pre.image,
-                )
-                raw_llm["pass2"] = meta2
-                if meta2.get("error"):
-                    warnings.append(f"pass2 실패: {meta2['error']}")
-                regions += regions_from_pass2(
-                    payload2, boxes, claimed, page_w, page_h, warnings
-                )
+        # ── ④ 검증 · 최종 정리 ────────────────────────────────────
+        with _timed(timings, "verify"):
+            verify_regions(regions, cfg.verify, warnings)
+            result.regions = finalize(regions, cfg.verify, warnings)
 
-        # ── ⑤ 값 전파 ─────────────────────────────────────────────
-        # 같은 값이 문서 여러 곳에 나오는데 일부만 탐지되는 것은 정상적으로
-        # 발생한다 (규칙은 박스 단위, pass-1 은 라벨 근처, pass-2 는 상위 몇 개).
-        # 한 곳에서 확정됐으면 나머지 위치도 같은 개인정보다.
-        with _timed(timings, "propagate"):
-            propagated = propagate_regions(
-                regions,
-                boxes,
-                page_w,
-                page_h,
-                claimed=claimed,
-                config=cfg.propagate,
-                warnings=warnings,
-            )
-            regions += propagated
-
-        # ── ⑥ 병합·검증 ───────────────────────────────────────────
-        with _timed(timings, "merge"):
-            result.regions = finalize(regions, boxes, warnings)
-
-        timings["total"] = sum(
-            v for k, v in timings.items() if k != "total"
-        )
+        timings["total"] = sum(v for k, v in timings.items() if k != "total")
         return result
 
     def run_pdf(

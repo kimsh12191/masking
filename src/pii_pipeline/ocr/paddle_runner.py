@@ -1,11 +1,24 @@
-"""PaddleOCR 래퍼 — det/rec 분리 및 폐쇄망 대응.
+"""PaddleOCR 래퍼 — 크롭 배치 인식 및 폐쇄망 대응.
+
+이 파이프라인에서 OCR 은 **탐지기가 아니라 측량기**다. 무엇이 개인정보인지는
+VLM 이 이미 판단했고, OCR 은 "그 값이 정확히 어느 픽셀에 있는가" 만 답한다.
+그래서 페이지 전체가 아니라 **VLM 이 지목한 영역의 크롭들**을 받는다.
+
+크롭 단위로 도는 것이 페이지 단위보다 유리한 이유:
+
+1. **det 가 쉬워진다.** 밀집한 노이즈 표에서 페이지 det 는 인접 셀을 붙이거나
+   한 셀을 쪼갠다. 한 칸짜리 크롭에서는 그런 모호함이 없다.
+2. **업샘플이 가능하다.** 작은 크롭은 2배로 키워도 비용이 무시할 만하고,
+   10px 짜리 글자에서 rec 정확도가 실제로 올라간다 (``locate.py`` 가 키운다).
+3. **실패가 국소적이다.** 한 크롭의 rec 실패는 그 항목 하나만
+   ``VLM_COARSE`` 로 떨어뜨린다. 페이지 전체 판단에 영향을 주지 않는다.
 
 핵심 설계:
 
 1. **det 임계값을 낮춰 넉넉하게 검출**한다. 검출기는 인식기보다 강해서
    손글씨/도장에 겹친 글자도 "여기 뭔가 있다"는 건 잡아낸다.
-2. **rec 실패/저신뢰 박스를 버리지 않는다.** 번호를 부여해 후보로 유지하고
-   이미지 pass 에서 회수한다. 이래야 VLM 이 좌표를 환각하지 않는다.
+2. **rec 실패/저신뢰 박스를 버리지 않는다.** "글자는 있는데 못 읽었다" 는
+   정보가 손글씨·도장 영역을 판별하는 근거다.
 3. **모델 경로를 명시적으로 지정**한다. PaddleOCR 은 기본적으로 첫 실행 시
    모델을 자동 다운로드하는데, 폐쇄망에서는 여기서 실패한다.
    ``scripts/download_models.py`` 로 미리 받아 반입할 것.
@@ -20,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from ..schema import OcrBox, OcrStatus
-from .layout import assign_reading_order, quad_to_bbox
+from .layout import quad_to_bbox, sort_reading_order
 
 log = logging.getLogger(__name__)
 
@@ -187,17 +200,45 @@ class PaddleOcrRunner:
     # ------------------------------------------------------------------
 
     def run(self, image: Any) -> list[OcrBox]:
-        """이미지에서 OCR 박스를 추출한다.
+        """이미지 1장에서 OCR 박스를 추출한다.
 
         Args:
             image: numpy 배열 (BGR) 또는 이미지 파일 경로.
 
         Returns:
-            읽기 순서로 정렬되고 ``index``/``row`` 가 채워진 박스 목록.
+            읽기 순서로 정렬되고 ``index`` 가 채워진 박스 목록.
             rec 실패 박스도 ``OcrStatus.FAILED`` 로 포함된다.
         """
         raw = self.engine.ocr(image, cls=True)
         return self.parse(raw)
+
+    def run_many(self, images: list[Any]) -> list[list[OcrBox]]:
+        """여러 크롭을 연속으로 인식한다.
+
+        엔진을 한 번만 예열하고 크롭들을 이어서 넘긴다. PaddleOCR 2.x 의
+        ``ocr()`` 은 배열 하나만 받으므로 여기서 순회하며, rec 배치는 크롭
+        내부에서 Paddle 이 알아서 묶는다. **크롭 간 병렬화는 아니다** —
+        이득은 엔진 재사용과 크롭당 입력이 작다는 점에서 나온다.
+
+        Args:
+            images: BGR numpy 배열 목록. 빈 배열이 섞여 있어도 된다.
+
+        Returns:
+            입력과 **같은 길이**의 결과 목록. 한 크롭이 실패하면 그 자리는
+            빈 목록이 된다 (전체를 버리지 않는다). 좌표는 각 크롭 기준이므로
+            호출부가 페이지 좌표로 환산해야 한다.
+        """
+        out: list[list[OcrBox]] = []
+        for n, img in enumerate(images):
+            if img is None or getattr(img, "size", 1) == 0:
+                out.append([])
+                continue
+            try:
+                out.append(self.run(img))
+            except Exception as exc:  # noqa: BLE001 - 크롭 하나로 페이지를 버리지 않는다
+                log.warning("크롭 %d OCR 실패: %s: %s", n, type(exc).__name__, exc)
+                out.append([])
+        return out
 
     def parse(self, raw: Any) -> list[OcrBox]:
         """PaddleOCR 원시 출력을 ``OcrBox`` 목록으로 변환한다.
@@ -229,16 +270,15 @@ class PaddleOcrRunner:
 
             boxes.append(
                 OcrBox(
-                    index=-1,  # assign_reading_order 에서 부여
+                    index=-1,  # sort_reading_order 에서 부여
                     bbox=quad_to_bbox(quad),
                     text=text.strip(),
                     status=self._status(text, rec_conf),
                     rec_conf=round(rec_conf, 4),
-                    quad=[(int(round(p[0])), int(round(p[1]))) for p in quad],
                 )
             )
 
-        return assign_reading_order(boxes)
+        return sort_reading_order(boxes)
 
     def _status(self, text: str, conf: float) -> OcrStatus:
         if not text.strip() or conf < self.config.rec_conf_floor:
