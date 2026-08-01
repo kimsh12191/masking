@@ -152,7 +152,7 @@ class TestFindValue:
     cfg = LocateConfig()
 
     def test_exact_single_box(self) -> None:
-        m = find_value("홍길동", [box("홍길동")], "NAME", self.cfg)
+        m = find_value("홍길동", [box("홍길동")], self.cfg)
         assert m is not None
         assert m.agreement is Agreement.EXACT
         assert len(m.boxes) == 1
@@ -160,13 +160,13 @@ class TestFindValue:
     def test_prefers_the_tightest_box(self) -> None:
         """옆 칸까지 딸려 들어오면 마스킹 박스가 셀 두 개를 덮는다."""
         boxes = [box("성명", 0, 0, 60, 30), box("홍길동", 70, 0, 150, 30)]
-        m = find_value("홍길동", boxes, "NAME", self.cfg)
+        m = find_value("홍길동", boxes, self.cfg)
         assert m is not None
         assert [b.text for b in m.boxes] == ["홍길동"]
 
     def test_substring_gives_a_char_span(self) -> None:
         """부분 마스킹(901231-1******)을 위해 박스 내 오프셋이 필요하다."""
-        m = find_value("홍길동", [box("담당자: 홍길동")], "NAME", self.cfg)
+        m = find_value("홍길동", [box("담당자: 홍길동")], self.cfg)
         assert m is not None
         assert m.char_span is not None
         start, end = m.char_span
@@ -174,47 +174,42 @@ class TestFindValue:
 
     def test_joins_boxes_when_the_value_is_split(self) -> None:
         boxes = [box("010-1234", 0, 0, 80, 30), box("5678", 85, 0, 130, 30)]
-        m = find_value("010-1234-5678", boxes, "PHONE", self.cfg)
+        m = find_value("010-1234-5678", boxes, self.cfg)
         assert m is not None
         assert len(m.boxes) == 2
         assert m.char_span is None  # 여러 박스에 걸치면 원문 오프셋이 하나가 아니다
 
     def test_folds_evasion_notation(self) -> None:
-        m = find_value("010-1234-5678", [box("공1공-1234-5678")], "PHONE", self.cfg)
+        m = find_value("010-1234-5678", [box("공1공-1234-5678")], self.cfg)
         assert m is not None
         assert m.agreement is Agreement.EXACT
 
-    def test_similarity_rescues_hangul_misreads(self) -> None:
-        m = find_value("홍길동", [box("홍길둥")], "NAME", self.cfg)
-        assert m is not None
-        assert m.agreement is Agreement.SIMILAR
-        assert m.similarity < 1.0
+    def test_near_misses_are_not_matched(self) -> None:
+        """유사 매칭 단계는 없다. 한 글자만 달라도 여기서는 실패다.
 
-    def test_similarity_is_never_used_for_numbers(self) -> None:
-        """숫자는 한 글자 다르면 오독이 아니라 그냥 다른 번호다.
-
-        유사도로 이어붙이면 옆 칸의 **다른 사람** 주민번호에 붙는다.
+        회수는 ``select_by_geometry`` 가 한다 — 텍스트가 비슷하면서 위치도
+        겹치면 기하가 같은 박스를 고르고, 위치가 안 겹치면 애초에 다른 값이라
+        유사도로 이어붙여선 안 된다. 특히 숫자는 한 글자 다르면 "오독된 같은
+        번호" 가 아니라 **그냥 다른 사람의 번호**다.
         """
-        assert find_value("901231-1234563", [box("901231-1234564")], "RRN", self.cfg) is None
-        assert find_value("010-1234-5678", [box("010-1234-5679")], "PHONE", self.cfg) is None
+        assert find_value("홍길동", [box("홍길둥")], self.cfg) is None
+        assert find_value("901231-1234563", [box("901231-1234564")], self.cfg) is None
+        assert find_value("010-1234-5678", [box("010-1234-5679")], self.cfg) is None
 
     def test_no_match_returns_none(self) -> None:
-        assert find_value("홍길동", [box("김철수")], "NAME", self.cfg) is None
+        assert find_value("홍길동", [box("김철수")], self.cfg) is None
 
     def test_empty_seed_returns_none(self) -> None:
-        assert find_value("", [box("홍길동")], "SIGNATURE", self.cfg) is None
+        assert find_value("", [box("홍길동")], self.cfg) is None
 
     def test_failed_boxes_are_ignored(self) -> None:
         """rec 실패 박스의 텍스트는 신뢰할 수 없다."""
         failed = [box("홍길동", status=OcrStatus.FAILED)]
-        assert find_value("홍길동", failed, "NAME", self.cfg) is None
+        assert find_value("홍길동", failed, self.cfg) is None
 
     def test_no_boxes_returns_none(self) -> None:
-        assert find_value("홍길동", [], "NAME", self.cfg) is None
+        assert find_value("홍길동", [], self.cfg) is None
 
-    def test_similarity_can_be_disabled(self) -> None:
-        strict = LocateConfig(similarity=1.0)
-        assert find_value("홍길동", [box("홍길둥")], "NAME", strict) is None
 
 
 # --------------------------------------------------------------------------
@@ -383,12 +378,20 @@ class TestLocate:
         regions, _ = locate([finding("홍길동")], blank_page(), FakeOcr([[box("홍길동")]]))
         assert regions[0].confidence < 1.0
 
-    def test_similar_match_needs_review(self) -> None:
-        regions, _ = locate([finding("홍길동")], blank_page(), FakeOcr([[box("홍길둥")]]))
+    def test_hangul_misread_falls_through_to_geometry(self) -> None:
+        """한 글자 오독은 이제 유사 매칭이 아니라 기하가 회수한다.
+
+        좌표는 여전히 OCR 것이고(``ocr_refined``), 값 교차검증은 실패했으므로
+        ``agreement=NONE`` + ``needs_review`` 로 남는다. ``reason`` 에 두 엔진이
+        각각 뭘 읽었는지가 함께 적혀야 사람이 판단할 수 있다.
+        """
+        f = finding("홍길동")
+        regions, _ = locate([f], blank_page(), FakeOcr([[in_vlm_box(f, "홍길둥")]] * 2))
         r = regions[0]
-        assert r.agreement is Agreement.SIMILAR
+        assert r.source is Source.OCR_REFINED
+        assert r.agreement is Agreement.NONE
         assert r.needs_review is True
-        assert "OCR" in (r.reason or "")
+        assert "홍길동" in (r.reason or "") and "홍길둥" in (r.reason or "")
 
     def test_retries_with_a_wider_crop(self) -> None:
         """VLM bbox 가 어긋나 값이 크롭 밖으로 나간 경우를 한 번 회수한다."""

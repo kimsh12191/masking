@@ -257,6 +257,13 @@ def describe(config: AppConfig) -> str:
                 else ""
             ),
             f"② VLM 탐지  타일 {pipe.detect.tiles}개 (겹침 {pipe.detect.overlap:.0%})"
+            + (
+                f" × 샘플 {pipe.detect.samples}회"
+                f" (T={pipe.detect.sample_temperature}, 합집합)"
+                if pipe.detect.samples > 1
+                else ""
+            )
+            + f"  호출 {pipe.detect.tiles * max(1, pipe.detect.samples)}회"
             f"  image_max_side={llm.image_max_side}"
             + (
                 f"  타일 세로 약 {tile_side}px"
@@ -268,10 +275,8 @@ def describe(config: AppConfig) -> str:
             f"③ 좌표 확정  크롭 패딩 {pipe.locate.pad_ratio:.0%}"
             f" (최소 {pipe.locate.min_pad_px}px)"
             f"  업샘플 x{pipe.locate.upscale}"
-            f"  유사매칭 {pipe.locate.similarity}"
             f"  기하 fallback={'ON' if pipe.locate.geometry_fallback else 'OFF'}",
-            f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}"
-            f"  항목명 제외={'ON' if pipe.verify.drop_field_labels else 'OFF'}",
+            f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}",
             f"전처리      긴 변 {pipe.target_long_side or '원본'}"
             f"  deskew={'ON' if pipe.deskew else 'OFF'}",
             f"출력        {out.out_dir}  이미지={'ON' if out.write_image else 'OFF'}",

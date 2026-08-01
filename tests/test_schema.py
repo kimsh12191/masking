@@ -95,10 +95,10 @@ class TestVlmFinding:
 
 class TestPiiRegionSerialization:
     def test_enums_become_strings(self) -> None:
-        d = region(ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.SIMILAR).to_dict()
+        d = region(ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.NONE).to_dict()
         assert d["source"] == "ocr_refined"
         assert d["ocr_status"] == "low_conf"
-        assert d["agreement"] == "similar"
+        assert d["agreement"] == "none"
 
     def test_bboxes_become_lists(self) -> None:
         d = region(member_boxes=[(1, 2, 3, 4)]).to_dict()

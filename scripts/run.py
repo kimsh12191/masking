@@ -109,14 +109,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="조각 간 겹침 비율 (기본 0.08). 경계에 걸린 줄을 보호한다")
     g.add_argument("--hint", default=None,
                    help="문서 종류 힌트. 비워 두는 것이 기본이다 (prefix caching 유지)")
+    g.add_argument("--samples", type=int, default=None,
+                   help="타일당 호출 횟수 (기본 1). 학습 없이 미탐을 줄이는 유일한 "
+                        "손잡이다 — 여러 번 뽑아 합집합을 만든다. 재현율↑ 정밀도↓, "
+                        "호출은 tiles x samples")
+    g.add_argument("--sample-temperature", type=float, default=None,
+                   help="--samples 2 이상일 때 쓸 온도 (기본 0.3). 0 이면 같은 답만 온다")
 
     g = p.add_argument_group("③ 좌표 확정")
     g.add_argument("--crop-pad", type=float, default=None,
                    help="크롭 여유 비율 (기본 0.35). VLM 좌표가 어긋나므로 넉넉히")
     g.add_argument("--crop-upscale", type=float, default=None,
                    help="크롭 업샘플 배율 (기본 2.0). 작은 글씨 대응. 1.0 이면 끈다")
-    g.add_argument("--similarity", type=float, default=None,
-                   help="유사 매칭 임계값 (기본 0.65). 1.0 이면 완전일치만")
     g.add_argument("--geometry-fallback", action=BOOL, default=None,
                    help="텍스트가 안 맞을 때 위치 겹침으로 박스를 고른다 (기본 ON). "
                         "--no-geometry-fallback 이면 텍스트 불일치 = 좌표 포기. A/B 비교용")
@@ -177,9 +181,10 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.tiles, det, "tiles"),
         (args.tile_overlap, det, "overlap"),
         (args.hint, det, "hint"),
+        (args.samples, det, "samples"),
+        (args.sample_temperature, det, "sample_temperature"),
         (args.crop_pad, loc, "pad_ratio"),
         (args.crop_upscale, loc, "upscale"),
-        (args.similarity, loc, "similarity"),
         (args.geometry_fallback, loc, "geometry_fallback"),
     ):
         if value is not None:

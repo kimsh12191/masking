@@ -58,7 +58,7 @@ def sample_result() -> PageResult:
                 id="r003", type="NAME", bbox=(220, 300, 380, 330),
                 source=Source.OCR_REFINED, confidence=0.85, member_index=[2],
                 text="김철둥", vlm_text="김철수",
-                ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.SIMILAR,
+                ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.NONE,
                 needs_review=True,
             ),
             # 좌표 근사 (서명·인영)

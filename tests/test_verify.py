@@ -103,7 +103,7 @@ class TestChecksum:
         assert r.needs_review is False
 
     def test_verified_but_disagreed_stays_in_review(self) -> None:
-        r = region(type="RRN", text=VALID_RRN, agreement=Agreement.SIMILAR)
+        r = region(type="RRN", text=VALID_RRN, agreement=Agreement.NONE)
         verify_regions([r])
         assert r.verified is True
         assert r.confidence < 1.0
@@ -193,11 +193,13 @@ class TestFinalizeFieldLabels:
         out = finalize([region(type="NAME", vlm_text="조민석", text="담당자: 조민석")])
         assert len(out) == 1
 
-    def test_can_be_kept_with_a_flag_instead(self) -> None:
-        out = finalize(
-            [region(type="NAME", vlm_text="성명")],
-            VerifyConfig(drop_field_labels=False),
-        )
+    def test_ocr_value_under_a_label_vlm_text_is_kept(self) -> None:
+        """VLM 은 항목명을 읽었지만 기하 선택이 값 칸을 골랐다면 **버리지 않는다.**
+
+        미탐이 확정되는 경로다. 헤더를 덧칠하는 손해가 이름을 놓치는 손해보다
+        작으므로 남기고 검토로 넘긴다.
+        """
+        out = finalize([region(type="NAME", vlm_text="성 명", text="홍길동")])
         assert len(out) == 1
         assert out[0].needs_review is True
 

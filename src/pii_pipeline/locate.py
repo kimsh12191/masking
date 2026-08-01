@@ -16,10 +16,15 @@
 =====  ==========================  ==================  ==============================
 순위   근거                        좌표                agreement
 =====  ==========================  ==================  ==============================
-①      VLM 텍스트와 일치하는 박스  정확 (OCR)          ``EXACT`` / ``SIMILAR``
+①      VLM 텍스트와 일치하는 박스  정확 (OCR)          ``EXACT``
 ②      VLM bbox 와 겹치는 박스     정확 (OCR)          ``NONE`` (교차검증 실패)
 ③      크롭에 OCR 박스가 없음      근사 (VLM)          ``NONE``
 =====  ==========================  ==================  ==============================
+
+**유사 매칭 단계는 없다.** 한때 ①과 ②사이에 "글자가 비슷하면 같은 값으로 본다"
+는 단계가 있었지만 제거했다. ②가 같은 일을 더 안전하게 한다 — 텍스트가 비슷하고
+위치도 겹치면 ②가 같은 박스를 고르고, 위치가 안 겹치면 애초에 다른 값이므로
+유사도로 이어붙여선 안 된다. 임계값 하나를 없애는 대신 잃는 것이 없다.
 
 ②가 있어야 하는 이유가 이 설계의 핵심 교훈이다.
 
@@ -51,7 +56,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Any
 
 from .normalize import canonicalize
@@ -72,26 +76,6 @@ log = logging.getLogger(__name__)
 
 #: 비교용 정규화에서 제거할 구분자.
 _STRIP = frozenset(" \t\n\r-–—_./\\,·:;()[]{}'\"|")
-
-#: 유사도 매칭을 **허용하는** 라벨.
-#:
-#: 번호류에는 쓰지 않는다. 숫자는 문자열로서 중복성이 없어서 한 글자 다른 번호는
-#: "오독된 같은 번호" 가 아니라 **그냥 다른 번호**다. 번호를 유사도로 이어붙이면
-#: 옆 칸의 다른 사람 주민번호에 붙는다.
-SIMILARITY_LABELS: frozenset[str] = frozenset({"NAME", "ADDRESS", "ORG", "TITLE"})
-
-#: 유사도 매칭을 시도할 최소 길이.
-#:
-#: **2 다.** 한국 이름은 대부분 3글자이고, 3글자에서 한 자만 오독되면
-#: ``SequenceMatcher`` 비율이 0.667 이다. 하한을 4 로 두면 이름이 전부 유사
-#: 매칭 대상에서 빠져 스캔 문서의 이름이 모두 ``vlm_coarse`` 로 떨어진다.
-#:
-#: 짧은 문자열의 유사도가 노이즈라는 것은 사실이지만, 그 걱정은 **페이지 전체를
-#: 훑을 때**의 이야기다. 여기서 탐색 범위는 VLM 이 이미 지목한 크롭 안의 박스
-#: 몇 개뿐이므로, 엉뚱한 사람의 이름과 만날 확률이 애초에 낮다. 그래서 기준을
-#: 낮출 수 있다 — 대신 결과는 ``Agreement.SIMILAR`` + ``needs_review`` 로
-#: 남고 두 엔진이 각각 뭘 읽었는지가 ``reason`` 에 적힌다.
-_SIM_MIN_LEN = 2
 
 #: 최종 박스 여유 패딩 (px). 경계 글자 잘림 방지.
 DEFAULT_PAD = 2
@@ -117,11 +101,6 @@ class LocateConfig:
         max_crop_side: 업샘플 후 크롭 긴 변 상한 (px). 넘으면 배율을 줄인다.
         retry_pad_ratio: 1차에서 값을 못 찾았을 때 크롭을 다시 뜰 여유 비율.
             VLM bbox 가 어긋난 경우를 한 번 더 시도한다.
-        similarity: 유사 매칭 임계값. ``SIMILARITY_LABELS`` 에만 적용된다.
-            1.0 이면 유사 매칭을 끈다.
-            **0.65 인 것은 3글자 이름 때문이다.** "홍길동" 을 OCR 이 "홍길둥"
-            으로 읽으면 비율이 0.667 이다. 0.75 로 두면 한국 이름의 한 글자
-            오독이 전부 매칭 실패가 되어 기하 선택으로 내려간다.
         max_join: 한 값을 이룰 수 있는 최대 박스 수. 텍스트 이어붙이기와 기하
             선택에 함께 적용된다. 기하 선택에서는 **과선택 상한** 역할이다 —
             넉넉한 bbox 가 옆 칸까지 덮었을 때 무한정 딸려오지 않게 막는다.
@@ -138,7 +117,6 @@ class LocateConfig:
     upscale: float = 2.0
     max_crop_side: int = 1600
     retry_pad_ratio: float = 1.2
-    similarity: float = 0.65
     max_join: int = 4
     geometry_fallback: bool = True
     min_cover: float = 0.5
@@ -183,22 +161,6 @@ def _norm(text: str) -> _Norm:
         starts.append(canon.starts[i])
         ends.append(canon.ends[i])
     return _Norm("".join(chars), starts, ends)
-
-
-def _similar(needle: str, haystack: str, threshold: float) -> tuple[int, int, float] | None:
-    """``haystack`` 안에서 ``needle`` 과 가장 비슷한 같은 길이 구간을 찾는다."""
-    if threshold >= 1.0 or len(needle) < _SIM_MIN_LEN or len(haystack) < len(needle):
-        return None
-    matcher = SequenceMatcher(autojunk=False)
-    matcher.set_seq2(needle)
-    best: tuple[int, int, float] | None = None
-    width = len(needle)
-    for start in range(len(haystack) - width + 1):
-        matcher.set_seq1(haystack[start : start + width])
-        ratio = matcher.ratio()
-        if ratio >= threshold and (best is None or ratio > best[2]):
-            best = (start, start + width, ratio)
-    return best
 
 
 # --------------------------------------------------------------------------
@@ -312,14 +274,17 @@ class _Match:
     boxes: list[OcrBox]
     agreement: Agreement
     char_span: tuple[int, int] | None
-    similarity: float
     how: str = "text"
 
 
 def find_value(
-    seed_text: str, boxes: list[OcrBox], label: str, cfg: LocateConfig
+    seed_text: str, boxes: list[OcrBox], cfg: LocateConfig
 ) -> _Match | None:
     """크롭 OCR 결과에서 VLM 이 읽은 값과 같은 박스(들)를 찾는다.
+
+    **완전일치만 본다.** 비슷하면 넘어가는 단계는 두지 않는다 — 텍스트가 안
+    맞으면 ``select_by_geometry`` 가 위치로 고른다. 임계값을 하나 없애는 대신
+    잃는 것이 없다 (모듈 docstring 참고).
 
     탐색 순서에 이유가 있다.
 
@@ -327,7 +292,6 @@ def find_value(
        ``char_span`` 도 이 경우에만 의미가 있다.
     2. **인접 박스 이어붙여 완전일치** — 값이 쪼개진 경우 (``"010-1234"`` 와
        ``"5678"`` 이 별개 박스). 읽기 순서로 붙인다.
-    3. **유사 매칭** — 한글 오독을 흡수한다. ``SIMILARITY_LABELS`` 만.
 
     좁은 답을 먼저 찾는 것이 중요하다. 이어붙이기를 먼저 시도하면 값 하나에
     옆 칸까지 딸려 들어와 박스가 셀 두 개를 덮는다.
@@ -335,7 +299,6 @@ def find_value(
     Args:
         seed_text: VLM 이 읽은 값.
         boxes: 크롭 OCR 박스 (읽기 순서).
-        label: 라벨. 유사 매칭 허용 여부를 결정한다.
         cfg: 설정.
 
     Returns:
@@ -359,7 +322,6 @@ def find_value(
                 boxes=[box],
                 agreement=Agreement.EXACT,
                 char_span=norm.span(pos, pos + len(seed)),
-                similarity=1.0,
             )
 
     # ② 인접 박스 이어붙이기
@@ -371,24 +333,9 @@ def find_value(
                     boxes=list(usable[i : i + width]),
                     agreement=Agreement.EXACT,
                     char_span=None,  # 여러 박스에 걸쳐 원문 오프셋이 하나가 아니다
-                    similarity=1.0,
                 )
 
-    # ③ 유사 매칭 (글자에 중복성이 있는 라벨만)
-    if label not in SIMILARITY_LABELS:
-        return None
-
-    best: _Match | None = None
-    for box, norm in zip(usable, norms, strict=True):
-        found = _similar(seed, norm.text, cfg.similarity)
-        if found and (best is None or found[2] > best.similarity):
-            best = _Match(
-                boxes=[box],
-                agreement=Agreement.SIMILAR,
-                char_span=norm.span(found[0], found[1]),
-                similarity=found[2],
-            )
-    return best
+    return None
 
 
 def select_by_geometry(
@@ -445,7 +392,6 @@ def select_by_geometry(
         boxes=inside,
         agreement=Agreement.NONE,  # 값 교차검증은 실패했다. 좌표만 확정된 것이다.
         char_span=None,
-        similarity=0.0,
         how="geometry",
     )
 
@@ -523,7 +469,7 @@ def locate(
     # ── ① 전부 크롭 -> OCR -> 텍스트 매칭 ─────────────────────
     tight = _crop_and_ocr(findings, image, ocr, cfg, cfg.pad_ratio, range(n), page_w, page_h)
     matches: list[_Match | None] = [
-        find_value(f.text, tight[i], f.type, cfg) for i, f in enumerate(findings)
+        find_value(f.text, tight[i], cfg) for i, f in enumerate(findings)
     ]
     #: 기하 선택과 진단에 쓸 박스 풀. 좁은 크롭 결과를 기본으로 한다.
     pool: list[list[OcrBox]] = [list(b) for b in tight]
@@ -542,7 +488,7 @@ def locate(
             findings, image, ocr, cfg, cfg.retry_pad_ratio, retry, page_w, page_h
         )
         for i, boxes in zip(retry, wide, strict=True):
-            matches[i] = find_value(findings[i].text, boxes, findings[i].type, cfg)
+            matches[i] = find_value(findings[i].text, boxes, cfg)
             if matches[i] is not None or not pool[i]:
                 # 넓힌 크롭에서 값을 찾았거나, 좁은 크롭이 아무것도 못 잡았다면
                 # 넓은 쪽 결과를 쓴다. 그 외에는 좁은 쪽을 지킨다.
@@ -645,9 +591,6 @@ def _refined_region(
         # 다만 1.0 으로 올리지 않는다 — 체크섬 통과만이 그 자격이 있다 (verify.py).
         conf = min(0.95, max(finding.conf, 0.9))
         reason = "크롭 OCR 과 완전일치"
-    elif match.agreement is Agreement.SIMILAR:
-        conf = finding.conf
-        reason = f"크롭 OCR 과 유사 일치 (={match.similarity:.2f}): OCR '{ocr_text[:40]}'"
     else:
         # 기하 선택. 좌표는 OCR 것이지만 값 교차검증은 없었다. VLM 이 읽은 값과
         # 선택된 박스가 읽은 값을 함께 남긴다 — 엉뚱한 셀을 골랐는지 판단하려면

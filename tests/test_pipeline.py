@@ -47,7 +47,16 @@ class FakeClient:
         self.metas = metas
         self.calls = 0
 
-    def complete_json(self, system: str, user: str, schema: dict, image: Any = None):
+    client = None  # detect() 의 지연 초기화 프라이밍 대상
+
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        schema: dict,
+        image: Any = None,
+        temperature: float | None = None,
+    ):
         n = self.calls
         self.calls += 1
         payload = self.payloads[n] if n < len(self.payloads) else {"findings": []}
@@ -95,7 +104,7 @@ def build(
     metas: list[dict] | None = None,
     **cfg_kw: Any,
 ) -> PiiPipeline:
-    cfg_kw.setdefault("detect", DetectConfig(tiles=1))
+    cfg_kw.setdefault("detect", DetectConfig(tiles=1, workers=1))
     cfg_kw.setdefault("locate", LocateConfig(upscale=1.0))
     config = PipelineConfig(**cfg_kw)
     pipe = PiiPipeline(config)
@@ -279,7 +288,7 @@ class TestDiagnostics:
         pipe = build(
             [{"findings": []}, {"findings": []}, {"findings": []}],
             [],
-            detect=DetectConfig(tiles=3),
+            detect=DetectConfig(tiles=3, workers=1),
         )
         result = pipe.run("x.png", image=blank_page())
         assert len(result.raw_llm["vlm"]) == 3
@@ -295,7 +304,7 @@ class TestDiagnostics:
 
 class TestTiling:
     def test_one_call_per_tile(self, no_preprocess: None) -> None:
-        pipe = build([{"findings": []}] * 4, [], detect=DetectConfig(tiles=4))
+        pipe = build([{"findings": []}] * 4, [], detect=DetectConfig(tiles=4, workers=1))
         pipe.run("x.png", image=blank_page())
         assert pipe.llm.calls == 4  # type: ignore[attr-defined]
 
@@ -305,7 +314,7 @@ class TestTiling:
         pipe = build(
             [{"findings": []}, {"findings": [vlm_item("홍길동", "NAME", (0.1, 0.0, 0.3, 0.2))]}],
             [[box("홍길동")]],
-            detect=DetectConfig(tiles=2, overlap=0.0),
+            detect=DetectConfig(tiles=2, overlap=0.0, workers=1),
         )
         result = pipe.run("x.png", image=blank_page())
         assert result.findings[0].bbox_norm[1] >= 0.5

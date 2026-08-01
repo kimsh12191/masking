@@ -123,7 +123,14 @@ class LlmConfig:
             똑같이 잘린다.** 잘림은 상한을 올려야만 벗어날 수 있다.
         timeout: 초 단위 요청 타임아웃.
         guided_backend: guided decoding 백엔드.
-        enable_thinking: Qwen3 계열 추론 모드. **반드시 False.**
+        guided: guided decoding 을 걸지 여부. **끄지 마라 — 단 하나의 예외가
+            ``enable_thinking=True`` 다.** 스키마를 강제하면 모델이 첫 토큰부터
+            JSON 을 뱉어야 해서 **사고 토큰이 나올 자리가 없다.** 즉 추론 모드를
+            켜 놓고 guided 를 함께 걸면 추론 모드가 조용히 무력화된다 — 켠 줄
+            알고 측정하면 잘못된 결론을 얻는다. 끄면 ``salvage_json`` 이 형식을
+            건져낸다.
+        enable_thinking: Qwen3 계열 추론 모드. 운영에서는 **False** 다
+            (지연시간을 먹고 guided 와 충돌한다). 측정·라벨 생성에서만 켠다.
         image_max_side: VLM 으로 보낼 이미지의 긴 변 길이.
             **타일링과 함께 봐야 하는 값이다.** A4 를 ``target_long_side=2480``
             으로 전처리하면 1748x2480 이고, 그대로 보내면 여기서 0.73배로
@@ -142,6 +149,7 @@ class LlmConfig:
     max_tokens_on_truncation: int = 4096
     timeout: float = 60.0
     guided_backend: str = "xgrammar"
+    guided: bool = True
     enable_thinking: bool = False
     image_max_side: int = 2000
     max_retries: int = 2
@@ -212,6 +220,7 @@ class LlmClient:
         user: str,
         schema: dict[str, Any],
         image: Any | None = None,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """스키마를 강제해 JSON 응답을 받는다.
 
@@ -220,6 +229,8 @@ class LlmClient:
             user: user 메시지 텍스트.
             schema: guided decoding 용 JSON Schema.
             image: 있으면 멀티모달 요청으로 보낸다.
+            temperature: 이 호출에만 적용할 온도. ``None`` 이면 설정값(0).
+                다중 샘플링에서만 쓴다 — 0 이면 몇 번 뽑아도 같은 답이 온다.
 
         Returns:
             ``(파싱된 dict, 메타정보)``. 실패 시 dict 는 빈 값이고 메타에
@@ -247,11 +258,12 @@ class LlmClient:
         ]
 
         extra_body: dict[str, Any] = {
-            "guided_json": schema,
-            "guided_decoding_backend": self.config.guided_backend,
             "chat_template_kwargs": {"enable_thinking": self.config.enable_thinking},
             **self.config.extra_body,
         }
+        if self.config.guided:
+            extra_body["guided_json"] = schema
+            extra_body["guided_decoding_backend"] = self.config.guided_backend
 
         last_error: str | None = None
         max_tokens = self.config.max_tokens
@@ -261,7 +273,9 @@ class LlmClient:
                 resp = self.client.chat.completions.create(
                     model=self.config.model,
                     messages=messages,
-                    temperature=self.config.temperature,
+                    temperature=(
+                        self.config.temperature if temperature is None else temperature
+                    ),
                     max_tokens=max_tokens,
                     extra_body=extra_body,
                 )

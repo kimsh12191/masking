@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +39,10 @@ _STRIP = " \t\n-–—_./\\,·:;()[]{}'\"|"
 #: bbox 가 퇴화(면적 0)했을 때 부여할 최소 정규화 크기.
 _MIN_SIDE = 0.004
 
+#: 동시 호출 상한. vLLM 서버 한 대를 상대로 이보다 늘려도 처리량이 늘지 않고
+#: 큐만 길어진다 (배치는 서버가 알아서 묶는다).
+_MAX_WORKERS = 8
+
 
 @dataclass
 class DetectConfig:
@@ -51,12 +56,25 @@ class DetectConfig:
             양쪽에서 반씩 잘라 둘 다 못 읽는 것을 막는다.
         dedup: 겹침 구간의 중복을 제거할지. 끄면 같은 값이 두 번 보고된다.
         hint: user 메시지에 덧붙일 문서 종류 힌트. 비워 두는 것이 기본이다.
+        samples: 타일당 호출 횟수. **학습 없이 미탐을 줄이는 유일한 손잡이다.**
+            2 이상이면 같은 타일을 여러 번 뽑아 ``_dedup`` 이 합집합을 만든다.
+            한 번은 놓치고 다른 번엔 잡히는 항목이 회수된다 — 재현율이 오르고
+            정밀도가 떨어진다. 마스킹에서는 미탐이 과탐보다 훨씬 비싸므로
+            대체로 맞는 거래지만, 호출 수가 ``tiles × samples`` 로 늘어난다.
+        sample_temperature: ``samples >= 2`` 일 때 쓸 온도. **0 이면 안 된다** —
+            같은 입력에 같은 답이 와서 샘플을 늘린 의미가 없어진다.
+            ``samples == 1`` 이면 무시되고 설정값(0)이 쓰인다 (결정론 유지).
+        workers: 동시 호출 수. 0 이면 호출 수만큼 (``_MAX_WORKERS`` 상한).
+            타일 호출은 서로 독립이므로 직렬로 돌릴 이유가 없다.
     """
 
     tiles: int = 3
     overlap: float = 0.08
     dedup: bool = True
     hint: str = ""
+    samples: int = 1
+    sample_temperature: float = 0.3
+    workers: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -221,31 +239,60 @@ def detect(
 
     rects = tile_rects(w, h, cfg.tiles, cfg.overlap)
     user = build_user(cfg.hint)
+    samples = max(1, cfg.samples)
+    # samples==1 이면 온도를 건드리지 않는다 — 기존의 결정론적 동작을 지킨다.
+    temp = None if samples == 1 else cfg.sample_temperature
 
-    findings: list[VlmFinding] = []
-    metas: list[dict[str, Any]] = []
+    # (타일, 샘플) 조합. 순서를 고정해 두면 병렬로 돌려도 결과가 결정론적이다.
+    calls = [(t, s) for t in range(len(rects)) for s in range(samples)]
+    tile_imgs = [
+        crop_norm(image, rect) if len(rects) > 1 else image for rect in rects
+    ]
 
-    for tile_no, rect in enumerate(rects):
-        tile_img = crop_norm(image, rect) if len(rects) > 1 else image
+    def one(job: tuple[int, int]) -> dict[str, Any]:
+        tile_no, sample_no = job
         payload, meta = client.complete_json(
-            system=SYSTEM_VLM, user=user, schema=VLM_SCHEMA, image=tile_img
+            system=SYSTEM_VLM,
+            user=user,
+            schema=VLM_SCHEMA,
+            image=tile_imgs[tile_no],
+            temperature=temp,
         )
         meta["tile"] = tile_no
-        meta["rect"] = [round(v, 4) for v in rect]
-        metas.append(meta)
+        meta["sample"] = sample_no
+        meta["rect"] = [round(v, 4) for v in rects[tile_no]]
+        meta["payload"] = payload
+        return meta
+
+    if len(calls) == 1:
+        metas = [one(calls[0])]
+    else:
+        # 클라이언트를 미리 만들어 둔다 (지연 초기화가 스레드에서 겹치지 않게).
+        _ = client.client
+        n_workers = cfg.workers or min(len(calls), _MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            metas = list(pool.map(one, calls))
+
+    findings: list[VlmFinding] = []
+    for meta in metas:
+        tile_no = meta["tile"]
+        rect = rects[tile_no]
+        where = f"타일 {tile_no}" + (
+            f" 샘플 {meta['sample']}" if samples > 1 else ""
+        )
+        payload = meta.pop("payload", {}) or {}
 
         if meta.get("error"):
-            warn.append(f"VLM 타일 {tile_no} 실패: {meta['error']}")
+            warn.append(f"VLM {where} 실패: {meta['error']}")
             continue
         if meta.get("salvaged"):
             warn.append(
-                f"VLM 타일 {tile_no}: JSON 형식 이탈을 복구했습니다 "
+                f"VLM {where}: JSON 형식 이탈을 복구했습니다 "
                 f"({meta['salvaged']}) — 프롬프트/guided decoding 점검 필요"
             )
 
-        raw_items = payload.get("findings") or []
         n_before = len(findings)
-        for item in raw_items:
+        for item in payload.get("findings") or []:
             if not isinstance(item, dict):
                 continue
             label = item.get("type")
@@ -254,7 +301,7 @@ def detect(
             bbox = _sane_bbox(item.get("bbox_norm"))
             if bbox is None:
                 warn.append(
-                    f"VLM 타일 {tile_no}: bbox_norm 이 없거나 잘못된 항목 폐기 "
+                    f"VLM {where}: bbox_norm 이 없거나 잘못된 항목 폐기 "
                     f"(type={label}, text={str(item.get('text'))[:20]!r})"
                 )
                 continue
@@ -268,12 +315,16 @@ def detect(
                     tile=tile_no,
                 )
             )
-        log.debug("타일 %d: %d건", tile_no, len(findings) - n_before)
+        log.debug("%s: %d건", where, len(findings) - n_before)
 
     if not cfg.dedup:
         return findings, metas
 
     deduped = _dedup(findings)
     if len(deduped) < len(findings):
-        log.debug("타일 겹침 중복 %d건 제거", len(findings) - len(deduped))
+        log.debug(
+            "중복 %d건 병합 (타일 겹침%s)",
+            len(findings) - len(deduped),
+            " + 다중 샘플" if samples > 1 else "",
+        )
     return deduped, metas

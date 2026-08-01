@@ -107,7 +107,7 @@ class TestFileApplication:
             "ocr:\n  lang: en\n  use_gpu: false\n"
             "detect:\n  tiles: 4\n"
             "locate:\n  upscale: 1.0\n"
-            "verify:\n  drop_field_labels: false\n"
+            "verify:\n  dedup_iou: 0.9\n"
             "pipeline:\n  target_long_side: 1600\n"
             "output:\n  out_dir: result\n  write_image: false\n",
         )
@@ -118,7 +118,7 @@ class TestFileApplication:
         assert c.pipeline.ocr.use_gpu is False
         assert c.pipeline.detect.tiles == 4
         assert c.pipeline.locate.upscale == 1.0
-        assert c.pipeline.verify.drop_field_labels is False
+        assert c.pipeline.verify.dedup_iou == 0.9
         assert c.pipeline.target_long_side == 1600
         assert c.output.out_dir == "result"
         assert c.output.write_image is False
@@ -311,11 +311,11 @@ class TestCliOverrides:
         apply_cli_overrides(
             config,
             parse(["x.png", "--crop-pad", "0.5", "--crop-upscale", "1.0",
-                   "--similarity", "1.0"]),
+                   "--no-geometry-fallback"]),
         )
         assert config.pipeline.locate.pad_ratio == 0.5
         assert config.pipeline.locate.upscale == 1.0
-        assert config.pipeline.locate.similarity == 1.0
+        assert config.pipeline.locate.geometry_fallback is False
 
     def test_upscale_one_still_overrides(self, isolated: Path) -> None:
         """1.0 은 '업샘플 끄기'라는 뜻이고 '미지정'이 아니다."""
@@ -365,7 +365,8 @@ class TestCliOverrides:
         for name in (
             "out", "image", "font", "show_ocr_boxes", "include_ocr",
             "deskew", "long_side", "tiles", "tile_overlap", "hint",
-            "crop_pad", "crop_upscale", "similarity", "geometry_fallback",
+            "samples", "sample_temperature",
+            "crop_pad", "crop_upscale", "geometry_fallback",
             "det_dir", "rec_dir", "cls_dir", "gpu_id",
             "base_url", "model", "image_max_side",
         ):
