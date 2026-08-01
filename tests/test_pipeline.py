@@ -169,6 +169,7 @@ class TestOldBugRegressions:
         assert region.type == "RRN"
 
     def test_header_cell_is_not_reported_as_a_name(self, no_preprocess: None) -> None:
+        """VLM 이 인쇄된 헤더를 값으로 보고한 경우 — 판단 자체가 틀렸으므로 버린다."""
         pipe = build(
             [{"findings": [vlm_item("성명", "NAME", (0.05, 0.1, 0.15, 0.14))]}],
             [[box("성 명")]],
@@ -176,6 +177,26 @@ class TestOldBugRegressions:
         result = pipe.run("x.png", image=blank_page())
         assert result.regions == []
         assert any("항목명만" in w for w in result.warnings)
+
+    def test_geometry_landing_on_a_header_is_kept_not_dropped(
+        self, no_preprocess: None
+    ) -> None:
+        """미탐 확정을 막는다.
+
+        VLM 은 실제 이름을 봤는데 박스 선택이 옆 헤더 셀에 떨어진 상황이다.
+        여기서 버리면 그 이름은 마스킹되지 않은 채 남는다. 헤더를 덧칠하는
+        손해가 이름을 놓치는 손해보다 작다.
+        """
+        pipe = build(
+            [{"findings": [vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14))]}],
+            [[box("성 명")], [box("성 명")]],
+        )
+        result = pipe.run("x.png", image=blank_page())
+        assert len(result.regions) == 1
+        r = result.regions[0]
+        assert r.vlm_text == "홍길동"
+        assert r.needs_review is True
+        assert "박스 선택 오류 의심" in (r.reason or "")
 
     def test_a_missed_value_is_never_silently_dropped(self, no_preprocess: None) -> None:
         """좌표를 못 잡아도 개인정보는 결과에 남아야 한다."""
@@ -227,25 +248,30 @@ class TestSilentFailureGuards:
 
 class TestDiagnostics:
     def test_findings_survive_for_recall_measurement(self, no_preprocess: None) -> None:
-        """findings 가 recall 의 분모다. 좌표를 못 잡은 건도 여기 남는다."""
+        """findings 가 recall 의 분모다. finalize 가 버린 건도 여기 남는다.
+
+        주의: ``detect._dedup`` 이 findings 를 읽기 순서로 재정렬하므로,
+        가짜 OCR 결과의 순서도 **읽기 순서**에 맞춰야 한다.
+        """
         pipe = build(
             [{"findings": [
-                vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14)),
-                vlm_item("성명", "NAME", (0.05, 0.1, 0.09, 0.14)),  # finalize 가 버린다
+                vlm_item("성명", "NAME", (0.05, 0.1, 0.25, 0.14)),   # 위 — finalize 가 버린다
+                vlm_item("홍길동", "NAME", (0.1, 0.5, 0.3, 0.54)),   # 아래
             ]}],
-            [[box("홍길동")], [box("성 명")]],
+            [[box("성 명")], [box("홍길동")]],
         )
         result = pipe.run("x.png", image=blank_page())
         assert len(result.findings) == 2
-        assert len(result.regions) == 1
+        assert [r.vlm_text for r in result.regions] == ["홍길동"]
 
     def test_localized_rate_reflects_the_geometry_stage(self, no_preprocess: None) -> None:
+        """두 번째는 크롭에 박스가 아예 없어 vlm_coarse 로 떨어진다."""
         pipe = build(
             [{"findings": [
                 vlm_item("홍길동", "NAME", (0.1, 0.1, 0.3, 0.14)),
                 vlm_item("김철수", "NAME", (0.1, 0.5, 0.3, 0.54)),
             ]}],
-            [[box("홍길동")], [], []],  # 두 번째는 1차·2차 모두 실패
+            [[box("홍길동")], [], []],
         )
         assert pipe.run("x.png", image=blank_page()).stats()["localized_rate"] == 0.5
 

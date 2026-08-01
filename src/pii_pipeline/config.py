@@ -268,7 +268,8 @@ def describe(config: AppConfig) -> str:
             f"③ 좌표 확정  크롭 패딩 {pipe.locate.pad_ratio:.0%}"
             f" (최소 {pipe.locate.min_pad_px}px)"
             f"  업샘플 x{pipe.locate.upscale}"
-            f"  유사매칭 {pipe.locate.similarity}",
+            f"  유사매칭 {pipe.locate.similarity}"
+            f"  기하 fallback={'ON' if pipe.locate.geometry_fallback else 'OFF'}",
             f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}"
             f"  항목명 제외={'ON' if pipe.verify.drop_field_labels else 'OFF'}",
             f"전처리      긴 변 {pipe.target_long_side or '원본'}"

@@ -19,9 +19,12 @@ from pii_pipeline.locate import (
     LocateConfig,
     _norm,
     crop_rect,
+    crop_scale,
     find_value,
     locate,
+    select_by_geometry,
 )
+from pii_pipeline.ocr.layout import denorm_bbox
 from pii_pipeline.schema import Agreement, OcrBox, OcrStatus, Source, VlmFinding
 
 np = pytest.importorskip("numpy", reason="numpy 미설치 환경에서는 건너뛴다")
@@ -39,6 +42,37 @@ def box(text: str, x1=0, y1=0, x2=100, y2=30, status=OcrStatus.OK, conf=0.95) ->
 
 def finding(text: str, label: str = "NAME", bbox=(0.1, 0.1, 0.3, 0.15), conf=0.9) -> VlmFinding:
     return VlmFinding(text=text, type=label, field="성명", bbox_norm=bbox, conf=conf)
+
+
+def in_vlm_box(f: VlmFinding, text: str, status=OcrStatus.OK) -> OcrBox:
+    """``f`` 의 VLM bbox **중앙**에 놓이도록 크롭 좌표계의 OCR 박스를 만든다.
+
+    ``FakeOcr`` 는 크롭 기준 좌표를 돌려주고 ``locate`` 가 이를 페이지 좌표로
+    환산한다(오프셋 더하기 + 업샘플 배율 나누기). 그래서 여기서는 그 역변환을
+    해 둬야 한다 — 배율을 빼먹으면 박스가 크롭 원점 쪽으로 당겨져서, 테스트가
+    통과하더라도 의도한 위치를 검증하지 못한다.
+    """
+    cfg = LocateConfig()
+    rect = crop_rect(f, PAGE_W, PAGE_H, cfg.pad_ratio, cfg.min_pad_px)
+    scale = crop_scale(rect, cfg)
+    vx1, vy1, vx2, vy2 = denorm_bbox(f.bbox_norm, PAGE_W, PAGE_H)
+
+    cx, cy = (vx1 + vx2) / 2.0, (vy1 + vy2) / 2.0
+    half_w = max(20.0, (vx2 - vx1) / 4.0)
+    half_h = max(8.0, (vy2 - vy1) / 4.0)
+
+    def to_crop(px: float, py: float) -> tuple[int, int]:
+        return (int((px - rect[0]) * scale), int((py - rect[1]) * scale))
+
+    x1, y1 = to_crop(cx - half_w, cy - half_h)
+    x2, y2 = to_crop(cx + half_w, cy + half_h)
+    return OcrBox(
+        index=-1,
+        bbox=(x1, y1, x2, y2),
+        text=text,
+        status=status,
+        rec_conf=0.2 if status is OcrStatus.FAILED else 0.95,
+    )
 
 
 class FakeOcr:
@@ -184,6 +218,112 @@ class TestFindValue:
 
 
 # --------------------------------------------------------------------------
+# 기하 선택
+# --------------------------------------------------------------------------
+
+
+class TestSelectByGeometry:
+    """텍스트를 전혀 보지 않는 선택. 페이지 좌표로 직접 검증한다."""
+
+    cfg = LocateConfig()
+    VLM = (200, 400, 500, 460)   # VLM 이 지목한 사각형
+
+    def test_picks_the_box_whose_center_is_inside(self) -> None:
+        target = box("홍길동", 210, 405, 320, 450)
+        outside = box("옆칸", 600, 405, 700, 450)
+        m = select_by_geometry(self.VLM, [outside, target], self.cfg)
+        assert m is not None
+        assert [b.text for b in m.boxes] == ["홍길동"]
+
+    def test_ignores_text_entirely(self) -> None:
+        """VLM 텍스트와 전혀 다른 값이어도 위치가 맞으면 고른다.
+
+        이게 목적이다 — 숫자 오독이 좌표 확정을 막지 않게 한다.
+        """
+        m = select_by_geometry(self.VLM, [box("전혀다른값", 210, 405, 320, 450)], self.cfg)
+        assert m is not None
+        assert m.how == "geometry"
+        assert m.agreement is Agreement.NONE
+
+    def test_includes_failed_boxes(self) -> None:
+        """rec 실패 박스도 좌표는 유효하다. 손글씨 회수 경로."""
+        failed = box("", 210, 405, 320, 450, status=OcrStatus.FAILED)
+        m = select_by_geometry(self.VLM, [failed], self.cfg)
+        assert m is not None
+        assert m.boxes[0].status is OcrStatus.FAILED
+
+    def test_takes_all_qualifying_boxes_for_split_values(self) -> None:
+        parts = [box("010-1234", 210, 405, 320, 450), box("5678", 330, 405, 420, 450)]
+        m = select_by_geometry(self.VLM, parts, self.cfg)
+        assert m is not None
+        assert len(m.boxes) == 2
+
+    def test_result_is_in_reading_order(self) -> None:
+        later = box("b", 330, 405, 420, 450)
+        earlier = box("a", 210, 405, 320, 450)
+        m = select_by_geometry(self.VLM, [later, earlier], self.cfg)
+        assert m is not None
+        assert [b.text for b in m.boxes] == ["a", "b"]
+
+    def test_falls_back_to_area_coverage(self) -> None:
+        """긴 주소 줄이 VLM bbox 를 관통해 중심이 밖으로 나간 경우."""
+        long_line = box("서울특별시 강남구 테헤란로 123", 250, 405, 900, 450)
+        m = select_by_geometry(self.VLM, [long_line], self.cfg)
+        # 중심(575)은 VLM bbox 밖이고 면적 커버도 0.5 미만이므로 최대 겹침으로 잡힌다
+        assert m is not None
+        assert m.boxes[0].text.startswith("서울")
+
+    def test_returns_none_when_nothing_overlaps(self) -> None:
+        far = box("먼칸", 700, 900, 800, 950)
+        assert select_by_geometry(self.VLM, [far], self.cfg) is None
+
+    def test_returns_none_for_empty_boxes(self) -> None:
+        assert select_by_geometry(self.VLM, [], self.cfg) is None
+
+    def test_over_selection_is_capped(self) -> None:
+        """넉넉한 bbox 가 옆 칸까지 덮었을 때 무한정 딸려오지 않아야 한다."""
+        wide = (0, 0, 1000, 1000)
+        many = [box(f"b{i}", 10 + i * 30, 10, 35 + i * 30, 40) for i in range(12)]
+        m = select_by_geometry(wide, many, LocateConfig(max_join=4))
+        assert m is not None
+        assert len(m.boxes) == 4
+
+    def test_cap_keeps_boxes_nearest_the_vlm_centre(self) -> None:
+        vlm = (0, 0, 1000, 100)
+        near = box("near", 480, 20, 520, 60)      # 중심 500 — vlm 중심과 일치
+        far = box("far", 10, 20, 50, 60)
+        m = select_by_geometry(vlm, [far, near], LocateConfig(max_join=1))
+        assert m is not None
+        assert [b.text for b in m.boxes] == ["near"]
+
+
+class TestInVlmBoxHelper:
+    """헬퍼가 정말 VLM bbox 안에 박스를 놓는지 검산한다.
+
+    업샘플 배율을 빼먹으면 박스가 크롭 원점 쪽으로 당겨지는데, 그래도 테스트가
+    통과해버릴 수 있다. 그러면 기하 선택을 검증하는 게 아니라 우연을 검증한다.
+    """
+
+    def test_lands_inside_the_vlm_bbox(self) -> None:
+        f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))
+        crop_box = in_vlm_box(f, "901112-2846261")
+        cfg = LocateConfig()
+        rect = crop_rect(f, PAGE_W, PAGE_H, cfg.pad_ratio, cfg.min_pad_px)
+        scale = crop_scale(rect, cfg)
+        # locate 가 하는 것과 같은 환산
+        page = (
+            rect[0] + int(crop_box.bbox[0] / scale),
+            rect[1] + int(crop_box.bbox[1] / scale),
+            rect[0] + int(round(crop_box.bbox[2] / scale)),
+            rect[1] + int(round(crop_box.bbox[3] / scale)),
+        )
+        vlm = denorm_bbox(f.bbox_norm, PAGE_W, PAGE_H)
+        cx, cy = (page[0] + page[2]) / 2, (page[1] + page[3]) / 2
+        assert vlm[0] <= cx <= vlm[2]
+        assert vlm[1] <= cy <= vlm[3]
+
+
+# --------------------------------------------------------------------------
 # 진입점
 # --------------------------------------------------------------------------
 
@@ -281,23 +421,93 @@ class TestLocate:
         assert r.needs_review is False
         assert "서명" in (r.reason or "")
 
-    def test_unreadable_crop_reports_handwriting(self) -> None:
+    def test_unreadable_crop_reports_detection_failure(self) -> None:
+        """크롭에 박스가 하나도 없다 = OCR 검출 문제. 처방이 다르다."""
         regions, _ = locate([finding("홍길동")], blank_page(), FakeOcr([[], []]))
         r = regions[0]
         assert r.source is Source.VLM_COARSE
         assert r.needs_review is True
-        assert "아무 글자도 읽지 못했다" in (r.reason or "")
+        assert "검출되지 않았다" in (r.reason or "")
+
+    def test_digit_misread_still_gets_precise_coordinates(self) -> None:
+        """이 설계의 핵심 케이스.
+
+        VLM 이 숫자 한두 자리를 틀려도 좌표는 확정되어야 한다. 긴 숫자열 정확
+        전사는 VLM 의 최대 약점이고, 그걸 좌표 확정의 전제로 두면 잘하는 일
+        (위치 판단)의 결과가 버려진다.
+        """
+        f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))
+        # VLM bbox 안에 놓인, 두 자리 오독된 OCR 박스
+        ocr = FakeOcr([[in_vlm_box(f, "901112-2864261")]] * 2)
+        regions, _ = locate([f], blank_page(), ocr)
+        r = regions[0]
+        assert r.source is Source.OCR_REFINED   # 좌표는 확정됐다
+        assert r.coarse is False
+        assert r.agreement is Agreement.NONE    # 값 교차검증은 실패했다
+        assert r.needs_review is True
 
     def test_disagreement_records_both_readings(self) -> None:
         """어느 엔진을 손봐야 하는지 로그만 보고 알 수 있어야 한다."""
-        ocr = FakeOcr([[box("9O1112-284626")], [box("9O1112-284626")]])
-        regions, _ = locate(
-            [finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))],
-            blank_page(), ocr,
-        )
+        f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))
+        ocr = FakeOcr([[in_vlm_box(f, "9O1112-284626")]] * 2)
+        regions, _ = locate([f], blank_page(), ocr)
         reason = regions[0].reason or ""
         assert "901112-2846261" in reason
         assert "9O1112-284626" in reason
+
+    def test_no_overlap_at_all_blames_the_vlm_coordinate(self) -> None:
+        """박스는 있는데 겹치지 않는다 = VLM 좌표 문제. 크롭을 넓혀도 안 낫는다."""
+        f = finding("홍길동", bbox=(0.6, 0.6, 0.8, 0.65))
+        ocr = FakeOcr([[box("전혀다른칸", 0, 0, 40, 20)]] * 2)
+        regions, _ = locate([f], blank_page(), ocr)
+        r = regions[0]
+        assert r.source is Source.VLM_COARSE
+        assert "겹치는 OCR 박스가 없다" in (r.reason or "")
+
+    def test_geometry_fallback_can_be_disabled(self) -> None:
+        f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))
+        ocr = FakeOcr([[in_vlm_box(f, "901112-2864261")]] * 2)
+        regions, _ = locate(
+            [f], blank_page(), ocr, LocateConfig(geometry_fallback=False)
+        )
+        assert regions[0].source is Source.VLM_COARSE
+
+    def test_failed_box_gets_precise_coordinates_via_geometry(self) -> None:
+        """손글씨 회수 — 텍스트 매칭으로는 불가능했던 경로.
+
+        det 는 성공하고 rec 만 실패한 박스는 "여기 글자는 있다" 는 뜻이다.
+        VLM 이 그 자리를 지목했다면 그 좌표가 VLM 근사치보다 정확하다.
+        """
+        f = finding("홍길동")
+        handwritten = in_vlm_box(f, "", status=OcrStatus.FAILED)
+        regions, _ = locate([f], blank_page(), FakeOcr([[handwritten]] * 2))
+        r = regions[0]
+        assert r.source is Source.OCR_REFINED
+        assert r.coarse is False
+        assert r.ocr_status is OcrStatus.FAILED
+        assert r.text is None            # 읽지 못했으므로 텍스트는 없다
+        assert r.vlm_text == "홍길동"     # VLM 이 읽은 값은 남는다
+        assert r.needs_review is True
+
+    def test_geometry_selection_is_warned(self) -> None:
+        warnings: list[str] = []
+        f = finding("901112-2846261", label="RRN", bbox=(0.2, 0.2, 0.5, 0.25))
+        ocr = FakeOcr([[in_vlm_box(f, "901112-2864261")]] * 2)
+        locate([f], blank_page(), ocr, warnings=warnings)
+        assert any("기하 선택" in w for w in warnings)
+
+    def test_text_match_wins_over_geometry(self) -> None:
+        """텍스트가 일치하는 박스가 있으면 그게 더 좁고 확실하다."""
+        f = finding("홍길동", bbox=(0.1, 0.1, 0.4, 0.15))
+        vx1, vy1 = 100, 200   # VLM bbox 좌상단 (0.1, 0.1) x 페이지 크기
+        wrong = OcrBox(index=-1, bbox=(vx1 + 5, vy1 + 5, vx1 + 60, vy1 + 35),
+                       text="다른값", status=OcrStatus.OK, rec_conf=0.95)
+        right = OcrBox(index=-1, bbox=(vx1 + 80, vy1 + 5, vx1 + 160, vy1 + 35),
+                       text="홍길동", status=OcrStatus.OK, rec_conf=0.95)
+        regions, _ = locate([f], blank_page(), FakeOcr([[wrong, right]]))
+        r = regions[0]
+        assert r.agreement is Agreement.EXACT
+        assert r.text == "홍길동"
 
     def test_coarse_region_keeps_the_vlm_text(self) -> None:
         regions, _ = locate([finding("홍길동")], blank_page(), FakeOcr([[], []]))

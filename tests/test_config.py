@@ -365,7 +365,7 @@ class TestCliOverrides:
         for name in (
             "out", "image", "font", "show_ocr_boxes", "include_ocr",
             "deskew", "long_side", "tiles", "tile_overlap", "hint",
-            "crop_pad", "crop_upscale", "similarity",
+            "crop_pad", "crop_upscale", "similarity", "geometry_fallback",
             "det_dir", "rec_dir", "cls_dir", "gpu_id",
             "base_url", "model", "image_max_side",
         ):

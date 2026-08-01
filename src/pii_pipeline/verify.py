@@ -103,13 +103,27 @@ def is_field_label(text: str | None) -> bool:
 
 
 def _is_label_only(region: PiiRegion) -> bool:
-    """값 없이 항목명만 잡힌 영역인가.
+    """값 없이 항목명만 잡힌 영역인가. **버려도 안전한 경우만** ``True``.
 
-    ``vlm_text`` 를 먼저 본다 — 이건 모델의 판단 자체가 틀린 경우다
-    ("성 명" 이라는 인쇄된 헤더를 NAME 으로 보고). ``text`` 는 크롭 OCR 이
-    읽은 값이므로, 그것도 항목명뿐이면 역시 값이 아니다.
+    두 경우를 구분해야 한다. 안 하면 실제 개인정보를 조용히 잃는다.
+
+    1. ``vlm_text`` 가 항목명이다 → **모델의 판단이 틀렸다.** 인쇄된 "성 명"
+       헤더를 NAME 으로 보고한 것이다. 버려도 잃을 것이 없다.
+    2. ``vlm_text`` 는 값인데 ``text`` 만 항목명이다 → 두 가지가 가능하다.
+       · 텍스트 매칭으로 고른 것이면(``EXACT``/``SIMILAR``) 두 엔진이 같은
+         항목명을 읽은 것이므로 1번과 같다. 버린다.
+       · **기하로 고른 것이면 선택이 틀렸을 수 있다.** VLM 은 "홍길동" 이
+         있다고 했고 박스 선택이 옆 헤더 셀에 떨어진 상황이다. 여기서 버리면
+         실제 이름이 마스킹되지 않은 채 남는다 — 미탐이 확정된다.
+         그래서 버리지 않고 검토로 넘긴다. 헤더 셀을 덧칠하는 손해가
+         이름을 놓치는 손해보다 작다.
     """
-    return is_field_label(region.vlm_text) or is_field_label(region.text)
+    if is_field_label(region.vlm_text):
+        return True
+    if not is_field_label(region.text):
+        return False
+    # text 만 항목명 — 근거가 텍스트 일치였을 때만 버린다
+    return region.agreement in (Agreement.EXACT, Agreement.SIMILAR)
 
 
 # --------------------------------------------------------------------------
@@ -299,6 +313,12 @@ def finalize(
                 )
                 continue
             region.needs_review = True
+        elif is_field_label(region.text):
+            # 기하 선택이 항목명 셀에 떨어졌다. 버리지 않지만(미탐 확정) 선택이
+            # 틀렸을 가능성이 높으므로 검토 큐로 보낸다.
+            region.needs_review = True
+            note = f"선택된 OCR 박스가 항목명이다 ('{region.text}') — 박스 선택 오류 의심"
+            region.reason = f"{region.reason}; {note}" if region.reason else note
 
         # 같은 라벨 + 크게 겹치는 기존 영역이 있으면 나은 쪽만 남긴다
         duplicate = next(

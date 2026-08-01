@@ -116,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--crop-upscale", type=float, default=None,
                    help="크롭 업샘플 배율 (기본 2.0). 작은 글씨 대응. 1.0 이면 끈다")
     g.add_argument("--similarity", type=float, default=None,
-                   help="유사 매칭 임계값 (기본 0.75). 1.0 이면 완전일치만")
+                   help="유사 매칭 임계값 (기본 0.65). 1.0 이면 완전일치만")
+    g.add_argument("--geometry-fallback", action=BOOL, default=None,
+                   help="텍스트가 안 맞을 때 위치 겹침으로 박스를 고른다 (기본 ON). "
+                        "--no-geometry-fallback 이면 텍스트 불일치 = 좌표 포기. A/B 비교용")
 
     g = p.add_argument_group("OCR")
     g.add_argument("--det-dir", default=None, help="검출 모델 디렉터리 (폐쇄망 필수)")
@@ -131,7 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--base-url", default=None, help="vLLM 엔드포인트")
     g.add_argument("--model", default=None, help="모델 이름")
     g.add_argument("--image-max-side", type=int, default=None,
-                   help="pass2 이미지 긴 변 길이. 1500 이상 유지할 것")
+                   help="VLM 에 보낼 이미지 긴 변 길이. --tiles 와 함께 볼 것 "
+                        "(--print-config 가 조합을 검산해준다)")
     return p
 
 
@@ -176,6 +180,7 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.crop_pad, loc, "pad_ratio"),
         (args.crop_upscale, loc, "upscale"),
         (args.similarity, loc, "similarity"),
+        (args.geometry_fallback, loc, "geometry_fallback"),
     ):
         if value is not None:
             setattr(target, attr, value)

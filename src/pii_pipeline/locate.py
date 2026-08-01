@@ -1,27 +1,50 @@
 """② 좌표 확정 단계 — VLM 이 지목한 영역을 크롭해 OCR 로 측량한다.
 
-    VlmFinding (값은 정확, 좌표는 대략)
+    VlmFinding (판단은 신뢰, 좌표는 대략, 전사는 참고)
       └─ 크롭 (여유 패딩 + 업샘플)
       └─ 배치 OCR
-      └─ 크롭 안에서 VLM 이 읽은 값과 같은 텍스트 줄 찾기
+      └─ 크롭 안에서 대상 박스 고르기          ← 이 단계가 핵심이다
       └─ PiiRegion (좌표 정확)
 
-핵심은 마지막 단계다. **VLM 의 좌표를 신뢰하지 않고, VLM 의 텍스트를 신뢰한다.**
-크롭 안에서 그 텍스트를 찾아낸 OCR 박스의 좌표를 쓴다. 그러면 좌표는 픽셀
-단위로 정확해지고, 동시에 두 엔진이 같은 값을 읽었다는 **교차검증**이 공짜로
-따라온다 (``Agreement``).
+**이 모듈은 모델을 호출하지 않는다.** 박스 선택은 전부 코드가 결정론적으로
+한다. 크롭 OCR 결과를 다시 VLM 에게 보여주고 고르라고 하면 이전 구조의 실패
+(시각적 위치를 박스 번호로 표현시키기)로 되돌아가고, 비용도 ``O(타일)`` 에서
+``O(항목)`` 으로 등급이 바뀐다.
 
-찾지 못하는 경우가 셋 있고, 각각 다르게 처리한다.
+박스 선택 우선순위 — **좁은 답부터, 확실한 근거부터**:
 
-===============================  ==============================================
-크롭 OCR 이 아무것도 못 읽었다     손글씨·도장. VLM 좌표를 쓰고 ``VLM_COARSE``
-OCR 은 읽었는데 값이 다르다        한쪽 오독. VLM 좌표 + ``reason`` 에 OCR 원문
-읽을 글자가 애초에 없다 (서명)     정상. VLM 좌표를 쓰고 검토 플래그 없음
-===============================  ==============================================
+=====  ==========================  ==================  ==============================
+순위   근거                        좌표                agreement
+=====  ==========================  ==================  ==============================
+①      VLM 텍스트와 일치하는 박스  정확 (OCR)          ``EXACT`` / ``SIMILAR``
+②      VLM bbox 와 겹치는 박스     정확 (OCR)          ``NONE`` (교차검증 실패)
+③      크롭에 OCR 박스가 없음      근사 (VLM)          ``NONE``
+=====  ==========================  ==================  ==============================
 
-두 번째 경우를 ``reason`` 에 남기는 것이 중요하다. "VLM 은 901112-2846261,
-OCR 은 9O1112-284626 을 읽었다" 가 로그에 남으면 어느 엔진을 손봐야 하는지
-바로 보인다. 이전 구조에서는 이 정보가 그냥 사라졌다.
+②가 있어야 하는 이유가 이 설계의 핵심 교훈이다.
+
+VLM 이 잘하는 일은 **"여기에 이 종류의 개인정보가 있다"** 는 판단이다. 근거가
+중복적이기 때문이다 — 필드 라벨, 표 구조상의 위치, 옆 칸과의 관계, 값의 대략적
+형태. 반면 ``901112-2846261`` 을 13자리 모두 정확히 맞히는 것은 중복성이 0인
+과제이고, 9B 급 모델에서 신뢰할 수 없다. 숫자에는 오독을 교정해줄 언어모델
+prior 가 없다 (``홍길둥`` 은 ``홍길동`` 으로 교정되지만 숫자는 안 된다).
+
+①만 있으면 **잘하는 일의 결과를 못하는 일이 가로막는다.** VLM 이 위치를 정확히
+지목했는데 숫자 한 자리를 틀리면 그 판단이 좌표로 이어지지 못한다. 그래서
+텍스트 일치는 **필수 조건이 아니라 확인 증거**로 강등하고, 좌표 확정은 기하가
+맡는다.
+
+그럼 왜 VLM 에게 ``text`` 를 계속 요구하는가 — 다운스트림이 필요해서가 아니다.
+**모델이 픽셀을 실제로 보게 만드는 장치다.** "여기 개인정보 있냐" 만 물으면
+모델은 레이아웃 prior 로 답할 수 있다 ("이 서식의 이 위치는 보통 주민번호
+칸이니까"). 칸이 비어 있어도 그렇게 답한다. 값을 적게 하면 그게 안 된다 —
+뭔가를 적으려면 봐야 한다.
+
+②의 대가는 정직하게 적어 둔다. **VLM bbox 가 어긋나면 엉뚱한 셀이 조용히
+선택된다.** ①에는 없던 실패 모드다 (그건 못 찾으면 못 찾았다고 했다).
+완충 장치는 둘이다 — 가장 좁은 후보를 우선하고, 텍스트가 일치하지 않은 채
+기하로 선택된 건은 ``agreement=NONE`` + ``needs_review`` 로 남기고 ``reason`` 에
+VLM 이 읽은 값과 선택된 박스의 OCR 값을 함께 적는다.
 """
 
 from __future__ import annotations
@@ -98,8 +121,16 @@ class LocateConfig:
             1.0 이면 유사 매칭을 끈다.
             **0.65 인 것은 3글자 이름 때문이다.** "홍길동" 을 OCR 이 "홍길둥"
             으로 읽으면 비율이 0.667 이다. 0.75 로 두면 한국 이름의 한 글자
-            오독이 전부 매칭 실패가 되어 ``vlm_coarse`` 로 떨어진다.
-        max_join: 값이 여러 OCR 박스로 쪼개졌을 때 이어붙일 최대 박스 수.
+            오독이 전부 매칭 실패가 되어 기하 선택으로 내려간다.
+        max_join: 한 값을 이룰 수 있는 최대 박스 수. 텍스트 이어붙이기와 기하
+            선택에 함께 적용된다. 기하 선택에서는 **과선택 상한** 역할이다 —
+            넉넉한 bbox 가 옆 칸까지 덮었을 때 무한정 딸려오지 않게 막는다.
+        geometry_fallback: 텍스트 매칭이 실패했을 때 기하로 박스를 고를지.
+            **끄면 이전 동작으로 돌아간다** (텍스트가 안 맞으면 좌표 포기).
+            A/B 비교용으로 남겨 둔 스위치다.
+        min_cover: 박스 중심이 VLM bbox 밖일 때, 면적의 이 비율 이상이 안에
+            들어와야 후보로 본다. 중심 판정이 실패하는 경우(긴 주소 줄이 VLM
+            bbox 를 관통)를 받는 2차 그물이다.
     """
 
     pad_ratio: float = 0.35
@@ -109,6 +140,8 @@ class LocateConfig:
     retry_pad_ratio: float = 1.2
     similarity: float = 0.65
     max_join: int = 4
+    geometry_fallback: bool = True
+    min_cover: float = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +225,22 @@ def crop_rect(
     )
 
 
+def crop_scale(rect: BBox, cfg: LocateConfig) -> float:
+    """``rect`` 크롭에 실제로 적용될 업샘플 배율.
+
+    ``_cut`` 과 테스트가 같은 계산을 쓰도록 따로 뺐다. 배율을 잘못 가정하면
+    좌표 환산이 어긋나는데, 그 오차는 "기하 선택이 안 된다" 처럼 보여서
+    원인을 찾기 어렵다.
+    """
+    long_side = max(rect[3] - rect[1], rect[2] - rect[0])
+    if long_side <= 0:
+        return 1.0
+    scale = max(1.0, cfg.upscale)
+    if long_side * scale > cfg.max_crop_side:
+        scale = max(1.0, cfg.max_crop_side / long_side)
+    return scale
+
+
 def _cut(image: Any, rect: BBox, cfg: LocateConfig) -> tuple[Any, float]:
     """이미지를 잘라 확대한다.
 
@@ -204,10 +253,7 @@ def _cut(image: Any, rect: BBox, cfg: LocateConfig) -> tuple[Any, float]:
     if crop.size == 0:
         return crop, 1.0
 
-    scale = max(1.0, cfg.upscale)
-    long_side = max(crop.shape[0], crop.shape[1]) * scale
-    if long_side > cfg.max_crop_side:
-        scale = max(1.0, cfg.max_crop_side / max(crop.shape[0], crop.shape[1]))
+    scale = crop_scale(rect, cfg)
     if scale <= 1.0:
         return crop, 1.0
 
@@ -255,12 +301,19 @@ def _to_page(boxes: list[OcrBox], rect: BBox, scale: float, crop_id: int) -> lis
 
 @dataclass
 class _Match:
-    """크롭 안에서 VLM 의 값을 찾아낸 결과."""
+    """크롭 안에서 대상 박스를 골라낸 결과.
+
+    Attributes:
+        how: 무엇을 근거로 골랐나. ``"text"`` (VLM 텍스트와 일치) 또는
+            ``"geometry"`` (VLM bbox 와 겹침). ``reason`` 문구와 검수 우선순위가
+            여기서 갈린다 — 기하로 고른 것은 엉뚱한 셀일 수 있다.
+    """
 
     boxes: list[OcrBox]
     agreement: Agreement
     char_span: tuple[int, int] | None
     similarity: float
+    how: str = "text"
 
 
 def find_value(
@@ -338,6 +391,89 @@ def find_value(
     return best
 
 
+def select_by_geometry(
+    vlm_bbox: BBox, boxes: list[OcrBox], cfg: LocateConfig
+) -> _Match | None:
+    """VLM 이 지목한 사각형과 겹치는 OCR 박스를 고른다.
+
+    텍스트를 전혀 보지 않는다. **VLM 의 판단(위치와 종류)만 쓰고 전사 정확도는
+    쓰지 않는다.** 숫자 한 자리 오독이 좌표 확정을 막지 않게 하는 것이 목적이다.
+
+    ``FAILED`` 박스도 후보에 넣는다. det 는 성공했고 rec 만 실패한 박스는
+    "여기 글자는 있는데 못 읽었다" 는 뜻이고, VLM 이 그 자리를 지목했다면
+    **그 좌표가 VLM 의 근사 좌표보다 정확하다.** 손글씨 칸이 여기서
+    ``vlm_coarse`` 를 벗어난다 — 텍스트 매칭으로는 불가능했던 회수다.
+
+    선택 순서 (좁은 답 우선):
+
+    1. **중심이 VLM bbox 안**에 있는 박스. 보통 정확히 그 셀이다.
+    2. 없으면 **면적의 ``min_cover`` 이상이 안에 들어온** 박스. 긴 주소 줄이
+       VLM bbox 를 관통해 중심이 밖으로 나간 경우를 받는다.
+    3. 없으면 **겹침이 가장 큰 박스 하나**.
+
+    Args:
+        vlm_bbox: VLM 좌표를 픽셀로 환산한 사각형 (패딩 전).
+        boxes: 크롭 OCR 박스 (페이지 좌표).
+        cfg: 설정. ``max_join`` 이 과선택 상한, ``min_cover`` 가 2단계 임계값이다.
+
+    Returns:
+        고른 박스들을 담은 ``_Match``, 후보가 전혀 없으면 ``None``.
+    """
+    if not boxes:
+        return None
+
+    inside = [b for b in boxes if _center_in(b.bbox, vlm_bbox)]
+    if not inside:
+        inside = [b for b in boxes if _cover(b.bbox, vlm_bbox) >= cfg.min_cover]
+    if not inside:
+        best = max(boxes, key=lambda b: _overlap_area(b.bbox, vlm_bbox))
+        if _overlap_area(best.bbox, vlm_bbox) <= 0:
+            return None
+        inside = [best]
+
+    # 과선택 상한. 넉넉한 bbox 가 옆 칸까지 덮었을 때 무한정 딸려오지 않게
+    # 막는다. 자를 때는 VLM 이 지목한 중심에 가까운 것을 남긴다.
+    if len(inside) > cfg.max_join:
+        cx = (vlm_bbox[0] + vlm_bbox[2]) / 2.0
+        cy = (vlm_bbox[1] + vlm_bbox[3]) / 2.0
+        inside.sort(key=lambda b: _dist2(b.bbox, cx, cy))
+        inside = inside[: cfg.max_join]
+
+    # 읽기 순서로 되돌린다 (위 -> 아래, 왼 -> 오른). 텍스트 재조립 순서가 된다.
+    inside.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+    return _Match(
+        boxes=inside,
+        agreement=Agreement.NONE,  # 값 교차검증은 실패했다. 좌표만 확정된 것이다.
+        char_span=None,
+        similarity=0.0,
+        how="geometry",
+    )
+
+
+def _center_in(box: BBox, outer: BBox) -> bool:
+    cx = (box[0] + box[2]) / 2.0
+    cy = (box[1] + box[3]) / 2.0
+    return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
+
+
+def _overlap_area(a: BBox, b: BBox) -> float:
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return float(w * h) if w > 0 and h > 0 else 0.0
+
+
+def _cover(box: BBox, outer: BBox) -> float:
+    """``box`` 면적 중 ``outer`` 안에 들어온 비율."""
+    area = float((box[2] - box[0]) * (box[3] - box[1]))
+    return _overlap_area(box, outer) / area if area > 0 else 0.0
+
+
+def _dist2(box: BBox, cx: float, cy: float) -> float:
+    bx = (box[0] + box[2]) / 2.0
+    by = (box[1] + box[3]) / 2.0
+    return (bx - cx) ** 2 + (by - cy) ** 2
+
+
 # --------------------------------------------------------------------------
 # 진입점
 # --------------------------------------------------------------------------
@@ -352,10 +488,17 @@ def locate(
 ) -> tuple[list[PiiRegion], list[OcrBox]]:
     """VLM 탐지 목록의 좌표를 크롭 OCR 로 확정한다.
 
-    OCR 은 **두 번의 배치**로 돈다. 1차는 전부, 2차는 1차에서 값을 못 찾은
-    것만 크롭을 넓혀 다시 시도한다. VLM bbox 가 조금 어긋나 값이 크롭 경계
-    밖으로 나간 경우를 회수하기 위한 것이고, 재시도는 한 번만 한다 —
-    두 번 넓혀서 안 잡히면 크롭 문제가 아니다.
+    세 국면으로 돈다. **모델 호출은 없다** — OCR 배치 2회와 코드 판정뿐이다.
+
+    ① 크롭 + OCR + 텍스트 매칭        전부
+    ② 크롭을 넓혀 텍스트 매칭 재시도   ①에서 실패한 것만
+    ③ 기하 선택                       ②까지 실패한 것 중 크롭에 박스가 있는 것
+
+    ②를 한 번만 하는 이유: 두 번 넓혀서 텍스트가 안 잡히면 크롭 크기 문제가
+    아니라 판독 불일치 문제다. 그건 ③이 처리한다.
+
+    ③의 후보는 **①의(더 좁은) 크롭 결과**를 우선 쓴다. ②의 크롭은 넓어서
+    옆 칸까지 들어오므로 기하 선택에 불리하다.
 
     Args:
         findings: VLM 탐지 목록.
@@ -375,49 +518,80 @@ def locate(
         return [], []
 
     page_h, page_w = image.shape[:2]
+    n = len(findings)
 
-    # ── 1차 배치 ──────────────────────────────────────────────
-    matches: list[_Match | None] = [None] * len(findings)
-    per_finding: list[list[OcrBox]] = [[] for _ in findings]
-    _ocr_batch(findings, image, ocr, cfg, cfg.pad_ratio, range(len(findings)),
-               page_w, page_h, matches, per_finding)
+    # ── ① 전부 크롭 -> OCR -> 텍스트 매칭 ─────────────────────
+    tight = _crop_and_ocr(findings, image, ocr, cfg, cfg.pad_ratio, range(n), page_w, page_h)
+    matches: list[_Match | None] = [
+        find_value(f.text, tight[i], f.type, cfg) for i, f in enumerate(findings)
+    ]
+    #: 기하 선택과 진단에 쓸 박스 풀. 좁은 크롭 결과를 기본으로 한다.
+    pool: list[list[OcrBox]] = [list(b) for b in tight]
 
-    # ── 2차 배치 (1차 실패분만 크롭을 넓혀 재시도) ────────────
+    # ── ② 텍스트 매칭 실패분만 크롭을 넓혀 재시도 ─────────────
     retry = [
         i
-        for i, m in enumerate(matches)
-        if m is None and findings[i].type not in TEXTLESS_LABELS and findings[i].text.strip()
+        for i in range(n)
+        if matches[i] is None
+        and findings[i].type not in TEXTLESS_LABELS
+        and findings[i].text.strip()
     ]
     if retry:
-        log.debug("좌표 확정 재시도 %d건 (크롭 확대)", len(retry))
-        _ocr_batch(findings, image, ocr, cfg, cfg.retry_pad_ratio, retry,
-                   page_w, page_h, matches, per_finding)
+        log.debug("텍스트 매칭 재시도 %d건 (크롭 확대)", len(retry))
+        wide = _crop_and_ocr(
+            findings, image, ocr, cfg, cfg.retry_pad_ratio, retry, page_w, page_h
+        )
+        for i, boxes in zip(retry, wide, strict=True):
+            matches[i] = find_value(findings[i].text, boxes, findings[i].type, cfg)
+            if matches[i] is not None or not pool[i]:
+                # 넓힌 크롭에서 값을 찾았거나, 좁은 크롭이 아무것도 못 잡았다면
+                # 넓은 쪽 결과를 쓴다. 그 외에는 좁은 쪽을 지킨다.
+                pool[i] = boxes
+
+    # ── ③ 기하 선택 (텍스트를 보지 않는다) ────────────────────
+    n_geometry = 0
+    if cfg.geometry_fallback:
+        for i in range(n):
+            if matches[i] is not None or not pool[i]:
+                continue
+            vlm_bbox = denorm_bbox(findings[i].bbox_norm, page_w, page_h)
+            picked = select_by_geometry(vlm_bbox, pool[i], cfg)
+            if picked is not None:
+                matches[i] = picked
+                n_geometry += 1
 
     # ── 박스에 페이지 전역 번호 부여 ──────────────────────────
     all_boxes: list[OcrBox] = []
-    for boxes in per_finding:
+    for boxes in pool:
         for box in boxes:
             box.index = len(all_boxes)
             all_boxes.append(box)
 
     # ── 영역 생성 ─────────────────────────────────────────────
     regions: list[PiiRegion] = []
-    for finding, match, boxes in zip(findings, matches, per_finding, strict=True):
+    for finding, match, boxes in zip(findings, matches, pool, strict=True):
         if match is not None:
-            regions.append(_refined_region(finding, match, cfg, page_w, page_h))
+            regions.append(_refined_region(finding, match, page_w, page_h))
         else:
-            regions.append(_coarse_region(finding, boxes, cfg, page_w, page_h))
+            regions.append(_coarse_region(finding, boxes, page_w, page_h))
 
     n_coarse = sum(1 for r in regions if r.coarse)
+    if n_geometry:
+        # 기하로 고른 것은 엉뚱한 셀일 수 있다. 건수를 드러내야 검수자가
+        # 이 부류를 우선 확인한다.
+        warn.append(
+            f"기하 선택 {n_geometry}/{n}건 — VLM 텍스트와 일치하는 OCR 박스가 없어 "
+            f"위치 겹침으로 골랐다. 좌표는 OCR 것이지만 다른 셀일 수 있다."
+        )
     if n_coarse:
         warn.append(
-            f"좌표 확정 실패 {n_coarse}/{len(regions)}건 — VLM 좌표를 그대로 사용 "
-            f"(vlm_coarse). 해당 영역은 사람 검토가 필요하다."
+            f"좌표 확정 실패 {n_coarse}/{n}건 — 크롭에 OCR 박스가 없어 VLM 좌표를 "
+            f"그대로 사용 (vlm_coarse). 해당 영역은 사람 검토가 필요하다."
         )
     return regions, all_boxes
 
 
-def _ocr_batch(
+def _crop_and_ocr(
     findings: list[VlmFinding],
     image: Any,
     ocr: PaddleOcrRunner,
@@ -426,17 +600,16 @@ def _ocr_batch(
     targets: Any,
     page_w: int,
     page_h: int,
-    matches: list[_Match | None],
-    per_finding: list[list[OcrBox]],
-) -> None:
-    """``targets`` 인덱스의 탐지들에 대해 크롭 -> 배치 OCR -> 매칭을 수행한다.
+) -> list[list[OcrBox]]:
+    """``targets`` 인덱스의 탐지들을 크롭해 배치 OCR 한다.
 
-    ``matches`` / ``per_finding`` 을 제자리에서 갱신한다. 이미 매칭된 항목의
-    결과는 덮어쓰지 않는다 (2차에서 더 나쁜 매칭이 나와도 1차를 지킨다).
+    Returns:
+        ``targets`` 와 **같은 순서·같은 길이**의 박스 목록. 좌표는 페이지 기준으로
+        환산되어 있다 (크롭 오프셋 + 업샘플 배율 역산).
     """
     idx_list = list(targets)
     if not idx_list:
-        return
+        return []
 
     rects: list[BBox] = []
     crops: list[Any] = []
@@ -449,32 +622,42 @@ def _ocr_batch(
         scales.append(scale)
 
     results = ocr.run_many(crops)
-
-    for i, rect, scale, boxes in zip(idx_list, rects, scales, results, strict=True):
-        page_boxes = _to_page(boxes, rect, scale, crop_id=i)
-        per_finding[i] = page_boxes  # 재시도 시 더 넓은 크롭 결과로 교체한다
-        if matches[i] is not None:
-            continue
-        matches[i] = find_value(findings[i].text, page_boxes, findings[i].type, cfg)
+    return [
+        _to_page(boxes, rect, scale, crop_id=i)
+        for i, rect, scale, boxes in zip(idx_list, rects, scales, results, strict=True)
+    ]
 
 
 def _refined_region(
-    finding: VlmFinding, match: _Match, cfg: LocateConfig, page_w: int, page_h: int
+    finding: VlmFinding, match: _Match, page_w: int, page_h: int
 ) -> PiiRegion:
-    """크롭 OCR 이 좌표를 확정한 경우."""
+    """크롭 OCR 이 좌표를 확정한 경우 (텍스트 매칭이든 기하 선택이든).
+
+    ``source`` 는 둘 다 ``OCR_REFINED`` 다 — 좌표가 OCR 것이라는 사실은 같다.
+    근거의 차이는 ``agreement`` 와 ``reason`` 이 표현한다.
+    """
     member = [b.bbox for b in match.boxes]
     ocr_text = " ".join(b.text for b in match.boxes if b.text)
     worst = _worst_status(match.boxes)
 
-    # 두 엔진이 같은 값을 읽었다면 VLM 자기확신도보다 높게 볼 근거가 있다.
-    # 다만 1.0 으로 올리지는 않는다 — 체크섬 통과만이 그 자격이 있다 (verify.py).
-    conf = min(0.95, max(finding.conf, 0.9)) if match.agreement is Agreement.EXACT else finding.conf
+    if match.agreement is Agreement.EXACT:
+        # 두 엔진이 같은 값을 읽었다면 VLM 자기확신도보다 높게 볼 근거가 있다.
+        # 다만 1.0 으로 올리지 않는다 — 체크섬 통과만이 그 자격이 있다 (verify.py).
+        conf = min(0.95, max(finding.conf, 0.9))
+        reason = "크롭 OCR 과 완전일치"
+    elif match.agreement is Agreement.SIMILAR:
+        conf = finding.conf
+        reason = f"크롭 OCR 과 유사 일치 (={match.similarity:.2f}): OCR '{ocr_text[:40]}'"
+    else:
+        # 기하 선택. 좌표는 OCR 것이지만 값 교차검증은 없었다. VLM 이 읽은 값과
+        # 선택된 박스가 읽은 값을 함께 남긴다 — 엉뚱한 셀을 골랐는지 판단하려면
+        # 이 두 개가 나란히 있어야 한다.
+        conf = finding.conf
+        reason = (
+            f"VLM bbox 와 위치가 겹치는 OCR 박스를 선택 (텍스트는 불일치). "
+            f"VLM '{finding.text[:30]}' vs OCR '{ocr_text[:40] or '(판독 실패)'}'"
+        )
 
-    reason = (
-        "크롭 OCR 과 완전일치"
-        if match.agreement is Agreement.EXACT
-        else f"크롭 OCR 과 유사 일치 (={match.similarity:.2f}): OCR '{ocr_text[:40]}'"
-    )
     return PiiRegion(
         id="",  # finalize 에서 부여
         type=finding.type,
@@ -499,26 +682,39 @@ def _refined_region(
 def _coarse_region(
     finding: VlmFinding,
     boxes: list[OcrBox],
-    cfg: LocateConfig,
     page_w: int,
     page_h: int,
 ) -> PiiRegion:
-    """크롭 OCR 이 값을 찾지 못한 경우. VLM 좌표를 그대로 쓴다.
+    """좌표를 확정하지 못한 경우. VLM 좌표를 그대로 쓴다.
 
-    세 경우를 ``reason`` 으로 구분한다. 이 구분이 있어야 "OCR 을 손봐야 하나
-    VLM 을 손봐야 하나" 를 로그만 보고 판단할 수 있다.
+    기하 선택이 들어온 뒤로 이 경로에 남는 것은 세 가지뿐이고, **셋의 처방이
+    서로 다르다.** ``reason`` 으로 구분해야 "OCR 을 손봐야 하나 VLM 을 손봐야
+    하나" 를 로그만 보고 판단할 수 있다.
+
+    ===========================  ===========================================
+    서명·인영                     정상. 읽을 글자가 없다. 검토 플래그 없음
+    크롭에 박스가 하나도 없다      OCR **검출** 문제. det 임계값·업샘플을 본다
+    박스는 있는데 겹치지 않는다    VLM **좌표** 문제. grounding 이 크게 어긋났다
+    ===========================  ===========================================
+
+    세 번째가 특히 중요하다. 박스가 있는데도 기하 선택이 실패했다면 VLM 의
+    bbox 가 엉뚱한 곳을 가리켰다는 뜻이고, 이건 크롭 패딩을 넓혀도 안 낫는다
+    (넓히면 더 많은 무관한 박스가 들어올 뿐이다). 프롬프트나 모델 쪽 문제다.
     """
     textless = finding.type in TEXTLESS_LABELS or not finding.text.strip()
     read = " ".join(b.text for b in boxes if b.text.strip())
 
     if textless:
         reason = "읽을 텍스트가 없는 항목 (서명·인영). VLM 좌표 사용"
-    elif not read:
-        reason = "크롭 OCR 이 아무 글자도 읽지 못했다 (손글씨/도장 추정). VLM 좌표 사용"
+    elif not boxes:
+        reason = (
+            "크롭에서 OCR 박스가 검출되지 않았다 (손글씨/도장/저대비 추정). "
+            "VLM 좌표 사용"
+        )
     else:
         reason = (
-            f"크롭 OCR 이 VLM 의 값을 찾지 못했다. "
-            f"VLM '{finding.text[:30]}' vs OCR '{read[:40]}'"
+            f"VLM bbox 와 겹치는 OCR 박스가 없다 (VLM 좌표가 어긋난 것으로 보인다). "
+            f"VLM '{finding.text[:30]}' / 크롭에서 읽은 것 '{read[:40] or '(없음)'}'"
         )
 
     bbox = denorm_bbox(finding.bbox_norm, page_w, page_h)
