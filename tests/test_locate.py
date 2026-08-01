@@ -490,6 +490,20 @@ class TestLocate:
         assert (r.bbox[2] - r.bbox[0]) < w * 0.5
         assert (r.bbox[3] - r.bbox[1]) < h * 0.5
 
+    def test_crop_padding_absorbs_the_models_grounding_floor(self) -> None:
+        """크롭 여유가 **모델의 해상도 하한(비전 토큰 1개)** 보다 커야 한다.
+
+        Qwen-VL 의 공간 단위는 32x32px 이고 300dpi 한글 한 줄이 30~40px 이므로
+        모델은 한 줄보다 정확할 수 없다. 한 줄짜리 이름 칸에서 세로 여유가
+        그보다 작으면 값이 크롭 밖으로 새어나가고, 텍스트 매칭이 구조적으로
+        실패한다 — 설정 하나가 파이프라인의 전제를 깨는 자리다.
+        """
+        cfg = LocateConfig()
+        # 이름 칸: 1748x2480 페이지에서 약 100x30px
+        f = finding("김수현", bbox=(0.300, 0.400, 0.357, 0.412))
+        x1, y1, x2, y2 = crop_rect(f, 1748, 2480, cfg.pad_ratio, cfg.min_pad_px)
+        assert (y2 - y1 - 30) / 2 >= 32, "세로 여유가 비전 토큰 1개보다 작다"
+
     def test_nearby_selection_is_warned(self) -> None:
         """이 건수가 크면 grounding 이 전반적으로 밀렸다는 신호다."""
         warnings: list[str] = []

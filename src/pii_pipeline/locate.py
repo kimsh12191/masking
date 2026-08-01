@@ -102,6 +102,19 @@ class LocateConfig:
         pad_ratio: 크롭 여유 (VLM bbox 크기 대비 비율). VLM 좌표는 어긋나므로
             넉넉히 잡는다. 좁으면 값이 크롭 밖으로 나가 못 찾는다.
         min_pad_px: 크롭 여유의 최솟값 (px). 작은 bbox 에서 비율만으로는 부족하다.
+
+            **이 값은 모델의 grounding 해상도 하한보다 커야 한다.** Qwen-VL 의
+            공간 단위는 비전 토큰 1개, 즉 ``image_factor`` × ``image_factor``
+            픽셀이다 (Qwen3-VL 은 32×32). 0~1000 좌표의 눈금이 1.76px 여도
+            모델이 실제로 구분할 수 있는 최소 단위는 32px 이고, 300dpi 한글
+            한 줄 높이가 30~40px 이므로 **모델은 원리적으로 한 줄보다 정확할
+            수 없다.**
+
+            한때 이 값이 12 였다. 한 줄짜리 이름 칸(약 100×30px)에서 ``pad_ratio``
+            0.35 는 세로 10px 밖에 주지 못해 ``max(12, 10) = 12px`` 이 되고,
+            32px 오차를 흡수하지 못한다. 값이 크롭 밖으로 나가면 텍스트 매칭이
+            실패하고, 그 다음은 어긋난 자리에서 박스를 고르게 된다. 모델의
+            해상도 하한의 1.5배를 준다.
         upscale: 크롭을 OCR 에 넣기 전 확대 배율. **작은 글씨에 대한 유일한
             대응책이다.** 원본에 없는 정보를 만들지는 못하지만, rec 모델은
             입력 글자 높이에 민감하므로 실측으로 효과가 있다. 1.0 이면 끈다.
@@ -120,7 +133,7 @@ class LocateConfig:
     """
 
     pad_ratio: float = 0.35
-    min_pad_px: int = 12
+    min_pad_px: int = 48
     upscale: float = 2.0
     max_crop_side: int = 1600
     retry_pad_ratio: float = 1.2
