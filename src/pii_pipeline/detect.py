@@ -124,8 +124,14 @@ def tile_rects(
         overlap: 겹침 비율 (0.0~0.5). 조각 두께의 이 비율만큼 양쪽으로 넓힌다.
         factor: 패치 격자 (``DetectConfig.image_factor``). 1 이면 스냅하지 않는다.
 
+    **모든 조각의 두께가 같다.** 예전에는 가운데 조각만 양쪽으로 겹쳐서 더
+    두꺼웠다 (896 / 992 / 896). 그러면 모델이 조각마다 다른 기하를 보게 되고,
+    좌표를 학습시킬 때 그 변동을 함께 배워야 한다. 두께를 고정하면 모델이
+    상대할 기하가 하나뿐이다.
+
     Returns:
         ``(x1, y1, x2, y2)`` 정규화 사각형 목록. 항상 최소 1개.
+        조각들은 **빈틈 없이** 페이지를 덮는다 (첫 조각은 0 에서, 마지막은 끝에서).
     """
     if tiles <= 1:
         return [(0.0, 0.0, 1.0, 1.0)]
@@ -135,21 +141,37 @@ def tile_rects(
     span = height if vertical else width
     f = max(1, factor)
 
-    band = span / tiles
-    pad = band * overlap
+    def up(value: float) -> int:
+        """격자 배수로 올림."""
+        return min(span, -(-int(-(-value // 1)) // f) * f)
 
-    rects: list[tuple[float, float, float, float]] = []
-    for i in range(tiles):
-        lo = 0 if i == 0 else max(0, int((i * band - pad) // f) * f)
-        hi = span if i == tiles - 1 else min(span, -(-int((i + 1) * band + pad) // f) * f)
-        if hi <= lo:  # 조각이 격자보다 얇은 극단적 경우
-            hi = min(span, lo + f)
-        rects.append(
-            (0.0, lo / height, 1.0, hi / height)
-            if vertical
-            else (lo / width, 0.0, hi / width, 1.0)
-        )
-    return rects
+    band = span / tiles
+    thickness = max(up(band), up(band * (1 + 2 * overlap)))
+
+    # 시작 위치는 균등 분할하고 **내림**으로 스냅한다. 올림하면 조각이 뒤로
+    # 밀려 앞 조각과의 사이에 빈틈이 생길 수 있는데, 빈틈은 곧 미탐이다.
+    def starts_for(thick: int) -> list[int]:
+        last = span - thick
+        out = [int(last * i / (tiles - 1) // f) * f for i in range(tiles)]
+        out[0] = 0
+        out[-1] = last  # span 도 thick 도 f 의 배수이므로 last 도 배수다
+        return out
+
+    # 스냅 때문에 이웃 사이가 벌어지면 두께를 한 칸 늘려 다시 잡는다.
+    # thickness 가 span 에 닿으면 조각 하나가 전체를 덮으므로 반드시 끝난다.
+    starts = starts_for(thickness)
+    while thickness < span and any(
+        b > a + thickness for a, b in zip(starts, starts[1:], strict=False)
+    ):
+        thickness = min(span, thickness + f)
+        starts = starts_for(thickness)
+
+    return [
+        (0.0, lo / height, 1.0, (lo + thickness) / height)
+        if vertical
+        else (lo / width, 0.0, (lo + thickness) / width, 1.0)
+        for lo in starts
+    ]
 
 
 def crop_norm(image: Any, rect: tuple[float, float, float, float]) -> Any:

@@ -95,12 +95,17 @@ def no_preprocess(monkeypatch: pytest.MonkeyPatch) -> None:
         target_long_side: Any = None,
         deskew: bool = True,
         align: int = 32,
+        canvas: Any = None,
     ) -> PreprocessResult:
         h, w = img.shape[:2]
         return PreprocessResult(image=img, width=w, height=h, applied=[])
 
     def fake_path(
-        path: str, target_long_side: Any = None, deskew: bool = True, align: int = 32
+        path: str,
+        target_long_side: Any = None,
+        deskew: bool = True,
+        align: int = 32,
+        canvas: Any = None,
     ):
         return fake(blank_page())
 

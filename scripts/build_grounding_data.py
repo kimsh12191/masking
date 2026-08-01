@@ -4,10 +4,11 @@
 문서 이미지 → 타일 이미지 + 정답 JSON. **사람 라벨 0건.**
 
     이미지/PDF
-      └─ preprocess          추론과 **같은** 전처리 (해상도·기울기·격자정렬)
+      └─ preprocess          추론과 **같은** 전처리 (고정 캔버스·기울기 보정)
       └─ 페이지 전역 OCR     한 번만. 타일마다 돌리면 경계에서 정답이 어긋난다
-      └─ tile_rects          추론과 **같은** 타일 분할
-      └─ 타일별 정답 생성    OCR 박스 → 타일 기준 0~1000 정수
+      └─ tile_rects          추론과 **같은** 타일 분할 (전부 같은 크기)
+      └─ 스케일 증강         같은 종횡비의 더 작은 영역 → 타일 크기로 확대
+      └─ 영역별 정답 생성    OCR 박스 → 영역 기준 0~1000 정수
       └─ 왕복 검산           추론 디코딩으로 되돌려 원래 박스가 나오는가
       └─ tiles/*.png + data.jsonl
 
@@ -15,6 +16,11 @@
 추론에서 보는 이미지가 같고, 좌표 규약도 같다.** 그래서 전처리·타일링을
 재구현하지 않고 ``pii_pipeline`` 의 함수를 그대로 호출한다. 여기서 한 번
 어긋나면 틀린 좌표를 학습시키게 되고, 그 오차는 결과만 보고는 찾을 수 없다.
+
+**모든 샘플의 입력 크기가 같다.** 페이지가 고정 캔버스이고 타일이 전부 같은
+크기이며, 증강 영역도 마지막에 타일 크기로 확대된다. 달라지는 것은 글자
+크기뿐이고, 그것이 증강의 목적이다 — 캔버스를 고정해도 문서마다 폰트 크기가
+다르므로 한 가지 스케일만 학습하면 나머지에서 좌표가 흔들린다.
 
 사용법::
 
@@ -33,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 
@@ -52,6 +59,7 @@ from pii_pipeline.train.dataset import (  # noqa: E402
     build_tile_sample,
     quantization_limit,
     roundtrip,
+    scale_regions,
 )
 
 log = logging.getLogger("build_grounding_data")
@@ -67,12 +75,24 @@ def page_samples(
     cfg: PipelineConfig,
     gcfg: GroundingConfig,
     ocr: PaddleOcrRunner,
+    scales: list[float],
+    rng,
 ) -> tuple[list[tuple[TileSample, object]], list[str]]:
-    """전처리된 페이지에서 타일 샘플들을 만든다.
+    """전처리된 페이지에서 학습 샘플들을 만든다.
+
+    영역 두 종류를 같은 코드로 처리한다.
+
+    ==========  ==========================================================
+    추론 타일   ``tile_rects`` 가 주는 것 그대로. 학습과 추론이 만나는 지점
+    증강 영역   같은 종횡비의 더 작은 영역. **글자가 더 크게 보인다**
+    ==========  ==========================================================
+
+    증강 영역도 마지막에 타일 크기로 확대되므로 **모델이 받는 입력 크기는
+    항상 같다.** 달라지는 것은 글자 크기뿐이다.
 
     Returns:
-        ``([(샘플, 타일이미지)], 문제 목록)``. 문제 목록이 비어 있지 않으면
-        그 페이지는 학습에 쓰면 안 된다.
+        ``([(샘플, 이미지)], 문제 목록)``. 문제 목록이 비어 있지 않으면
+        그 페이지의 해당 영역은 학습에 쓰면 안 된다.
     """
     page_h, page_w = image.shape[:2]
     problems: list[str] = []
@@ -81,13 +101,21 @@ def page_samples(
     if not boxes:
         return [], ["페이지 OCR 이 박스를 하나도 못 찾았다"]
 
-    rects = tile_rects(
+    tiles = tile_rects(
         page_w, page_h, cfg.detect.tiles, cfg.detect.overlap, cfg.detect.image_factor
     )
+    # 증강은 타일 0 의 모양을 기준으로 뽑는다. 타일이 전부 같은 크기이므로
+    # 어느 것을 기준으로 잡아도 같다 (detect.tile_rects 는 균일 타일을 낸다).
+    regions = [(i, r) for i, r in enumerate(tiles)]
+    regions += [(-1, r) for r in scale_regions(tiles[0], page_w, page_h, scales, rng)]
+
+    # 모델이 실제로 받을 타일 픽셀 크기. 증강 영역도 여기에 맞춰 확대한다.
+    tile_h_px = round((tiles[0][3] - tiles[0][1]) * page_h)
+    tile_w_px = round((tiles[0][2] - tiles[0][0]) * page_w)
 
     out: list[tuple[TileSample, object]] = []
-    for i, rect in enumerate(rects):
-        sample = build_tile_sample(boxes, i, rect, page_w, page_h, gcfg)
+    for index, rect in regions:
+        sample = build_tile_sample(boxes, index, rect, page_w, page_h, gcfg)
         if sample is None:
             continue
 
@@ -98,15 +126,35 @@ def page_samples(
         limit = quantization_limit(rect, page_w, page_h) + 1.0
         if sample.max_error_px > limit:
             problems.append(
-                f"타일 {i}: 왕복 오차 {sample.max_error_px:.1f}px "
+                f"영역 {index}: 왕복 오차 {sample.max_error_px:.1f}px "
                 f"> 허용 {limit:.1f}px — 좌표 변환이 추론 경로와 어긋났다"
             )
             continue
 
-        tile_img = crop_norm(image, rect) if len(rects) > 1 else image
-        out.append((sample, as_model_sees(tile_img, cfg.llm.image_max_side)))
+        crop = crop_norm(image, rect) if len(tiles) > 1 or index < 0 else image
+        out.append((sample, to_tile_size(crop, tile_w_px, tile_h_px, cfg.llm.image_max_side)))
 
     return out, problems
+
+
+def to_tile_size(crop, tile_w: int, tile_h: int, max_side: int):
+    """영역 크롭을 **타일과 같은 픽셀 크기**로 만든 뒤 추론과 같은 축소를 건다.
+
+    증강 영역은 타일보다 작으므로 여기서 확대되고, 그래서 글자가 커 보인다.
+    추론 타일은 이미 그 크기라 확대가 없다.
+
+    좌표는 손대지 않는다 — per-mille 은 이미지 크기에 불변이다.
+    """
+    h, w = crop.shape[:2]
+    if (w, h) != (tile_w, tile_h):
+        import cv2  # type: ignore[import-not-found]
+
+        crop = cv2.resize(
+            crop,
+            (tile_w, tile_h),
+            interpolation=cv2.INTER_AREA if w > tile_w else cv2.INTER_CUBIC,
+        )
+    return as_model_sees(crop, max_side)
 
 
 def as_model_sees(tile, max_side: int):
@@ -150,6 +198,7 @@ def load_pages(path: str, cfg: PipelineConfig):
                 page.image,
                 target_long_side=cfg.target_long_side,
                 deskew=cfg.deskew,
+                canvas=cfg.canvas,
                 align=cfg.detect.image_factor,
             )
             yield f"{Path(path).stem}_p{page.page_no:03d}", pre.image
@@ -158,6 +207,7 @@ def load_pages(path: str, cfg: PipelineConfig):
             path,
             target_long_side=cfg.target_long_side,
             deskew=cfg.deskew,
+            canvas=cfg.canvas,
             align=cfg.detect.image_factor,
         )
         yield Path(path).stem, pre.image
@@ -230,6 +280,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="FAILED/저신뢰 박스를 빼고 인쇄 텍스트만 (손글씨·도장을 못 배운다)",
     )
+    ap.add_argument(
+        "--aug-scales",
+        default="1.5,2.0",
+        help="스케일 증강 배율 (쉼표 구분). 타일과 같은 종횡비의 더 작은 영역을 "
+        "잘라 타일 크기로 확대한다 — **입력 크기는 고정, 글자 크기만 커진다.** "
+        "빈 문자열이면 증강 없음",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="증강 위치 난수 시드")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -250,9 +308,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.overlay:
         (out_dir / "overlay").mkdir(exist_ok=True)
 
+    scales = [float(s) for s in args.aug_scales.split(",") if s.strip()]
+    rng = random.Random(args.seed)
     ocr = PaddleOcrRunner(cfg.ocr)
 
-    n_pages = n_samples = n_items = n_textless = 0
+    n_pages = n_samples = n_items = n_textless = n_aug = 0
     n_overlay = 0
     worst_error = 0.0
     problems: list[str] = []
@@ -268,11 +328,16 @@ def main(argv: list[str] | None = None) -> int:
             for stem, image in pages:
                 n_pages += 1
                 page_h, page_w = image.shape[:2]
-                samples, page_problems = page_samples(image, cfg, gcfg, ocr)
+                samples, page_problems = page_samples(image, cfg, gcfg, ocr, scales, rng)
                 problems.extend(f"{stem} {p}" for p in page_problems)
 
-                for sample, tile_img in samples:
-                    name = f"{stem}_t{sample.tile}"
+                for n, (sample, tile_img) in enumerate(samples):
+                    # 증강 영역은 tile=-1 이라 이름이 겹친다. 순번을 붙인다.
+                    name = (
+                        f"{stem}_t{sample.tile}"
+                        if sample.tile >= 0
+                        else f"{stem}_aug{n:02d}"
+                    )
                     tile_path = tiles_dir / f"{name}.png"
 
                     import cv2  # type: ignore[import-not-found]
@@ -299,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
                     n_samples += 1
+                    n_aug += int(sample.tile < 0)
                     n_items += len(sample.items)
                     n_textless += sample.n_textless
                     worst_error = max(worst_error, sample.max_error_px)
@@ -317,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("=" * 58)
     print(f" 페이지        {n_pages}")
-    print(f" 타일 샘플     {n_samples}")
+    print(f" 학습 샘플     {n_samples}  (추론 타일 {n_samples - n_aug} + 스케일 증강 {n_aug})")
     print(f" 항목          {n_items}  (타일당 평균 {n_items / max(1, n_samples):.1f})")
     print(
         f"   글자+좌표   {n_items - n_textless}"

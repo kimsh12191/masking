@@ -57,6 +57,52 @@ from ..schema import BBox, OcrBox, OcrStatus
 Rect = tuple[float, float, float, float]
 
 
+def scale_regions(
+    rect: Rect,
+    page_w: int,
+    page_h: int,
+    scales: list[float],
+    rng: Any,
+) -> list[Rect]:
+    """타일과 **같은 종횡비**로 더 작은 영역들을 뽑는다 (스케일 증강).
+
+    입력 크기는 고정인데 글자 크기만 달라지게 하는 것이 목적이다. 작은 영역을
+    잘라 타일 크기로 확대하면 글자가 그 배율만큼 커 보인다.
+
+        s = 1.0   타일 그대로            글자 1배
+        s = 2.0   타일의 절반 영역       글자 2배
+
+    **왜 필요한가.** 캔버스를 고정해도 문서마다 폰트 크기가 다르다. 추론 타일
+    하나의 스케일만 학습하면 그보다 작거나 큰 글씨에서 좌표가 흔들린다. 종횡비를
+    타일과 맞추는 것이 중요한데, 안 맞추고 확대하면 글자가 찌그러지고 모델이
+    왜곡된 글자를 학습하게 된다.
+
+    ``s < 1`` 은 만들지 않는다. 타일이 이미 페이지 폭 전체를 쓰므로 더 넓은
+    영역이 없다 — 그 방향은 캔버스 크기를 바꿔야 얻어진다.
+
+    Args:
+        rect: 기준 타일의 정규화 사각형.
+        page_w: 페이지 폭 (px).
+        page_h: 페이지 높이 (px).
+        scales: 배율 목록. 1.0 이하는 건너뛴다.
+        rng: ``random.Random``. 위치를 뽑는 데 쓴다.
+
+    Returns:
+        정규화 사각형 목록. 페이지 안에 완전히 들어간다.
+    """
+    rw, rh = rect[2] - rect[0], rect[3] - rect[1]
+    out: list[Rect] = []
+    for s in scales:
+        if s <= 1.0:
+            continue
+        w, h = rw / s, rh / s
+        # 영역이 페이지 밖으로 나가지 않는 범위에서 위치를 뽑는다.
+        x = rng.uniform(0.0, max(0.0, 1.0 - w))
+        y = rng.uniform(0.0, max(0.0, 1.0 - h))
+        out.append((x, y, min(1.0, x + w), min(1.0, y + h)))
+    return out
+
+
 @dataclass
 class GroundingConfig:
     """학습 샘플 생성 설정.

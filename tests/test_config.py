@@ -393,6 +393,9 @@ class TestGridReport:
 
     def _cfg(self, **kw: Any) -> AppConfig:
         c = load_config(None, use_env=False)
+        # canvas 가 있으면 target_long_side 는 쓰이지 않는다. 어느 쪽을
+        # 검사하는지 테스트마다 명시한다.
+        c.pipeline.canvas = kw.get("canvas", (1760, 2464))
         c.pipeline.target_long_side = kw.get("long_side", 2464)
         c.pipeline.llm.image_max_side = kw.get("max_side", 1984)
         c.pipeline.locate.min_pad_px = kw.get("min_pad", 64)
@@ -404,8 +407,18 @@ class TestGridReport:
 
     def test_a4_2480_is_flagged(self) -> None:
         """2480 은 A4 300dpi 지만 32 의 배수가 아니다 — 2464 를 써야 한다."""
-        out = grid_report(self._cfg(long_side=2480))
+        out = grid_report(self._cfg(canvas=None, long_side=2480))
         assert "target_long_side=2480" in out and "2464 권장" in out
+
+    def test_unaligned_canvas_is_flagged(self) -> None:
+        """캔버스는 전처리가 여백으로 보정해 주지 않는다 (크기가 고정이라
+        붙일 자리가 없다). 안 맞으면 조각도 격자에서 벗어난다."""
+        out = grid_report(self._cfg(canvas=(1750, 2464)))
+        assert "canvas 폭=1750" in out and "1728 권장" in out
+
+    def test_canvas_hides_the_long_side_check(self) -> None:
+        """canvas 를 쓰면 target_long_side 는 무시되므로 트집잡지 않는다."""
+        assert grid_report(self._cfg(long_side=2480)).startswith("OK")
 
     def test_unaligned_image_max_side_is_flagged(self) -> None:
         out = grid_report(self._cfg(max_side=2000))

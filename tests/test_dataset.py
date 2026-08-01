@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from pii_pipeline.detect import tile_rects
@@ -19,6 +21,7 @@ from pii_pipeline.train.dataset import (
     GroundingConfig,
     build_tile_sample,
     quantization_limit,
+    scale_regions,
     roundtrip,
     to_permille,
 )
@@ -191,3 +194,56 @@ class TestSampleShape:
         assert set(payload) == {"findings"}
         assert set(payload["findings"][0]) == {"text", "bbox_2d"}
         assert len(payload["findings"][0]["bbox_2d"]) == 4
+
+
+class TestScaleRegions:
+    """입력 크기는 고정, **글자 크기만** 달라지게 하는 증강.
+
+    캔버스를 고정해도 문서마다 폰트 크기가 다르다. 추론 타일 하나의 스케일만
+    학습하면 그보다 작거나 큰 글씨에서 좌표가 흔들린다.
+    """
+
+    PAGE_W, PAGE_H = 1760, 2464
+    TILE = (0.0, 0.0, 1.0, 960 / 2464)
+
+    def regions(self, scales: list[float], seed: int = 0) -> list[tuple]:
+        return scale_regions(
+            self.TILE, self.PAGE_W, self.PAGE_H, scales, random.Random(seed)
+        )
+
+    def test_aspect_ratio_matches_the_tile(self) -> None:
+        """종횡비가 다르면 타일 크기로 늘릴 때 글자가 찌그러진다."""
+        tile_ar = (self.TILE[2] - self.TILE[0]) * self.PAGE_W / (
+            (self.TILE[3] - self.TILE[1]) * self.PAGE_H
+        )
+        for r in self.regions([1.5, 2.0, 2.5]):
+            ar = (r[2] - r[0]) * self.PAGE_W / ((r[3] - r[1]) * self.PAGE_H)
+            assert ar == pytest.approx(tile_ar, rel=1e-6)
+
+    def test_higher_scale_means_a_smaller_region(self) -> None:
+        """작은 영역을 타일 크기로 키우니 글자가 그만큼 커 보인다."""
+        r15, r20 = self.regions([1.5, 2.0])
+        assert (r20[3] - r20[1]) < (r15[3] - r15[1])
+
+    def test_regions_stay_inside_the_page(self) -> None:
+        for r in self.regions([1.5, 2.0, 3.0], seed=7):
+            assert 0.0 <= r[0] < r[2] <= 1.0
+            assert 0.0 <= r[1] < r[3] <= 1.0
+
+    def test_scale_one_or_less_is_skipped(self) -> None:
+        """타일이 이미 페이지 폭 전체다. 더 넓은 영역은 없다."""
+        assert self.regions([1.0, 0.5]) == []
+
+    def test_deterministic_for_a_given_seed(self) -> None:
+        """같은 시드면 같은 데이터셋이어야 재현이 된다."""
+        assert self.regions([1.5, 2.0], seed=3) == self.regions([1.5, 2.0], seed=3)
+
+    def test_labels_survive_the_roundtrip_in_an_augmented_region(self) -> None:
+        """증강 영역에서도 좌표가 추론 경로로 정확히 복원되어야 한다."""
+        boxes = [box("강동혁", 300, 200, 480, 250), box("서울시", 300, 400, 520, 450)]
+        for rect in self.regions([2.0], seed=1):
+            sample = build_tile_sample(boxes, -1, rect, self.PAGE_W, self.PAGE_H)
+            if sample is None:
+                continue
+            limit = quantization_limit(rect, self.PAGE_W, self.PAGE_H) + 1.0
+            assert sample.max_error_px <= limit

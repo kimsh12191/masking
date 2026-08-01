@@ -704,3 +704,46 @@ class TestCoordConventionEndToEnd:
         warnings: list[str] = []
         detect(blank_page(), FakeClient([{"findings": []}] * 3), cfg(tiles=3), warnings)
         assert not any("축소" in w for w in warnings)
+
+
+class TestUniformTiles:
+    """조각 두께가 **전부 같아야** 한다.
+
+    예전에는 가운데 조각만 양쪽으로 겹쳐서 더 두꺼웠다 (896 / 992 / 896).
+    그러면 모델이 조각마다 다른 기하를 보게 되고, 좌표를 학습시킬 때 그 변동을
+    함께 배워야 한다. 두께가 고정이면 상대할 기하가 하나뿐이다.
+    """
+
+    CANVAS_W, CANVAS_H = 1760, 2464
+
+    def thicknesses(self, tiles: int, overlap: float = 0.08) -> set[int]:
+        rects = tile_rects(self.CANVAS_W, self.CANVAS_H, tiles, overlap, 32)
+        return {round(r[3] * self.CANVAS_H) - round(r[1] * self.CANVAS_H) for r in rects}
+
+    def test_every_tile_has_the_same_thickness(self) -> None:
+        for n in (2, 3, 4, 6):
+            assert len(self.thicknesses(n)) == 1, f"조각 {n}개에서 두께가 갈렸다"
+
+    def test_uniform_even_without_overlap(self) -> None:
+        assert len(self.thicknesses(3, overlap=0.0)) == 1
+
+    def test_still_covers_the_page_without_gaps(self) -> None:
+        """두께를 고정하느라 페이지 일부가 빠지면 그건 미탐이다."""
+        for n in (2, 3, 4, 6):
+            rects = tile_rects(self.CANVAS_W, self.CANVAS_H, n, 0.08, 32)
+            assert rects[0][1] == 0.0
+            assert rects[-1][3] == 1.0
+            for a, b in zip(rects[:-1], rects[1:], strict=True):
+                assert b[1] <= a[3], f"조각 {n}개에서 빈 구간이 생겼다"
+
+    def test_thickness_and_offsets_stay_on_the_patch_grid(self) -> None:
+        for n in (2, 3, 4, 6):
+            rects = tile_rects(self.CANVAS_W, self.CANVAS_H, n, 0.08, 32)
+            for r in rects:
+                y1, y2 = round(r[1] * self.CANVAS_H), round(r[3] * self.CANVAS_H)
+                assert y1 % 32 == 0 and (y2 - y1) % 32 == 0
+
+    def test_neighbours_still_overlap(self) -> None:
+        rects = tile_rects(self.CANVAS_W, self.CANVAS_H, 3, 0.08, 32)
+        for a, b in zip(rects[:-1], rects[1:], strict=True):
+            assert b[1] < a[3]

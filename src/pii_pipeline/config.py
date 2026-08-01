@@ -250,10 +250,18 @@ def grid_report(config: AppConfig) -> str:
         return "image_factor=1 — 격자 정렬을 쓰지 않는다"
 
     bad: list[str] = []
-    long_side = config.pipeline.target_long_side
-    if long_side and long_side % f:
-        near = (long_side // f) * f
-        bad.append(f"target_long_side={long_side} (÷{f} 아님, {near} 권장)")
+    canvas = config.pipeline.canvas
+    if canvas:
+        # 캔버스는 전처리가 여백으로 보정해 주지 않는다 (크기가 고정이라 붙일
+        # 자리가 없다). 여기서 안 맞으면 조각도 격자에서 벗어난다.
+        for name, value in (("폭", int(canvas[0])), ("높이", int(canvas[1]))):
+            if value % f:
+                bad.append(f"canvas {name}={value} (÷{f} 아님, {(value // f) * f} 권장)")
+    else:
+        long_side = config.pipeline.target_long_side
+        if long_side and long_side % f:
+            near = (long_side // f) * f
+            bad.append(f"target_long_side={long_side} (÷{f} 아님, {near} 권장)")
     if config.pipeline.llm.image_max_side % f:
         near = (config.pipeline.llm.image_max_side // f) * f
         bad.append(f"image_max_side={config.pipeline.llm.image_max_side} (÷{f} 아님, {near} 권장)")
@@ -280,8 +288,29 @@ def describe(config: AppConfig) -> str:
         config.pipeline,
         config.output,
     )
-    long_side = pipe.target_long_side or 0
-    tile_side = int(long_side / max(1, pipe.detect.tiles)) if long_side else 0
+    # canvas 를 쓰면 페이지 크기가 고정이므로 타일 크기를 **추정이 아니라
+    # 실측**할 수 있다. tile_rects 를 그대로 불러서 검산한다 — 여기서 손으로
+    # 나눈 값을 보여주면 실제와 다른 숫자를 확인하고 넘어가게 된다.
+    if pipe.canvas:
+        from .detect import tile_rects
+
+        canvas_w, canvas_h = int(pipe.canvas[0]), int(pipe.canvas[1])
+        long_side = max(canvas_w, canvas_h)
+        rects = tile_rects(
+            canvas_w, canvas_h, pipe.detect.tiles, pipe.detect.overlap,
+            pipe.detect.image_factor,
+        )
+        vertical = canvas_h >= canvas_w
+        tile_side = (
+            round((rects[0][3] - rects[0][1]) * canvas_h)
+            if vertical
+            else round((rects[0][2] - rects[0][0]) * canvas_w)
+        )
+        page_report = f"고정 캔버스 {canvas_w}x{canvas_h}"
+    else:
+        long_side = pipe.target_long_side or 0
+        tile_side = int(long_side / max(1, pipe.detect.tiles)) if long_side else 0
+        page_report = f"긴 변 {pipe.target_long_side or '원본'} (페이지 크기 가변)"
     return "\n".join(
         [
             f"설정 파일   {config.source_path or '(없음 — 기본값 사용)'}",
@@ -304,7 +333,7 @@ def describe(config: AppConfig) -> str:
             + f"  호출 {pipe.detect.tiles * max(1, pipe.detect.samples)}회"
             f"  image_max_side={llm.image_max_side}"
             + (
-                f"  타일 세로 약 {tile_side}px"
+                f"  타일 {tile_side}px"
                 + (" — 축소 없음" if tile_side and tile_side <= llm.image_max_side
                    else " — 축소 발생, 타일을 늘리거나 image_max_side 를 올릴 것")
                 if tile_side
@@ -328,7 +357,7 @@ def describe(config: AppConfig) -> str:
             f"  업샘플 x{pipe.locate.upscale}"
             f"  기하 fallback={'ON' if pipe.locate.geometry_fallback else 'OFF'}",
             f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}",
-            f"전처리      긴 변 {pipe.target_long_side or '원본'}"
+            f"전처리      {page_report}"
             f"  deskew={'ON' if pipe.deskew else 'OFF'}",
             f"출력        {out.out_dir}  이미지={'ON' if out.write_image else 'OFF'}",
         ]
