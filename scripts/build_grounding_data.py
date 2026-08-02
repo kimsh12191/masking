@@ -275,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         default=20,
         help="검수용 오버레이를 앞에서 N개 저장 (0 이면 끔)",
     )
-    ap.add_argument("--text-min-conf", type=float, default=0.9)
+    ap.add_argument("--text-min-conf", type=float, default=None)
     ap.add_argument(
         "--no-textless",
         action="store_true",
@@ -283,14 +283,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--aug-scales",
-        default="1.5,2.0",
+        default=None,
         help="스케일 증강 배율 (쉼표 구분). 타일과 같은 종횡비의 더 작은 영역을 "
         "잘라 타일 크기로 확대한다 — **입력 크기는 고정, 글자 크기만 커진다.** "
         "빈 문자열이면 증강 없음",
     )
     ap.add_argument(
         "--query-ratio",
-        default="0.25,1.0",
+        default=None,
         help="한 샘플에서 물을 값의 비율 구간 '최소,최대'. 매번 이 안에서 뽑는다. "
         "**전부 묻지 않는 것이 중요하다** — 추론에서는 텍스트가 수십 줄이어도 "
         "개인정보 몇 개만 답해야 하므로, 항상 전부를 물으면 모델이 "
@@ -299,14 +299,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--read-ratio",
         type=float,
-        default=0.0,
+        default=None,
         help="빈 항목(도장·손글씨)이 있는 영역에서 'read' 과제도 낼 확률. "
         "**기본은 0 (locate 만)** — 좌표 능력은 내용과 무관해서 글자로 배운 것이 "
         "도장에도 쓰이고, 서명 블록은 원래 커서 32px 오차의 비중이 작다. "
         "과제를 둘로 늘리면 '가끔 text 를 빈 문자열로 낸다' 까지 배우는데 그게 "
         "추론으로 새면 손해다. 학습 후 서명 좌표가 실제로 나쁘면 그때 켤 것",
     )
-    ap.add_argument("--seed", type=int, default=0, help="증강 위치·과제 선택 난수 시드")
+    ap.add_argument("--seed", type=int, default=None, help="증강 위치·질의 추출 난수 시드")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -315,11 +315,23 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(message)s",
     )
 
-    cfg = load_config(args.config).pipeline if args.config else PipelineConfig()
-    gcfg = GroundingConfig(
-        text_min_conf=args.text_min_conf,
-        keep_textless=not args.no_textless,
-    )
+    # 설정 파일이 기본, CLI 가 덮는다 (준 것만). 학습 설정이 서빙 설정과 **같은
+    # 파일**에 있는 것이 핵심이다 — 캔버스·타일이 갈리면 틀린 좌표를 학습시킨다.
+    app = load_config(args.config)
+    cfg, gcfg = app.pipeline, app.grounding
+    if args.text_min_conf is not None:
+        gcfg.text_min_conf = args.text_min_conf
+    if args.no_textless:
+        gcfg.keep_textless = False
+    if args.aug_scales is not None:
+        gcfg.aug_scales = [float(v) for v in args.aug_scales.split(",") if v.strip()]
+    if args.query_ratio is not None:
+        lo, _, hi = args.query_ratio.partition(",")
+        gcfg.query_ratio = (float(lo), float(hi or lo))
+    if args.read_ratio is not None:
+        gcfg.read_ratio = args.read_ratio
+    if args.seed is not None:
+        gcfg.seed = args.seed
 
     out_dir = Path(args.out)
     tiles_dir = out_dir / "tiles"
@@ -327,10 +339,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.overlay:
         (out_dir / "overlay").mkdir(exist_ok=True)
 
-    scales = [float(s) for s in args.aug_scales.split(",") if s.strip()]
-    lo, _, hi = args.query_ratio.partition(",")
-    query_ratio = (float(lo), float(hi or lo))
-    rng = random.Random(args.seed)
+    scales = [float(v) for v in gcfg.aug_scales]
+    query_ratio = tuple(gcfg.query_ratio)
+    rng = random.Random(gcfg.seed)
     ocr = PaddleOcrRunner(cfg.ocr)
 
     n_pages = n_samples = n_items = n_textless = n_aug = 0
@@ -386,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "target": {"findings": sample.locate_items(query)},
                             }
                         )
-                    if sample.n_textless and rng.random() < args.read_ratio:
+                    if sample.n_textless and rng.random() < gcfg.read_ratio:
                         rows.append(
                             {"task": "read", "target": {"findings": sample.items}}
                         )

@@ -52,6 +52,7 @@ LLM 이 ``q_proj``/``k_proj`` 인 반면 ViT 는 ``qkv`` 로 합쳐져 있고 �
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import sys
@@ -61,6 +62,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from pii_pipeline.config import load_config  # noqa: E402
+from pii_pipeline.train.config import TrainConfig  # noqa: E402
 from pii_pipeline.train.sft import (  # noqa: E402
     IGNORE_INDEX,
     TOKEN_AXIS_KEYS,
@@ -75,20 +78,6 @@ from pii_pipeline.train.sft import (  # noqa: E402
 
 log = logging.getLogger("train_grounding")
 
-#: LoRA 를 걸 선형층. Qwen 계열 트랜스포머 블록의 표준 이름이다.
-DEFAULT_LORA_TARGETS = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
-
-#: 전체 학습할 비전 merger 모듈. **32px 토큰 격자 아래의 정밀도가 여기 걸린다.**
-#: 모델 구현에 따라 이름이 다르므로 ``--list-modules`` 로 확인할 것.
-DEFAULT_MERGER = "visual.merger"
 
 
 # --------------------------------------------------------------------------
@@ -230,15 +219,7 @@ def load_model(model_id: str, dtype: str, device_map: str | None = None) -> tupl
     return model, processor
 
 
-def attach_lora(
-    model: Any,
-    rank: int,
-    alpha: int,
-    dropout: float,
-    merger: str | None,
-    vision_prefix: str = "visual",
-    vision_blocks: int = 0,
-) -> Any:
+def attach_lora(model: Any, tc: TrainConfig) -> Any:
     """LoRA 를 걸고, merger 는 전체 학습 대상으로 올린다.
 
     세 부위를 따로 다룬다.
@@ -254,16 +235,17 @@ def attach_lora(
     import torch.nn as nn  # type: ignore[import-not-found]
     from peft import LoraConfig, get_peft_model  # type: ignore[import-not-found]
 
-    targets = list(DEFAULT_LORA_TARGETS)
+    targets = list(tc.lora_targets)
+    merger = tc.merger_module if tc.train_merger else None
 
-    if vision_blocks > 0:
+    if tc.vision_blocks > 0:
         linear_names = [
             name for name, module in model.named_modules() if isinstance(module, nn.Linear)
         ]
-        picked = select_vision_blocks(linear_names, vision_prefix, vision_blocks)
+        picked = select_vision_blocks(linear_names, tc.vision_prefix, tc.vision_blocks)
         if not picked:
             raise ValueError(
-                f"비전 타워 '{vision_prefix}' 에서 블록 선형층을 찾지 못했습니다. "
+                f"비전 타워 '{tc.vision_prefix}' 에서 블록 선형층을 찾지 못했습니다. "
                 f"--list-modules 로 실제 접두사를 확인하고 --vision-prefix 로 "
                 f"지정하거나, --vision-blocks 0 으로 끄세요."
             )
@@ -283,9 +265,9 @@ def attach_lora(
         log.info("merger 전체 학습: %s (하위 모듈 %d개)", merger, len(found))
 
     config = LoraConfig(
-        r=rank,
-        lora_alpha=alpha,
-        lora_dropout=dropout,
+        r=tc.rank,
+        lora_alpha=tc.alpha,
+        lora_dropout=tc.dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=targets,
@@ -369,28 +351,31 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Qwen3-VL 좌표 LoRA 학습")
     ap.add_argument("--data", required=True, help="build_grounding_data.py 의 data.jsonl")
     ap.add_argument("-o", "--out", default="out/lora", help="어댑터 저장 경로")
-    ap.add_argument("--model", default="Qwen/Qwen3.5-9B", help="베이스 모델 (서빙과 같아야 한다)")
-    ap.add_argument("--epochs", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--batch", type=int, default=1)
-    ap.add_argument("--grad-accum", type=int, default=8)
-    ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--alpha", type=int, default=32)
-    ap.add_argument("--dropout", type=float, default=0.05)
-    ap.add_argument("--max-len", type=int, default=8192)
-    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
-    ap.add_argument("--merger-module", default=DEFAULT_MERGER)
+    ap.add_argument("--config", "-c", default=None, help="YAML 설정 (서빙과 같은 것)")
+    ap.add_argument("--model", default=None, help="베이스 모델 (서빙과 같아야 한다)")
+    # 기본값은 전부 설정 파일(train 섹션)에서 온다. 여기 default 가 None 인 것은
+    # **준 것만 덮기** 위해서다 — argparse 기본값을 두면 설정 파일을 항상 무시한다.
+    ap.add_argument("--epochs", type=float, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--batch", type=int, default=None)
+    ap.add_argument("--grad-accum", type=int, default=None)
+    ap.add_argument("--rank", type=int, default=None)
+    ap.add_argument("--alpha", type=int, default=None)
+    ap.add_argument("--dropout", type=float, default=None)
+    ap.add_argument("--max-len", type=int, default=None)
+    ap.add_argument("--dtype", default=None, choices=["bf16", "fp16", "fp32"])
+    ap.add_argument("--merger-module", default=None)
     ap.add_argument(
         "--vision-blocks",
         type=int,
-        default=0,
+        default=None,
         help="비전 인코더(ViT)의 **상위 N개 블록**에 LoRA 를 건다. 0 이면 ViT 동결. "
         "merger 만으로 32px 격자 아래로 못 내려가면 여기를 연다 — 다만 "
         "**merger 만 열고 먼저 재 볼 것.** 한꺼번에 열면 뭐가 들었는지 모른다",
     )
     ap.add_argument(
         "--vision-prefix",
-        default="visual",
+        default=None,
         help="비전 타워 모듈 접두사. --list-modules 로 확인",
     )
     ap.add_argument(
@@ -399,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         help="merger 를 동결한다. 32px 토큰 격자 아래로는 못 내려간다 — A/B 비교용",
     )
     ap.add_argument("--merge", default=None, help="학습 후 머지해 저장할 경로 (서빙용)")
-    ap.add_argument("--workers", type=int, default=4, help="데이터로더 워커 (이미지 전처리)")
+    ap.add_argument("--workers", type=int, default=None, help="데이터로더 워커 (이미지 전처리)")
     ap.add_argument(
         "--max-samples",
         type=int,
@@ -410,13 +395,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="데이터·프롬프트·마스킹만 확인")
     ap.add_argument("--dry-run-index", type=int, default=0)
     ap.add_argument("--list-modules", action="store_true", help="모듈 이름 출력 후 종료")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    # 설정 파일(train 섹션)이 기본, CLI 가 덮는다 (준 것만).
+    tc = load_config(args.config).train
+    for name in (
+        "model", "epochs", "lr", "batch", "grad_accum", "rank", "alpha", "dropout",
+        "max_len", "dtype", "merger_module", "vision_blocks", "vision_prefix",
+        "workers", "seed",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(tc, name, value)
+    if args.no_merger:
+        tc.train_merger = False
+
     if args.list_modules:
-        model, _ = load_model(args.model, args.dtype, device_map="auto")
+        model, _ = load_model(tc.model, tc.dtype, device_map="auto")
         for name, _ in model.named_modules():
             print(name)
         return 0
@@ -429,20 +427,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.dry_run:
-        return dry_run(examples, args.model, args.dry_run_index)
+        return dry_run(examples, tc.model, args.dry_run_index)
 
     from transformers import Trainer, TrainingArguments  # type: ignore[import-not-found]
 
-    model, processor = load_model(args.model, args.dtype)
-    model = attach_lora(
-        model,
-        args.rank,
-        args.alpha,
-        args.dropout,
-        None if args.no_merger else args.merger_module,
-        vision_prefix=args.vision_prefix,
-        vision_blocks=args.vision_blocks,
-    )
+    model, processor = load_model(tc.model, tc.dtype)
+    model = attach_lora(model, tc)
 
     # gradient checkpointing + LoRA 의 고전적인 함정. 베이스가 전부 동결이라
     # 체크포인트 구간 입력에 grad_fn 이 없고, 역전파가
@@ -451,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    dataset = GroundingDataset(examples, processor, args.max_len)
+    dataset = GroundingDataset(examples, processor, tc.max_len)
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is None:
         pad_id = processor.tokenizer.eos_token_id
@@ -465,20 +455,20 @@ def main(argv: list[str] | None = None) -> int:
         model=model,
         args=TrainingArguments(
             output_dir=args.out,
-            num_train_epochs=args.epochs,
-            learning_rate=args.lr,
-            per_device_train_batch_size=args.batch,
-            gradient_accumulation_steps=args.grad_accum,
+            num_train_epochs=tc.epochs,
+            learning_rate=tc.lr,
+            per_device_train_batch_size=tc.batch,
+            gradient_accumulation_steps=tc.grad_accum,
             gradient_checkpointing=True,
             # reentrant 방식은 PEFT 와 섞였을 때 일부 파라미터의 grad 를 흘린다.
             gradient_checkpointing_kwargs={"use_reentrant": False},
-            bf16=args.dtype == "bf16",
-            fp16=args.dtype == "fp16",
+            bf16=tc.dtype == "bf16",
+            fp16=tc.dtype == "fp16",
             logging_steps=10,
             save_strategy="epoch",
             report_to=[],
-            seed=args.seed,
-            dataloader_num_workers=args.workers,
+            seed=tc.seed,
+            dataloader_num_workers=tc.workers,
             # pixel_values 는 모델 시그니처에 없는 이름일 수 있다. 끄지 않으면
             # Trainer 가 조용히 버리고 모델이 이미지를 못 본다.
             remove_unused_columns=False,
@@ -492,7 +482,8 @@ def main(argv: list[str] | None = None) -> int:
     model.save_pretrained(out_dir)
     processor.save_pretrained(out_dir)
     (out_dir / "train_args.json").write_text(
-        json.dumps(vars(args), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps({"args": vars(args), "train": dataclasses.asdict(tc)},
+                   ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"\n어댑터 저장: {out_dir}")
 

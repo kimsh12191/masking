@@ -121,6 +121,13 @@ class GroundingConfig:
         min_items: 이 개수 미만이면 샘플을 버린다. 빈 타일만 잔뜩 배우면
             "아무것도 없다" 로 답하는 쪽이 쉬워진다.
         min_side_px: 이보다 작은 박스는 버린다. 노이즈 검출이다.
+        aug_scales: 스케일 증강 배율 (``scale_regions``). 같은 배율을 두 번
+            적으면 위치가 다른 영역이 두 개 나온다.
+        query_ratio: 한 샘플에서 물을 값의 비율 구간 ``(최소, 최대)``.
+            **전부 묻지 않는 것이 중요하다** (``sample_query`` 참조).
+        read_ratio: 빈 항목(도장·손글씨)이 있는 영역에서 ``read`` 과제도 낼 확률.
+            기본 0 — 좌표 능력은 내용과 무관해서 글자로 배운 것이 도장에도 쓰인다.
+        seed: 증강 위치·질의 추출의 난수 시드. 같은 시드면 같은 데이터셋이다.
     """
 
     text_min_conf: float = 0.9
@@ -129,6 +136,10 @@ class GroundingConfig:
     max_items: int = 32
     min_items: int = 1
     min_side_px: int = 6
+    aug_scales: list[float] = field(default_factory=lambda: [1.5, 2.0])
+    query_ratio: tuple[float, float] = (0.25, 1.0)
+    read_ratio: float = 0.0
+    seed: int = 0
 
 
 @dataclass

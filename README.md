@@ -102,6 +102,14 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA �
 pip install -r requirements-train.txt
 ```
 
+> **설정은 추론과 같은 파일에 있다** — `config/default.yaml` 의 `grounding:`
+> (데이터 생성) 과 `train:` (LoRA) 섹션. 전체 주석이 붙어 있고, 아래 CLI 플래그는
+> 그 값을 **일회성으로 덮는 용도**다.
+>
+> 같은 파일에 둔 이유는 결합 때문이다. 위쪽 `pipeline.canvas` 와 `detect.tiles` 가
+> **학습과 추론 양쪽의 기하를 동시에 정한다.** 따로 두면 갈리기 쉽고, 갈리면
+> 틀린 좌표를 학습시키는데 에러도 안 난다.
+
 ### ① 이미지 → 라벨 (사람 라벨 0건)
 
 ```bash
@@ -290,6 +298,8 @@ pipeline.canvas   detect.tiles   detect.overlap   detect.image_factor   llm.imag
 | `locate.upscale` | 2.0 | 작은 글씨 인식률 |
 | `ocr.gpu_id` | 0 | vLLM 과 카드를 나눌 때 |
 | `pipeline.canvas` | [1760, 2464] | **고정 캔버스.** 모든 페이지가 이 크기. `image_factor`(32)의 배수로 |
+| `grounding.*` | | 학습 데이터 생성 (추론에서는 안 읽는다) |
+| `train.*` | | LoRA 학습 (추론에서는 안 읽는다) |
 
 ---
 

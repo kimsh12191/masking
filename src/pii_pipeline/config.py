@@ -27,6 +27,8 @@ from .llm.client import LlmConfig
 from .locate import LocateConfig
 from .ocr.paddle_runner import OcrConfig, parse_gpu_id
 from .pipeline import PipelineConfig
+from .train.config import TrainConfig
+from .train.dataset import GroundingConfig
 from .verify import VerifyConfig
 
 log = logging.getLogger(__name__)
@@ -67,10 +69,20 @@ class OutputConfig:
 
 @dataclass
 class AppConfig:
-    """파이프라인 + 산출물 설정 묶음."""
+    """파이프라인 + 산출물 + 학습 설정 묶음.
+
+    학습 설정(``grounding`` / ``train``)이 여기 함께 있는 것은 의도한 것이다.
+    학습 데이터를 서빙과 다른 캔버스·타일로 만들면 **틀린 좌표를 학습시키는데**
+    에러도 안 나고 결과만 나빠진다. 같은 파일에 있어야 그 결합이 눈에 보인다.
+    추론 런타임은 ``pipeline`` 만 읽으므로 부담도 없다.
+    """
 
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    #: 학습 데이터 생성 (scripts/build_grounding_data.py)
+    grounding: GroundingConfig = field(default_factory=GroundingConfig)
+    #: LoRA 학습 (scripts/train_grounding.py)
+    train: TrainConfig = field(default_factory=TrainConfig)
     #: 실제로 읽은 설정 파일 경로 (없으면 None). 로그/감사용.
     source_path: Path | None = None
 
@@ -154,7 +166,11 @@ def read_yaml(path: Path) -> dict[str, Any]:
 #: YAML 최상위 섹션. ``ocr``/``llm``/``detect``/``locate``/``verify`` 는 코드상
 #: ``PipelineConfig`` 안에 있지만, 설정 파일에서는 평평하게 두는 편이 읽기 쉬워
 #: 최상위로 뺀다. 섹션 이름이 파이프라인 단계 이름과 1:1 이다.
-SECTIONS = ("pipeline", "ocr", "llm", "detect", "locate", "verify", "output")
+SECTIONS = (
+    "pipeline", "ocr", "llm", "detect", "locate", "verify", "output",
+    # 추론에는 쓰이지 않는다. 학습 스크립트만 읽는다.
+    "grounding", "train",
+)
 
 
 def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConfig:
@@ -180,6 +196,8 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             verify=VerifyConfig(),
         ),
         output=OutputConfig(),
+        grounding=GroundingConfig(),
+        train=TrainConfig(),
     )
 
     # ② 설정 파일
@@ -200,6 +218,8 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             "locate": config.pipeline.locate,
             "verify": config.pipeline.verify,
             "output": config.output,
+            "grounding": config.grounding,
+            "train": config.train,
         }
         for section in SECTIONS:
             values = data.get(section) or {}
