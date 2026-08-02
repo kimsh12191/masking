@@ -23,14 +23,32 @@ next-token 예측을 돌리는 것이 전부다.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..llm.prompts import SYSTEM_GROUNDING, USER_GROUNDING
+from ..llm.prompts import (
+    SYSTEM_GROUNDING,
+    SYSTEM_LOCATE,
+    USER_GROUNDING,
+    build_locate_user,
+)
 
 #: 손실에서 제외할 라벨 값 (PyTorch cross-entropy 의 기본 ``ignore_index``).
 IGNORE_INDEX = -100
+
+#: 과제 두 종류.
+#:
+#: ==========  ==========================================================
+#: ``locate``  **기본이자 사실상 유일한 과제.** 값을 주고 위치만 묻는다.
+#:             손실이 거의 전부 좌표에 걸리고, OCR 오독이 정답에 섞이지 않는다
+#: ``read``    전부 읽고 위치까지. 도장·손글씨처럼 지목할 텍스트가 없는 영역을
+#:             가르칠 수 있지만 **기본으로 만들지 않는다** — 좌표 능력은 내용과
+#:             무관해서 글자로 배운 것이 도장에도 쓰이고, 과제를 둘로 늘리면
+#:             "가끔 text 를 빈 문자열로 낸다" 까지 배운다.
+#:             ``build_grounding_data.py --read-ratio`` 로 켠다
+#: ==========  ==========================================================
+TASKS = ("locate", "read")
 
 #: **토큰 축을 갖는** 입력 키. 배치에서 길이를 맞춰 패딩해야 하는 것들이다.
 #:
@@ -70,6 +88,10 @@ class Example:
     target: dict[str, Any]
     #: 재현·디버깅용. 학습에는 쓰지 않는다.
     meta: dict[str, Any]
+    #: ``TASKS`` 중 하나.
+    task: str = "locate"
+    #: ``locate`` 과제에서 위치를 물을 값들 (중복 없음).
+    query: list[str] = field(default_factory=list)
 
     @property
     def answer(self) -> str:
@@ -107,8 +129,24 @@ def load_jsonl(path: str | Path) -> list[Example]:
             image = root / row["image"]
             if not image.is_file():
                 raise FileNotFoundError(f"{jsonl}:{lineno} 의 이미지가 없습니다: {image}")
+            task = row.get("task", "locate")
+            if task not in TASKS:
+                raise ValueError(
+                    f"{jsonl}:{lineno} 의 task 가 잘못되었습니다: {task!r} "
+                    f"({' / '.join(TASKS)} 중 하나)"
+                )
+            if task == "locate" and not row.get("query"):
+                # 질문이 비면 "아무것도 안 물었는데 답하라" 가 되어, 모델이
+                # 질문에 없는 것을 지어내도록 배운다.
+                raise ValueError(f"{jsonl}:{lineno} 의 locate 샘플에 query 가 없습니다")
             out.append(
-                Example(image_path=image, target=row["target"], meta=row.get("meta", {}))
+                Example(
+                    image_path=image,
+                    target=row["target"],
+                    meta=row.get("meta", {}),
+                    task=task,
+                    query=row.get("query", []),
+                )
             )
     return out
 
@@ -122,13 +160,18 @@ def build_messages(example: Example) -> tuple[list[dict[str, Any]], str]:
         그 뒤에 정답을 이어 붙인다. 이래야 정답 시작 위치가 **정의상** 정확하다
         (문자열을 붙여 놓고 나중에 찾으면 토크나이저 경계에서 어긋난다).
     """
+    if example.task == "locate":
+        system, user = SYSTEM_LOCATE, build_locate_user(example.query)
+    else:
+        system, user = SYSTEM_GROUNDING, USER_GROUNDING
+
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_GROUNDING}]},
+        {"role": "system", "content": [{"type": "text", "text": system}]},
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": USER_GROUNDING},
+                {"type": "text", "text": user},
             ],
         },
     ]
@@ -170,6 +213,52 @@ def mask_prompt(
     return [ignore_index] * prompt_len + list(input_ids[prompt_len:])
 
 
+def select_vision_blocks(
+    linear_names: list[str], prefix: str, last_n: int
+) -> list[str]:
+    """비전 타워의 **상위 ``last_n`` 개 블록** 안에 있는 선형층 이름을 고른다.
+
+    LoRA 대상 이름을 하드코딩할 수 없어서 필요한 함수다. Qwen 계열은 LLM 이
+    ``q_proj``/``k_proj``... 인데 ViT 는 ``qkv`` 로 합쳐져 있고, 그마저도 버전마다
+    다르다 (2.5-VL 은 MLP 가 ``fc1``/``fc2``, 그 뒤로는 SwiGLU 로 바뀌었다).
+    그래서 이름을 짐작하지 않고 **모델에서 찾아** 전체 경로로 지정한다.
+
+    상위 블록만 여는 이유는 하위 블록이 선·획 같은 저수준 특징을 담당해서
+    좌표 과제로 흔들 이유가 없고, 흔들면 전사 능력까지 함께 흔들리기 때문이다.
+
+    블록 번호가 없는 모듈(``patch_embed``, ``merger``)은 제외한다 — merger 는
+    LoRA 가 아니라 전체 학습으로 따로 다룬다.
+
+    Args:
+        linear_names: 모델의 선형층 전체 이름 목록.
+        prefix: 비전 타워 접두사 (Qwen 은 ``"visual"``).
+        last_n: 뒤에서 몇 개 블록을 열지. 0 이면 열지 않는다.
+
+    Returns:
+        LoRA 를 걸 모듈의 **전체 경로** 목록. 접미사가 아니라 전체 경로라야
+        같은 이름의 다른 블록이 딸려오지 않는다.
+    """
+    if last_n <= 0:
+        return []
+
+    import re
+
+    block_re = re.compile(r"(?:^|\.)blocks\.(\d+)\.")
+    by_block: dict[int, list[str]] = {}
+    for name in linear_names:
+        if not name.startswith(prefix):
+            continue
+        match = block_re.search(name)
+        if match is None:
+            continue
+        by_block.setdefault(int(match.group(1)), []).append(name)
+
+    if not by_block:
+        return []
+    keep = sorted(by_block)[-last_n:]
+    return [name for index in keep for name in by_block[index]]
+
+
 def summarize(examples: list[Example]) -> dict[str, Any]:
     """학습 전 데이터 점검용 통계. **돌리기 전에 눈으로 볼 것.**"""
     n_items = sum(len(e.target.get("findings", [])) for e in examples)
@@ -180,8 +269,12 @@ def summarize(examples: list[Example]) -> dict[str, Any]:
         if not f.get("text")
     )
     lengths = [len(e.answer) for e in examples]
+    by_task: dict[str, int] = {}
+    for e in examples:
+        by_task[e.task] = by_task.get(e.task, 0) + 1
     return {
         "samples": len(examples),
+        "by_task": by_task,
         "items": n_items,
         "items_per_sample": round(n_items / max(1, len(examples)), 1),
         "textless_items": n_textless,

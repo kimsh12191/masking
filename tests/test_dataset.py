@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from pii_pipeline.detect import tile_rects
@@ -19,6 +21,8 @@ from pii_pipeline.train.dataset import (
     GroundingConfig,
     build_tile_sample,
     quantization_limit,
+    sample_query,
+    scale_regions,
     roundtrip,
     to_permille,
 )
@@ -191,3 +195,179 @@ class TestSampleShape:
         assert set(payload) == {"findings"}
         assert set(payload["findings"][0]) == {"text", "bbox_2d"}
         assert len(payload["findings"][0]["bbox_2d"]) == 4
+
+
+class TestScaleRegions:
+    """입력 크기는 고정, **글자 크기만** 달라지게 하는 증강.
+
+    캔버스를 고정해도 문서마다 폰트 크기가 다르다. 추론 타일 하나의 스케일만
+    학습하면 그보다 작거나 큰 글씨에서 좌표가 흔들린다.
+    """
+
+    PAGE_W, PAGE_H = 1760, 2464
+    TILE = (0.0, 0.0, 1.0, 960 / 2464)
+
+    def regions(self, scales: list[float], seed: int = 0) -> list[tuple]:
+        return scale_regions(
+            self.TILE, self.PAGE_W, self.PAGE_H, scales, random.Random(seed)
+        )
+
+    def test_aspect_ratio_matches_the_tile(self) -> None:
+        """종횡비가 다르면 타일 크기로 늘릴 때 글자가 찌그러진다."""
+        tile_ar = (self.TILE[2] - self.TILE[0]) * self.PAGE_W / (
+            (self.TILE[3] - self.TILE[1]) * self.PAGE_H
+        )
+        for r in self.regions([1.5, 2.0, 2.5]):
+            ar = (r[2] - r[0]) * self.PAGE_W / ((r[3] - r[1]) * self.PAGE_H)
+            assert ar == pytest.approx(tile_ar, rel=1e-6)
+
+    def test_higher_scale_means_a_smaller_region(self) -> None:
+        """작은 영역을 타일 크기로 키우니 글자가 그만큼 커 보인다."""
+        r15, r20 = self.regions([1.5, 2.0])
+        assert (r20[3] - r20[1]) < (r15[3] - r15[1])
+
+    def test_regions_stay_inside_the_page(self) -> None:
+        for r in self.regions([1.5, 2.0, 3.0], seed=7):
+            assert 0.0 <= r[0] < r[2] <= 1.0
+            assert 0.0 <= r[1] < r[3] <= 1.0
+
+    def test_scale_one_or_less_is_skipped(self) -> None:
+        """타일이 이미 페이지 폭 전체다. 더 넓은 영역은 없다."""
+        assert self.regions([1.0, 0.5]) == []
+
+    def test_deterministic_for_a_given_seed(self) -> None:
+        """같은 시드면 같은 데이터셋이어야 재현이 된다."""
+        assert self.regions([1.5, 2.0], seed=3) == self.regions([1.5, 2.0], seed=3)
+
+    def test_labels_survive_the_roundtrip_in_an_augmented_region(self) -> None:
+        """증강 영역에서도 좌표가 추론 경로로 정확히 복원되어야 한다."""
+        boxes = [box("강동혁", 300, 200, 480, 250), box("서울시", 300, 400, 520, 450)]
+        for rect in self.regions([2.0], seed=1):
+            sample = build_tile_sample(boxes, -1, rect, self.PAGE_W, self.PAGE_H)
+            if sample is None:
+                continue
+            limit = quantization_limit(rect, self.PAGE_W, self.PAGE_H) + 1.0
+            assert sample.max_error_px <= limit
+
+
+class TestLocateTask:
+    """값을 주고 위치만 묻는 주 과제 — 질문은 중복 제거, 답은 모든 출현."""
+
+    def sample(self, boxes: list) -> object:
+        return build_tile_sample(boxes, 0, (0.0, 0.0, 1.0, 1.0), PAGE_W, PAGE_H)
+
+    def test_query_drops_duplicates(self) -> None:
+        """질문에 두 번 적으면 '두 번 물었으니 두 개' 를 배운다. 추론에서는
+        값이 몇 번 나오는지 아무도 모르므로 쓸 수 없는 규칙이다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("강동혁", 100, 300, 200, 340),
+            box("서울시", 100, 500, 220, 540),
+        ])
+        assert s.query() == ["강동혁", "서울시"]
+
+    def test_answer_keeps_every_occurrence(self) -> None:
+        """한 곳만 답하면 나머지 출현이 마스킹되지 않는다 — 가장 흔한 실패다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("강동혁", 100, 300, 200, 340),
+        ])
+        assert len(s.query()) == 1
+        assert len(s.locate_items()) == 2
+        assert {tuple(i["bbox_2d"]) for i in s.locate_items()}.__len__() == 2
+
+    def test_query_keeps_first_seen_order(self) -> None:
+        s = self.sample([
+            box("나중", 100, 500, 200, 540),
+            box("먼저", 100, 100, 200, 140),
+        ])
+        # items 는 읽기 순서로 정렬되므로 위쪽이 먼저다
+        assert s.query() == ["먼저", "나중"]
+
+    def test_textless_boxes_are_not_asked_or_answered(self) -> None:
+        """도장·손글씨는 지목할 텍스트가 없다. 묻지 않은 것을 답하라고 가르치면
+        모델이 질문에 없는 것을 지어낸다."""
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("", 100, 300, 200, 340, status=OcrStatus.FAILED, conf=0.1),
+        ])
+        assert s.query() == ["강동혁"]
+        assert len(s.locate_items()) == 1
+        assert len(s.items) == 2  # read 과제용으로는 남아 있다
+
+
+class TestSampleQuery:
+    """전부 묻지 않는다.
+
+    추론에서는 페이지에 텍스트가 수십 줄이어도 개인정보 몇 개만 답해야 한다.
+    학습에서 항상 "전부" 를 물으면 모델이 *"보이는 것을 다 답한다"* 를 배우고,
+    질문에 없는 것을 무시하는 연습을 한 번도 못 한다.
+    """
+
+    TEXTS = [f"값{i}" for i in range(10)]
+
+    def test_asks_for_a_subset(self) -> None:
+        picked = sample_query(self.TEXTS, random.Random(0), (0.3, 0.5))
+        assert 3 <= len(picked) <= 5
+        assert set(picked) <= set(self.TEXTS)
+
+    def test_full_ratio_asks_everything(self) -> None:
+        picked = sample_query(self.TEXTS, random.Random(0), (1.0, 1.0))
+        assert sorted(picked) == sorted(self.TEXTS)
+
+    def test_never_empty_when_there_is_text(self) -> None:
+        """질문이 비면 '아무것도 안 물었는데 답하라' 가 된다."""
+        for seed in range(20):
+            assert sample_query(["하나"], random.Random(seed), (0.01, 0.1))
+
+    def test_no_duplicates(self) -> None:
+        picked = sample_query(self.TEXTS, random.Random(3), (0.8, 1.0))
+        assert len(picked) == len(set(picked))
+
+    def test_order_is_shuffled(self) -> None:
+        """질문이 항상 읽기 순서면 '질문 순서대로 답한다' 로 배울 수 있다."""
+        orders = {
+            tuple(sample_query(self.TEXTS, random.Random(s), (1.0, 1.0)))
+            for s in range(10)
+        }
+        assert len(orders) > 1
+
+    def test_deterministic_for_a_given_seed(self) -> None:
+        a = sample_query(self.TEXTS, random.Random(5), (0.3, 0.9))
+        b = sample_query(self.TEXTS, random.Random(5), (0.3, 0.9))
+        assert a == b
+
+    def test_empty_input(self) -> None:
+        assert sample_query([], random.Random(0), (0.5, 1.0)) == []
+
+
+class TestAnswerFollowsTheQuery:
+    def sample(self, boxes: list) -> object:
+        return build_tile_sample(boxes, 0, (0.0, 0.0, 1.0, 1.0), PAGE_W, PAGE_H)
+
+    def test_unqueried_values_are_left_out(self) -> None:
+        """묻지 않은 것을 답하면 '이미지에 있으면 다 답한다' 를 가르치게 된다."""
+        s = self.sample([
+            box("물어본값", 100, 100, 200, 140),
+            box("안물어본값", 100, 300, 250, 340),
+        ])
+        got = s.locate_items(["물어본값"])
+        assert [i["text"] for i in got] == ["물어본값"]
+
+    def test_all_occurrences_of_a_queried_value_are_kept(self) -> None:
+        s = self.sample([
+            box("강동혁", 100, 100, 200, 140),
+            box("다른값", 100, 300, 200, 340),
+            box("강동혁", 100, 500, 200, 540),
+        ])
+        got = s.locate_items(["강동혁"])
+        assert len(got) == 2
+
+    def test_answer_stays_in_reading_order(self) -> None:
+        """질문 순서가 아니라 읽기 순서다."""
+        s = self.sample([
+            box("위", 100, 100, 200, 140),
+            box("아래", 100, 500, 200, 540),
+        ])
+        got = s.locate_items(["아래", "위"])  # 질문은 역순
+        assert [i["text"] for i in got] == ["위", "아래"]

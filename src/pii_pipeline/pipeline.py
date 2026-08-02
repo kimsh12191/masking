@@ -50,7 +50,13 @@ class PipelineConfig:
     """파이프라인 설정.
 
     Attributes:
-        target_long_side: 전처리 시 긴 변 목표 길이. 결과 좌표계의 기준이 된다.
+        canvas: ``(폭, 높이)`` **고정 캔버스.** 주면 모든 페이지가 정확히 이
+            크기가 되고 ``target_long_side`` 는 무시된다. 종횡비를 지키며
+            확대·축소한 뒤 오른쪽·아래를 흰색으로 채운다.
+
+            **좌표 학습을 하려면 이쪽이다.** 페이지가 고정이라야 타일도 고정이고,
+            모델이 상대할 기하가 하나뿐이다. ``detect.image_factor`` 의 배수로 둘 것.
+        target_long_side: 전처리 시 긴 변 목표 길이. ``canvas`` 가 있으면 무시된다.
             높이면 크롭 해상도가 올라가지만 VLM 입력도 커진다 (타일링이 이를
             흡수한다 — ``DetectConfig.tiles`` 참조).
             **``detect.image_factor`` 의 배수로 둘 것.** A4 300dpi 는 2480 이지만
@@ -64,6 +70,7 @@ class PipelineConfig:
         verify: ④ 검증 설정.
     """
 
+    canvas: tuple[int, int] | None = (1760, 2464)
     target_long_side: int | None = 2464
     deskew: bool = True
     ocr: OcrConfig = field(default_factory=OcrConfig.from_env)
@@ -125,6 +132,7 @@ class PiiPipeline:
                     image,
                     target_long_side=cfg.target_long_side,
                     deskew=cfg.deskew,
+                    canvas=cfg.canvas,
                     align=cfg.detect.image_factor,
                 )
             else:
@@ -132,6 +140,7 @@ class PiiPipeline:
                     image_path,
                     target_long_side=cfg.target_long_side,
                     deskew=cfg.deskew,
+                    canvas=cfg.canvas,
                     align=cfg.detect.image_factor,
                 )
 

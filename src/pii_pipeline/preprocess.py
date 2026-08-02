@@ -58,17 +58,19 @@ def preprocess(
     target_long_side: int | None = 2464,
     deskew: bool = True,
     align: int = 32,
+    canvas: tuple[int, int] | None = None,
 ) -> PreprocessResult:
     """이미지 파일을 읽어 OCR 에 적합한 형태로 정규화한다.
 
     Args:
         image_path: 입력 이미지 경로.
-        target_long_side: 긴 변 목표 길이. **``align`` 의 배수로 둘 것** —
-            A4 300dpi 는 2480 이지만 32 의 배수가 아니라 2464(=32×77)를 쓴다.
-            ``None`` 이면 원본 유지. **확대는 하지 않는다** (없는 정보를 만들지 않음).
+        target_long_side: 긴 변 목표 길이. ``canvas`` 를 주면 무시된다.
         deskew: 기울기 보정 여부.
         align: 이 값의 배수가 되도록 오른쪽·아래에 흰 여백을 붙인다
             (VLM 패치 격자. ``DetectConfig.image_factor``). 1 이면 끈다.
+            ``canvas`` 를 주면 캔버스가 이미 배수이므로 하는 일이 없다.
+        canvas: ``(폭, 높이)`` 고정 캔버스. 주면 **모든 페이지가 정확히 이 크기**가
+            된다 (``preprocess_array`` 참조).
 
     Returns:
         전처리 결과. ``image`` 는 OpenCV BGR numpy 배열.
@@ -86,8 +88,46 @@ def preprocess(
         raise RuntimeError(f"이미지를 읽을 수 없습니다: {image_path}")
 
     return preprocess_array(
-        img, target_long_side=target_long_side, deskew=deskew, align=align
+        img,
+        target_long_side=target_long_side,
+        deskew=deskew,
+        align=align,
+        canvas=canvas,
     )
+
+
+def _fit_canvas(img: Any, canvas_w: int, canvas_h: int, cv2: Any) -> tuple[Any, float, tuple[int, int]]:
+    """종횡비를 지키며 캔버스에 맞추고 오른쪽·아래를 흰색으로 채운다.
+
+    **축소만이 아니라 확대도 한다.** 여기가 ``target_long_side`` 방식과 갈리는
+    지점이다. 확대를 막으면 저해상도 스캔이 큰 캔버스 구석에 작게 박히고, 그러면
+    같은 서식이라도 스캔 DPI 에 따라 글자 크기가 제각각이 된다 — 좌표를 학습시킬
+    때 그 변동이 그대로 잡음이 된다. 캔버스를 채우면 글자 크기가 **문서 자체의
+    레이아웃에만** 의존한다.
+
+    확대로 없던 정보가 생기지는 않는다 (흐려질 뿐이다). 다만 좌표는 정확히
+    보존되고, 이 단계의 목적이 그것이다.
+
+    Returns:
+        ``(이미지, 적용 배율, (오른쪽 여백, 아래 여백))``.
+    """
+    h, w = img.shape[:2]
+    scale = min(canvas_w / max(1, w), canvas_h / max(1, h))
+    new_w = max(1, min(canvas_w, round(w * scale)))
+    new_h = max(1, min(canvas_h, round(h * scale)))
+    if (new_w, new_h) != (w, h):
+        img = cv2.resize(
+            img,
+            (new_w, new_h),
+            # 축소는 INTER_AREA, 확대는 INTER_CUBIC 이 표준이다.
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC,
+        )
+    pad_w, pad_h = canvas_w - new_w, canvas_h - new_h
+    if pad_w or pad_h:
+        img = cv2.copyMakeBorder(
+            img, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+    return img, scale, (pad_w, pad_h)
 
 
 def preprocess_array(
@@ -95,22 +135,39 @@ def preprocess_array(
     target_long_side: int | None = 2464,
     deskew: bool = True,
     align: int = 32,
+    canvas: tuple[int, int] | None = None,
 ) -> PreprocessResult:
     """이미 메모리에 있는 이미지를 정규화한다.
 
     PDF 페이지처럼 파일을 거치지 않는 입력에 쓴다.
 
+    두 가지 방식이 있고 ``canvas`` 가 있으면 그쪽이 이긴다.
+
+    ===================  =========================================================
+    ``canvas`` 지정      **모든 페이지가 정확히 같은 크기**가 된다. 종횡비를
+                         지키며 확대·축소한 뒤 오른쪽·아래를 흰색으로 채운다
+    ``target_long_side`` 긴 변만 맞춘다 (축소만). 짧은 변은 종횡비대로라
+                         페이지마다 다르다
+    ===================  =========================================================
+
+    **좌표 학습을 할 것이면 ``canvas`` 를 쓴다.** 페이지 크기가 고정이라야
+    타일도 고정이고, 모델이 한 가지 기하만 학습하면 된다. 페이지마다 크기가
+    다르면 같은 per-mille 값이 페이지마다 다른 픽셀을 가리키게 되고, 그
+    변동을 모델이 함께 배워야 한다.
+
     Args:
         img: BGR numpy 배열.
-        target_long_side: 긴 변 목표 길이. ``None`` 이면 축소하지 않는다.
+        target_long_side: 긴 변 목표 길이. ``canvas`` 를 주면 무시된다.
         deskew: 기울기 보정 여부.
         align: 이 값의 배수가 되도록 오른쪽·아래에 흰 여백을 붙인다. 1 이면 끈다.
+        canvas: ``(폭, 높이)``. **``align`` 의 배수로 둘 것.**
 
     Returns:
         전처리 결과. 입력 배열은 변경하지 않는다.
 
     Raises:
         RuntimeError: opencv 미설치.
+        ValueError: ``canvas`` 값이 양수가 아닐 때.
     """
     try:
         import cv2  # type: ignore[import-not-found]
@@ -126,8 +183,29 @@ def preprocess_array(
         "rotation_deg": 0.0,
     }
 
-    # 1) 해상도 정규화 (축소만)
-    if target_long_side and max(orig_h, orig_w) > target_long_side:
+    # 1) 해상도 정규화
+    if canvas is not None:
+        # YAML 에서는 리스트로 들어온다. 길이/부호를 여기서 한 번만 검사한다 —
+        # 잘못된 값이 조용히 통과하면 페이지 전체가 엉뚱한 크기가 된다.
+        if len(canvas) != 2:
+            raise ValueError(f"canvas 는 [폭, 높이] 두 값이어야 합니다: {canvas}")
+        canvas_w, canvas_h = int(canvas[0]), int(canvas[1])
+        if canvas_w <= 0 or canvas_h <= 0:
+            raise ValueError(f"canvas 는 양수여야 합니다: {canvas}")
+        img, scale, pad = _fit_canvas(img, canvas_w, canvas_h, cv2)
+        transform["scale"] = scale
+        transform["canvas"] = [canvas_w, canvas_h]
+        transform["canvas_pad"] = list(pad)
+        applied.append(f"canvas({orig_w}x{orig_h}->{canvas_w}x{canvas_h}, x{scale:.3f})")
+        # 종횡비가 캔버스와 크게 다르면 픽셀 예산의 상당량이 흰 여백으로 간다.
+        # 조용히 넘기면 "왜 이 문서만 인식이 나쁘지" 로 헤매게 된다.
+        waste = 1.0 - (canvas_w - pad[0]) * (canvas_h - pad[1]) / (canvas_w * canvas_h)
+        if waste > 0.15:
+            applied.append(
+                f"경고: 종횡비가 캔버스와 달라 {waste * 100:.0f}% 가 흰 여백입니다 "
+                f"(그만큼 글자가 작아집니다)"
+            )
+    elif target_long_side and max(orig_h, orig_w) > target_long_side:
         scale = target_long_side / max(orig_h, orig_w)
         img = cv2.resize(
             img,
@@ -164,7 +242,9 @@ def preprocess_array(
     #
     # 자르지 않고 붙이는 이유: 기존 픽셀이 하나도 움직이지 않아 **좌표가 그대로
     # 유효하다.** 잘라내면 페이지 끝의 값을 잃는데, 그건 미탐이다.
-    if align > 1:
+    # canvas 를 썼으면 크기가 이미 고정이다. 여기서 또 붙이면 캔버스가 아니게 된다
+    # (캔버스가 align 의 배수가 아니면 붙을 것이 있는데, 그건 설정 오류다).
+    if align > 1 and canvas is None:
         h, w = img.shape[:2]
         pad_w = (-w) % align
         pad_h = (-h) % align

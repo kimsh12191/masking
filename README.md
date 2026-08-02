@@ -38,7 +38,7 @@ VLM 의 약점은 프롬프트로 못 고친다. 패치 크기는 아키텍처�
 
 ```bash
 pip install pytest 'numpy<2.0' 'Pillow<11' opencv-python-headless PyYAML pypdfium2
-python -m pytest          # 791 passed
+python -m pytest          # 877 passed
 python scripts/run.py --print-config
 ```
 
@@ -112,28 +112,84 @@ python scripts/build_grounding_data.py <문서들> -o data/g -c config/default.y
 어디 있는가" 뿐이다. `data/g/overlay/*.png` 를 **눈으로 확인**하고 넘어간다.
 박스가 글자에 안 붙어 있으면 여기서 멈춘다.
 
-| 학습 샘플 | |
+**과제는 "값을 줄 테니 위치만 찍어라" 다.** 전사는 이미 잘하므로 안 가르친다 —
+손실이 거의 전부 좌표에 걸리고, OCR 오독이 정답에 섞일 길도 없다.
+
+```
+[입력]  타일 이미지 1760×960  +
+
+  다음 값들이 이 이미지에 있다. 각각의 위치를 **모두** 답하라.
+  - 강동혁
+  - 780914-2184953
+
+[정답]
+  {"findings":[{"text":"강동혁","bbox_2d":[318,266,398,317]},
+               {"text":"강동혁","bbox_2d":[600,800,700,850]},   ← 같은 값 2곳
+               {"text":"780914-2184953","bbox_2d":[670,667,886,719]}]}
+```
+
+손실은 정답 토큰에만 걸린다 (프롬프트는 마스킹).
+
+| 설계 | 왜 |
 |---|---|
-| **입력** | 타일 이미지 (추론에서 모델이 받는 것과 동일) |
-| **정답** | `{"findings":[{"text":"강동혁","bbox_2d":[318,266,398,317]}, ...]}` |
-| 손실 | 정답 토큰만. 프롬프트는 마스킹 |
+| 질문은 **중복 제거**, 답은 **모든 출현** | 같은 이름·날짜가 여러 칸에 나오는 게 정상이다. 한 곳만 답하면 나머지가 안 가려진다 |
+| **전부 묻지 않는다** (`--query-ratio 0.25,1.0`) | 추론에서는 텍스트 수십 줄 중 개인정보 몇 개만 답한다. 항상 전부 물으면 "보이는 것 다 답한다" 를 배운다 |
+| 질문 순서를 섞는다 | 답은 읽기 순서다. 질문 순서대로 답하는 걸 배우면 추론에서 무너진다 |
+| 입력 크기가 **항상 같다** | 페이지가 고정 캔버스(1760×2464), 타일 3개가 전부 1760×960 |
+| `--aug-scales 1.5,2.0` | 더 작은 영역을 잘라 타일 크기로 확대. **크기는 그대로, 글자만 커 보인다.** 문서마다 폰트가 다르므로 한 스케일만 배우면 흔들린다 |
 
 `bbox_2d` 는 OCR 픽셀 박스를 추론 디코딩의 **역함수**로 환산한 값이라, 모델이
 정답대로 뱉으면 픽셀 좌표가 그대로 복원된다 (왕복 오차 0px, 빌더가 assert 로 검산).
 
+> 도장·서명은 지목할 텍스트가 없어 이 과제로 못 가르친다. `--read-ratio` 로
+> "전부 읽어라" 과제를 섞을 수 있지만 **기본은 꺼져 있다** — 좌표 능력은 내용과
+> 무관해서 글자로 배운 것이 도장에도 쓰인다. 학습 후 실제로 나쁘면 그때 켠다.
+
 ### ② 학습
 
+**평범한 SFT 다.** 좌표 회귀 헤드도, 특별한 손실도 없다.
+
+```
+[system] + [타일 이미지] + [user]  →  모델이 정답 JSON 을 생성
+                                       ↑ 이 토큰들에만 cross-entropy
+```
+
+모델은 **이미 이 형식으로 답한다.** 숫자만 틀리니까 그 숫자를 정답으로 놓고
+next-token 예측을 돌리는 것이 전부다. 프롬프트 토큰은 손실에서 뺀다 — 안 빼면
+모델이 자기 지시문을 외운다.
+
 ```bash
-python scripts/train_grounding.py --data data/g/data.jsonl --dry-run          # 배선 확인
-python scripts/train_grounding.py --data data/g/data.jsonl -o out/s --max-samples 8   # 스모크
+python scripts/train_grounding.py --data data/g/data.jsonl --dry-run          # ① 배선 확인
+python scripts/train_grounding.py --data data/g/data.jsonl -o out/s --max-samples 8   # ② 스모크
 python scripts/train_grounding.py --data data/g/data.jsonl -o out/lora --merge out/merged
 ```
 
-LoRA 는 LLM 에, **vision merger 는 전체 학습**이 기본값이다. 32px 토큰 격자
-아래의 정밀도가 merger 에서 결정되므로 여기를 닫으면 격자 아래로 못 내려간다
-(`--no-merger` 로 A/B).
+**①을 건너뛰지 마라.** GPU 없이 돌고, 손실이 걸리는 문자열을 디코딩해 보여준다.
+거기 정답 JSON 만 나와야 한다. 지시문이 섞여 있거나 시작이 한 토큰 밀리면
+**학습 로그에는 아무 징후가 없고** "좌표가 안 좋아지네" 로만 나타난다.
 
-`--merge` 로 저장한 가중치를 vLLM 에 올린다.
+**어디를 여는가**
+
+| 부위 | 기본 | 왜 |
+|---|---|---|
+| LLM attention/MLP | LoRA r=16 | |
+| **vision merger** | **전체 학습** | 패치 4개를 토큰 1개로 압축하는 자리. **32px 격자 아래 위치정보가 여기서 살아남느냐로 결정된다.** 선형층 두어 개라 통째로 열어도 싸다 |
+| ViT | 동결 | `--vision-blocks N` 으로 상위 N개 블록에 LoRA |
+
+ViT 를 기본으로 안 여는 건 **순서** 때문이다. merger 만 열고 먼저 재야 어디까지가
+merger 몫인지 안다 (`--no-merger` 로 A/B). 격자 아래로 못 내려가면 그때 켠다.
+
+**규모**
+
+| | |
+|---|---|
+| 하드웨어 | A100·H100 **1장** (9B bf16 + LoRA + grad checkpointing) |
+| 시간 | 수 시간 |
+| 데이터 | 페이지 500~2,000장이면 시작할 만하다 (장당 샘플 5개, 좌표 라벨 ~80개) |
+| 기본값 | lr 1e-4, batch 1 × accum 8, 1 epoch, bf16 |
+
+**서빙**은 `--merge` 로 베이스에 합친 체크포인트를 vLLM 에 올린다. LoRA 핫스왑은
+비전타워 쪽 보장이 애매한데, 어차피 모델 하나만 쓰므로 머지가 확실하다.
 
 ### ③ 평가 — **반드시 두 축을 함께**
 
@@ -155,7 +211,7 @@ python scripts/measure.py  <평가 페이지들>    # 재현율
 
 ```json
 {
-  "page": {"width": 1748, "height": 2480},
+  "page": {"width": 1760, "height": 2464},
   "regions": [{
     "id": "r001", "type": "RRN", "bbox": [412, 780, 690, 812],
     "source": "ocr_refined", "confidence": 1.0,
@@ -198,7 +254,7 @@ python scripts/measure.py  <평가 페이지들>    # 재현율
 | `locate.min_pad_px` | 64 | 크롭 여유. 모델 grounding 한계(32px)의 2배 |
 | `locate.upscale` | 2.0 | 작은 글씨 인식률 |
 | `ocr.gpu_id` | 0 | vLLM 과 카드를 나눌 때 |
-| `pipeline.target_long_side` | 2464 | **`image_factor`(32)의 배수로** |
+| `pipeline.canvas` | [1760, 2464] | **고정 캔버스.** 모든 페이지가 이 크기. `image_factor`(32)의 배수로 |
 
 ---
 

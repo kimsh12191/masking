@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from pii_pipeline.llm.prompts import SYSTEM_GROUNDING, USER_GROUNDING
+from pii_pipeline.llm.prompts import (
+    SYSTEM_GROUNDING,
+    SYSTEM_LOCATE,
+    USER_GROUNDING,
+)
 from pii_pipeline.train.sft import (
     IGNORE_INDEX,
     TOKEN_AXIS_KEYS,
@@ -26,17 +30,21 @@ from pii_pipeline.train.sft import (
     load_jsonl,
     mask_prompt,
     pad_fill_value,
+    select_vision_blocks,
     summarize,
 )
 
 
-def example(findings=None) -> Example:
+def example(findings=None, task: str = "locate", query=None) -> Example:
+    items = findings if findings is not None else [
+        {"text": "강동혁", "bbox_2d": [318, 266, 398, 317]}
+    ]
     return Example(
         image_path=Path("tiles/x_t0.png"),
-        target={"findings": findings if findings is not None else [
-            {"text": "강동혁", "bbox_2d": [318, 266, 398, 317]}
-        ]},
+        target={"findings": items},
         meta={"tile": 0},
+        task=task,
+        query=query if query is not None else [i["text"] for i in items if i["text"]],
     )
 
 
@@ -107,8 +115,16 @@ class TestPadding:
 
 
 class TestBuildMessages:
-    def test_uses_the_grounding_prompts(self) -> None:
-        messages, _ = build_messages(example())
+    def test_locate_asks_for_the_given_values(self) -> None:
+        """주 과제 — 값을 알려주고 위치만 묻는다."""
+        messages, _ = build_messages(example(task="locate", query=["강동혁", "서울"]))
+        assert messages[0]["content"][0]["text"] == SYSTEM_LOCATE
+        user = messages[1]["content"][1]["text"]
+        assert "강동혁" in user and "서울" in user
+
+    def test_read_falls_back_to_the_transcription_prompt(self) -> None:
+        """도장·손글씨는 지목할 텍스트가 없어 이쪽으로만 가르칠 수 있다."""
+        messages, _ = build_messages(example(task="read"))
         assert messages[0]["content"][0]["text"] == SYSTEM_GROUNDING
         assert messages[1]["content"][1]["text"] == USER_GROUNDING
 
@@ -158,8 +174,10 @@ class TestLoadJsonl:
 
     def test_reads_rows(self, tmp_path: Path) -> None:
         rows = [
-            {"image": "tiles/a.png", "target": {"findings": []}, "meta": {"tile": 0}},
-            {"image": "tiles/b.png", "target": {"findings": []}, "meta": {"tile": 1}},
+            {"image": "tiles/a.png", "task": "read",
+             "target": {"findings": []}, "meta": {"tile": 0}},
+            {"image": "tiles/b.png", "task": "read",
+             "target": {"findings": []}, "meta": {"tile": 1}},
         ]
         got = load_jsonl(self._write(tmp_path, rows))
         assert len(got) == 2
@@ -167,7 +185,7 @@ class TestLoadJsonl:
 
     def test_missing_image_raises(self, tmp_path: Path) -> None:
         """조용히 건너뛰면 데이터가 반쯤 빠진 채 학습이 돈다."""
-        rows = [{"image": "tiles/gone.png", "target": {"findings": []}}]
+        rows = [{"image": "tiles/gone.png", "task": "read", "target": {"findings": []}}]
         path = self._write(tmp_path, rows, make_images=False)
         with pytest.raises(FileNotFoundError, match="이미지가 없습니다"):
             load_jsonl(path)
@@ -177,7 +195,10 @@ class TestLoadJsonl:
         (tmp_path / "tiles/a.png").write_bytes(b"x")
         path = tmp_path / "data.jsonl"
         path.write_text(
-            json.dumps({"image": "tiles/a.png", "target": {"findings": []}}) + "\n\n",
+            json.dumps(
+                {"image": "tiles/a.png", "task": "read", "target": {"findings": []}}
+            )
+            + "\n\n",
             encoding="utf-8",
         )
         assert len(load_jsonl(path)) == 1
@@ -203,3 +224,55 @@ class TestSummarize:
 
     def test_handles_empty_input(self) -> None:
         assert summarize([])["samples"] == 0
+
+
+class TestSelectVisionBlocks:
+    """ViT LoRA 대상은 **모델에서 찾는다.** 이름을 하드코딩할 수 없다.
+
+    Qwen 계열은 LLM 이 q_proj/k_proj 인데 ViT 는 qkv 로 합쳐져 있고, MLP 이름도
+    버전마다 바뀐다 (fc1/fc2 -> SwiGLU). 짐작하면 조용히 아무것도 안 걸린다.
+    """
+
+    # Qwen2-VL 풍 이름 (블록 0~3) + LLM + merger
+    NAMES = (
+        [f"visual.blocks.{i}.attn.qkv" for i in range(4)]
+        + [f"visual.blocks.{i}.attn.proj" for i in range(4)]
+        + [f"visual.blocks.{i}.mlp.fc1" for i in range(4)]
+        + ["visual.patch_embed.proj", "visual.merger.mlp.0", "visual.merger.mlp.2"]
+        + [f"model.layers.{i}.self_attn.q_proj" for i in range(4)]
+    )
+
+    def test_picks_only_the_top_blocks(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 2)
+        blocks = {n.split(".")[2] for n in got}
+        assert blocks == {"2", "3"}
+
+    def test_returns_full_paths(self) -> None:
+        """접미사로 주면 다른 블록까지 딸려온다. 전체 경로여야 한다."""
+        for name in select_vision_blocks(self.NAMES, "visual", 1):
+            assert name.startswith("visual.blocks.3.")
+
+    def test_llm_layers_are_never_included(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 4)
+        assert not any(n.startswith("model.layers") for n in got)
+
+    def test_merger_and_patch_embed_are_excluded(self) -> None:
+        """merger 는 LoRA 가 아니라 전체 학습으로 따로 다룬다."""
+        got = select_vision_blocks(self.NAMES, "visual", 4)
+        assert not any("merger" in n or "patch_embed" in n for n in got)
+
+    def test_zero_blocks_means_frozen_vit(self) -> None:
+        assert select_vision_blocks(self.NAMES, "visual", 0) == []
+
+    def test_more_blocks_than_exist_is_fine(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 99)
+        assert {n.split(".")[2] for n in got} == {"0", "1", "2", "3"}
+
+    def test_unknown_prefix_returns_nothing(self) -> None:
+        """호출부가 이걸 보고 죽으며 --list-modules 를 안내한다."""
+        assert select_vision_blocks(self.NAMES, "vision_tower", 2) == []
+
+    def test_works_with_a_different_naming_scheme(self) -> None:
+        """버전이 바뀌어 SwiGLU 로 가도 블록 번호만 있으면 잡힌다."""
+        names = [f"visual.blocks.{i}.mlp.gate_proj" for i in range(3)]
+        assert select_vision_blocks(names, "visual", 1) == ["visual.blocks.2.mlp.gate_proj"]

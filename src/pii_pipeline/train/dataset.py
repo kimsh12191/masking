@@ -57,6 +57,52 @@ from ..schema import BBox, OcrBox, OcrStatus
 Rect = tuple[float, float, float, float]
 
 
+def scale_regions(
+    rect: Rect,
+    page_w: int,
+    page_h: int,
+    scales: list[float],
+    rng: Any,
+) -> list[Rect]:
+    """타일과 **같은 종횡비**로 더 작은 영역들을 뽑는다 (스케일 증강).
+
+    입력 크기는 고정인데 글자 크기만 달라지게 하는 것이 목적이다. 작은 영역을
+    잘라 타일 크기로 확대하면 글자가 그 배율만큼 커 보인다.
+
+        s = 1.0   타일 그대로            글자 1배
+        s = 2.0   타일의 절반 영역       글자 2배
+
+    **왜 필요한가.** 캔버스를 고정해도 문서마다 폰트 크기가 다르다. 추론 타일
+    하나의 스케일만 학습하면 그보다 작거나 큰 글씨에서 좌표가 흔들린다. 종횡비를
+    타일과 맞추는 것이 중요한데, 안 맞추고 확대하면 글자가 찌그러지고 모델이
+    왜곡된 글자를 학습하게 된다.
+
+    ``s < 1`` 은 만들지 않는다. 타일이 이미 페이지 폭 전체를 쓰므로 더 넓은
+    영역이 없다 — 그 방향은 캔버스 크기를 바꿔야 얻어진다.
+
+    Args:
+        rect: 기준 타일의 정규화 사각형.
+        page_w: 페이지 폭 (px).
+        page_h: 페이지 높이 (px).
+        scales: 배율 목록. 1.0 이하는 건너뛴다.
+        rng: ``random.Random``. 위치를 뽑는 데 쓴다.
+
+    Returns:
+        정규화 사각형 목록. 페이지 안에 완전히 들어간다.
+    """
+    rw, rh = rect[2] - rect[0], rect[3] - rect[1]
+    out: list[Rect] = []
+    for s in scales:
+        if s <= 1.0:
+            continue
+        w, h = rw / s, rh / s
+        # 영역이 페이지 밖으로 나가지 않는 범위에서 위치를 뽑는다.
+        x = rng.uniform(0.0, max(0.0, 1.0 - w))
+        y = rng.uniform(0.0, max(0.0, 1.0 - h))
+        out.append((x, y, min(1.0, x + w), min(1.0, y + h)))
+    return out
+
+
 @dataclass
 class GroundingConfig:
     """학습 샘플 생성 설정.
@@ -90,9 +136,9 @@ class TileSample:
     """타일 하나에 대한 학습 샘플.
 
     Attributes:
-        tile: 타일 인덱스.
+        tile: 타일 인덱스. 증강 영역은 ``-1``.
         rect: 타일의 정규화 사각형. 좌표 검산에 필요하다.
-        items: ``{"text": str, "bbox_2d": [x1,y1,x2,y2]}`` 목록.
+        items: ``{"text": str, "bbox_2d": [x1,y1,x2,y2]}`` 목록 (읽기 순서).
         max_error_px: 이 샘플에서 관측된 최대 왕복 오차 (페이지 픽셀).
             per-mille 양자화 상한을 넘으면 변환이 어딘가 어긋난 것이다.
         n_textless: 좌표만 가르치는 항목 수 (손글씨·도장·저신뢰).
@@ -107,6 +153,83 @@ class TileSample:
     def target_json(self) -> str:
         """추론 스키마와 같은 모양의 학습 타깃 문자열."""
         return json.dumps({"findings": self.items}, ensure_ascii=False)
+
+    def query(self) -> list[str]:
+        """물을 수 있는 값 전체. **중복을 제거한다.**
+
+        같은 값이 여러 곳에 있다는 사실은 **답**에서 표현된다 (같은 텍스트로
+        항목이 여러 개). 질문에 두 번 적으면 "두 번 물었으니 두 개 답한다" 를
+        배우게 되고, 그건 추론에서 쓸 수 없는 규칙이다 — 추론 때는 값이 몇 번
+        나오는지 아무도 모른다.
+
+        빈 문자열(도장·손글씨)은 지목할 방법이 없으므로 뺀다.
+
+        실제로 물을 것은 이 중 일부다 (``sample_query`` 참조).
+
+        Returns:
+            첫 등장 순서를 지킨 중복 없는 값 목록.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in self.items:
+            text = item["text"]
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+        return out
+
+    def locate_items(self, query: list[str] | None = None) -> list[dict[str, Any]]:
+        """위치 질의의 정답. **물어본 값들의** 모든 출현.
+
+        묻지 않은 값은 답에서 빠진다. 이 필터가 없으면 "이미지에 있는 것은
+        묻지 않아도 답한다" 를 가르치게 되는데, 추론에서는 정확히 그 반대가
+        필요하다 — 페이지에 텍스트가 수십 줄이어도 개인정보만 답해야 한다.
+
+        Args:
+            query: 물어본 값들. ``None`` 이면 텍스트가 있는 항목 전체.
+
+        Returns:
+            읽기 순서의 항목 목록. 질문 순서가 아니다.
+        """
+        if query is None:
+            return [item for item in self.items if item["text"]]
+        wanted = set(query)
+        return [item for item in self.items if item["text"] in wanted]
+
+
+def sample_query(
+    texts: list[str], rng: Any, ratio_range: tuple[float, float]
+) -> list[str]:
+    """물어볼 값의 부분집합을 뽑는다.
+
+    **매번 전부 묻지 않는 것이 핵심이다.** 추론에서는 페이지에 텍스트가 수십
+    줄이어도 그중 개인정보 몇 개만 답해야 한다. 학습에서 항상 "전부" 를 물으면
+    모델은 *"보이는 것을 다 답한다"* 를 배우고, **질문에 없는 것을 무시하는
+    연습을 한 번도 하지 못한다.**
+
+    부수 효과로 같은 타일에서 매번 다른 (질문, 답) 쌍이 나온다.
+
+    **순서를 섞는다.** 답은 읽기 순서여야 하는데, 질문이 항상 읽기 순서로
+    들어오면 모델이 "질문 순서대로 답한다" 로 배울 수 있다. 그러면 추론에서
+    질문 순서라는 것이 없을 때 무너진다.
+
+    Args:
+        texts: 물을 수 있는 값 전체 (``TileSample.query()``).
+        rng: ``random.Random``.
+        ratio_range: 뽑을 비율 구간 ``(최소, 최대)``. ``(1.0, 1.0)`` 이면 전부.
+
+    Returns:
+        뽑힌 값들 (섞인 순서). 입력이 비어 있으면 빈 목록.
+    """
+    if not texts:
+        return []
+    lo, hi = ratio_range
+    ratio = rng.uniform(min(lo, hi), max(lo, hi))
+    k = max(1, min(len(texts), round(len(texts) * ratio)))
+    picked = rng.sample(texts, k)
+    rng.shuffle(picked)
+    return picked
 
 
 # --------------------------------------------------------------------------
