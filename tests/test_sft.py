@@ -30,6 +30,7 @@ from pii_pipeline.train.sft import (
     load_jsonl,
     mask_prompt,
     pad_fill_value,
+    select_vision_blocks,
     summarize,
 )
 
@@ -223,3 +224,55 @@ class TestSummarize:
 
     def test_handles_empty_input(self) -> None:
         assert summarize([])["samples"] == 0
+
+
+class TestSelectVisionBlocks:
+    """ViT LoRA 대상은 **모델에서 찾는다.** 이름을 하드코딩할 수 없다.
+
+    Qwen 계열은 LLM 이 q_proj/k_proj 인데 ViT 는 qkv 로 합쳐져 있고, MLP 이름도
+    버전마다 바뀐다 (fc1/fc2 -> SwiGLU). 짐작하면 조용히 아무것도 안 걸린다.
+    """
+
+    # Qwen2-VL 풍 이름 (블록 0~3) + LLM + merger
+    NAMES = (
+        [f"visual.blocks.{i}.attn.qkv" for i in range(4)]
+        + [f"visual.blocks.{i}.attn.proj" for i in range(4)]
+        + [f"visual.blocks.{i}.mlp.fc1" for i in range(4)]
+        + ["visual.patch_embed.proj", "visual.merger.mlp.0", "visual.merger.mlp.2"]
+        + [f"model.layers.{i}.self_attn.q_proj" for i in range(4)]
+    )
+
+    def test_picks_only_the_top_blocks(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 2)
+        blocks = {n.split(".")[2] for n in got}
+        assert blocks == {"2", "3"}
+
+    def test_returns_full_paths(self) -> None:
+        """접미사로 주면 다른 블록까지 딸려온다. 전체 경로여야 한다."""
+        for name in select_vision_blocks(self.NAMES, "visual", 1):
+            assert name.startswith("visual.blocks.3.")
+
+    def test_llm_layers_are_never_included(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 4)
+        assert not any(n.startswith("model.layers") for n in got)
+
+    def test_merger_and_patch_embed_are_excluded(self) -> None:
+        """merger 는 LoRA 가 아니라 전체 학습으로 따로 다룬다."""
+        got = select_vision_blocks(self.NAMES, "visual", 4)
+        assert not any("merger" in n or "patch_embed" in n for n in got)
+
+    def test_zero_blocks_means_frozen_vit(self) -> None:
+        assert select_vision_blocks(self.NAMES, "visual", 0) == []
+
+    def test_more_blocks_than_exist_is_fine(self) -> None:
+        got = select_vision_blocks(self.NAMES, "visual", 99)
+        assert {n.split(".")[2] for n in got} == {"0", "1", "2", "3"}
+
+    def test_unknown_prefix_returns_nothing(self) -> None:
+        """호출부가 이걸 보고 죽으며 --list-modules 를 안내한다."""
+        assert select_vision_blocks(self.NAMES, "vision_tower", 2) == []
+
+    def test_works_with_a_different_naming_scheme(self) -> None:
+        """버전이 바뀌어 SwiGLU 로 가도 블록 번호만 있으면 잡힌다."""
+        names = [f"visual.blocks.{i}.mlp.gate_proj" for i in range(3)]
+        assert select_vision_blocks(names, "visual", 1) == ["visual.blocks.2.mlp.gate_proj"]

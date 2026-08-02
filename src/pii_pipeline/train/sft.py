@@ -213,6 +213,52 @@ def mask_prompt(
     return [ignore_index] * prompt_len + list(input_ids[prompt_len:])
 
 
+def select_vision_blocks(
+    linear_names: list[str], prefix: str, last_n: int
+) -> list[str]:
+    """비전 타워의 **상위 ``last_n`` 개 블록** 안에 있는 선형층 이름을 고른다.
+
+    LoRA 대상 이름을 하드코딩할 수 없어서 필요한 함수다. Qwen 계열은 LLM 이
+    ``q_proj``/``k_proj``... 인데 ViT 는 ``qkv`` 로 합쳐져 있고, 그마저도 버전마다
+    다르다 (2.5-VL 은 MLP 가 ``fc1``/``fc2``, 그 뒤로는 SwiGLU 로 바뀌었다).
+    그래서 이름을 짐작하지 않고 **모델에서 찾아** 전체 경로로 지정한다.
+
+    상위 블록만 여는 이유는 하위 블록이 선·획 같은 저수준 특징을 담당해서
+    좌표 과제로 흔들 이유가 없고, 흔들면 전사 능력까지 함께 흔들리기 때문이다.
+
+    블록 번호가 없는 모듈(``patch_embed``, ``merger``)은 제외한다 — merger 는
+    LoRA 가 아니라 전체 학습으로 따로 다룬다.
+
+    Args:
+        linear_names: 모델의 선형층 전체 이름 목록.
+        prefix: 비전 타워 접두사 (Qwen 은 ``"visual"``).
+        last_n: 뒤에서 몇 개 블록을 열지. 0 이면 열지 않는다.
+
+    Returns:
+        LoRA 를 걸 모듈의 **전체 경로** 목록. 접미사가 아니라 전체 경로라야
+        같은 이름의 다른 블록이 딸려오지 않는다.
+    """
+    if last_n <= 0:
+        return []
+
+    import re
+
+    block_re = re.compile(r"(?:^|\.)blocks\.(\d+)\.")
+    by_block: dict[int, list[str]] = {}
+    for name in linear_names:
+        if not name.startswith(prefix):
+            continue
+        match = block_re.search(name)
+        if match is None:
+            continue
+        by_block.setdefault(int(match.group(1)), []).append(name)
+
+    if not by_block:
+        return []
+    keep = sorted(by_block)[-last_n:]
+    return [name for index in keep for name in by_block[index]]
+
+
 def summarize(examples: list[Example]) -> dict[str, Any]:
     """학습 전 데이터 점검용 통계. **돌리기 전에 눈으로 볼 것.**"""
     n_items = sum(len(e.target.get("findings", [])) for e in examples)

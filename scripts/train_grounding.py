@@ -21,8 +21,19 @@ LLM 만 열면 부족하다. 지금 오차가 비전 토큰 1칸(32px) 규모인
 지점에서 결정된다. 거기를 닫아 두면 격자 아래로 못 내려간다. 그래서
 LLM 은 LoRA, merger 는 전체 학습이 기본값이다.
 
+    LLM             LoRA
+    vision merger   전체 학습        (--no-merger 로 끔)
+    ViT             동결             (--vision-blocks N 으로 상위 N개 블록 열기)
+
+ViT 를 기본으로 열지 않는 이유는 **순서** 때문이다. merger 만 열고 먼저
+재야 어디까지가 merger 몫인지 안다. 한꺼번에 열면 좋아져도 나빠져도 원인을
+못 가른다. merger 만으로 격자 아래로 못 내려가면 그때 ``--vision-blocks`` 를 켠다.
+
 모듈 이름은 모델·라이브러리 버전에 따라 다르므로 ``--list-modules`` 로
-확인하고 ``--merger-module`` 로 지정할 수 있게 해 두었다.
+확인하고 ``--merger-module`` / ``--vision-prefix`` 로 지정할 수 있게 해 두었다.
+ViT LoRA 대상은 하드코딩하지 않고 모델에서 찾는다 (``select_vision_blocks``) —
+LLM 이 ``q_proj``/``k_proj`` 인 반면 ViT 는 ``qkv`` 로 합쳐져 있고 그마저도
+버전마다 다르다.
 
 돌리기 전에
 -----------
@@ -58,6 +69,7 @@ from pii_pipeline.train.sft import (  # noqa: E402
     load_jsonl,
     mask_prompt,
     pad_fill_value,
+    select_vision_blocks,
     summarize,
 )
 
@@ -219,10 +231,45 @@ def load_model(model_id: str, dtype: str, device_map: str | None = None) -> tupl
 
 
 def attach_lora(
-    model: Any, rank: int, alpha: int, dropout: float, merger: str | None
+    model: Any,
+    rank: int,
+    alpha: int,
+    dropout: float,
+    merger: str | None,
+    vision_prefix: str = "visual",
+    vision_blocks: int = 0,
 ) -> Any:
-    """LoRA 를 걸고, merger 는 전체 학습 대상으로 올린다."""
+    """LoRA 를 걸고, merger 는 전체 학습 대상으로 올린다.
+
+    세 부위를 따로 다룬다.
+
+    ==============  ==================================================
+    LLM             LoRA (이름이 표준적이라 접미사로 지정)
+    vision merger   **전체 학습.** 32px 토큰 격자 아래의 위치 정보가
+                    여기서 살아남느냐로 결정된다
+    ViT 상위 블록   LoRA. 이름을 모델에서 찾아 전체 경로로 지정한다
+                    (``select_vision_blocks``)
+    ==============  ==================================================
+    """
+    import torch.nn as nn  # type: ignore[import-not-found]
     from peft import LoraConfig, get_peft_model  # type: ignore[import-not-found]
+
+    targets = list(DEFAULT_LORA_TARGETS)
+
+    if vision_blocks > 0:
+        linear_names = [
+            name for name, module in model.named_modules() if isinstance(module, nn.Linear)
+        ]
+        picked = select_vision_blocks(linear_names, vision_prefix, vision_blocks)
+        if not picked:
+            raise ValueError(
+                f"비전 타워 '{vision_prefix}' 에서 블록 선형층을 찾지 못했습니다. "
+                f"--list-modules 로 실제 접두사를 확인하고 --vision-prefix 로 "
+                f"지정하거나, --vision-blocks 0 으로 끄세요."
+            )
+        targets += picked
+        blocks = sorted({n.rsplit(".blocks.", 1)[1].split(".")[0] for n in picked})
+        log.info("ViT LoRA: 블록 %s (선형층 %d개)", ",".join(blocks), len(picked))
 
     modules_to_save = None
     if merger:
@@ -241,7 +288,7 @@ def attach_lora(
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=DEFAULT_LORA_TARGETS,
+        target_modules=targets,
         modules_to_save=modules_to_save,
     )
     peft_model = get_peft_model(model, config)
@@ -334,6 +381,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--merger-module", default=DEFAULT_MERGER)
     ap.add_argument(
+        "--vision-blocks",
+        type=int,
+        default=0,
+        help="비전 인코더(ViT)의 **상위 N개 블록**에 LoRA 를 건다. 0 이면 ViT 동결. "
+        "merger 만으로 32px 격자 아래로 못 내려가면 여기를 연다 — 다만 "
+        "**merger 만 열고 먼저 재 볼 것.** 한꺼번에 열면 뭐가 들었는지 모른다",
+    )
+    ap.add_argument(
+        "--vision-prefix",
+        default="visual",
+        help="비전 타워 모듈 접두사. --list-modules 로 확인",
+    )
+    ap.add_argument(
         "--no-merger",
         action="store_true",
         help="merger 를 동결한다. 32px 토큰 격자 아래로는 못 내려간다 — A/B 비교용",
@@ -380,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         args.alpha,
         args.dropout,
         None if args.no_merger else args.merger_module,
+        vision_prefix=args.vision_prefix,
+        vision_blocks=args.vision_blocks,
     )
 
     # gradient checkpointing + LoRA 의 고전적인 함정. 베이스가 전부 동결이라

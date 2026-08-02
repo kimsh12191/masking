@@ -137,9 +137,14 @@ python scripts/train_grounding.py --data data/g/data.jsonl -o out/s --max-sample
 python scripts/train_grounding.py --data data/g/data.jsonl -o out/lora --merge out/merged
 ```
 
-LoRA 는 LLM 에, **vision merger 는 전체 학습**이 기본값이다. 32px 토큰 격자
-아래의 정밀도가 merger 에서 결정되므로 여기를 닫으면 격자 아래로 못 내려간다
-(`--no-merger` 로 A/B).
+| 부위 | 기본 | 왜 |
+|---|---|---|
+| LLM attention/MLP | LoRA | |
+| **vision merger** | **전체 학습** | 패치 4개를 토큰 1개로 압축하는 자리. **32px 격자 아래 위치정보가 여기서 살아남느냐로 결정된다.** 선형층 두어 개라 통째로 열어도 싸다 |
+| ViT | 동결 | `--vision-blocks N` 으로 상위 N개 블록에 LoRA |
+
+ViT 를 기본으로 안 여는 건 **순서** 때문이다. merger 만 열고 먼저 재야 어디까지가
+merger 몫인지 안다 (`--no-merger` 로 A/B). 격자 아래로 못 내려가면 그때 켠다.
 
 `--merge` 로 저장한 가중치를 vLLM 에 올린다.
 
