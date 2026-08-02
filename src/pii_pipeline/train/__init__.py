@@ -42,6 +42,7 @@ from .dataset import (
     TileSample,
     build_tile_sample,
     roundtrip,
+    sample_query,
     scale_regions,
     to_permille,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "TileSample",
     "build_tile_sample",
     "roundtrip",
+    "sample_query",
     "scale_regions",
     "to_permille",
 ]

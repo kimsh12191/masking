@@ -155,7 +155,7 @@ class TileSample:
         return json.dumps({"findings": self.items}, ensure_ascii=False)
 
     def query(self) -> list[str]:
-        """위치 질의(``locate``)에 쓸 값 목록. **중복을 제거한다.**
+        """물을 수 있는 값 전체. **중복을 제거한다.**
 
         같은 값이 여러 곳에 있다는 사실은 **답**에서 표현된다 (같은 텍스트로
         항목이 여러 개). 질문에 두 번 적으면 "두 번 물었으니 두 개 답한다" 를
@@ -163,6 +163,8 @@ class TileSample:
         나오는지 아무도 모른다.
 
         빈 문자열(도장·손글씨)은 지목할 방법이 없으므로 뺀다.
+
+        실제로 물을 것은 이 중 일부다 (``sample_query`` 참조).
 
         Returns:
             첫 등장 순서를 지킨 중복 없는 값 목록.
@@ -177,13 +179,57 @@ class TileSample:
             out.append(text)
         return out
 
-    def locate_items(self) -> list[dict[str, Any]]:
-        """위치 질의의 정답. 질문에 담긴 값들의 **모든** 출현.
+    def locate_items(self, query: list[str] | None = None) -> list[dict[str, Any]]:
+        """위치 질의의 정답. **물어본 값들의** 모든 출현.
 
-        빈 문자열 항목은 질문에 없으므로 답에서도 뺀다. 있는데 묻지 않은 것을
-        답하라고 가르치면 모델이 질문에 없는 것을 지어내게 된다.
+        묻지 않은 값은 답에서 빠진다. 이 필터가 없으면 "이미지에 있는 것은
+        묻지 않아도 답한다" 를 가르치게 되는데, 추론에서는 정확히 그 반대가
+        필요하다 — 페이지에 텍스트가 수십 줄이어도 개인정보만 답해야 한다.
+
+        Args:
+            query: 물어본 값들. ``None`` 이면 텍스트가 있는 항목 전체.
+
+        Returns:
+            읽기 순서의 항목 목록. 질문 순서가 아니다.
         """
-        return [item for item in self.items if item["text"]]
+        if query is None:
+            return [item for item in self.items if item["text"]]
+        wanted = set(query)
+        return [item for item in self.items if item["text"] in wanted]
+
+
+def sample_query(
+    texts: list[str], rng: Any, ratio_range: tuple[float, float]
+) -> list[str]:
+    """물어볼 값의 부분집합을 뽑는다.
+
+    **매번 전부 묻지 않는 것이 핵심이다.** 추론에서는 페이지에 텍스트가 수십
+    줄이어도 그중 개인정보 몇 개만 답해야 한다. 학습에서 항상 "전부" 를 물으면
+    모델은 *"보이는 것을 다 답한다"* 를 배우고, **질문에 없는 것을 무시하는
+    연습을 한 번도 하지 못한다.**
+
+    부수 효과로 같은 타일에서 매번 다른 (질문, 답) 쌍이 나온다.
+
+    **순서를 섞는다.** 답은 읽기 순서여야 하는데, 질문이 항상 읽기 순서로
+    들어오면 모델이 "질문 순서대로 답한다" 로 배울 수 있다. 그러면 추론에서
+    질문 순서라는 것이 없을 때 무너진다.
+
+    Args:
+        texts: 물을 수 있는 값 전체 (``TileSample.query()``).
+        rng: ``random.Random``.
+        ratio_range: 뽑을 비율 구간 ``(최소, 최대)``. ``(1.0, 1.0)`` 이면 전부.
+
+    Returns:
+        뽑힌 값들 (섞인 순서). 입력이 비어 있으면 빈 목록.
+    """
+    if not texts:
+        return []
+    lo, hi = ratio_range
+    ratio = rng.uniform(min(lo, hi), max(lo, hi))
+    k = max(1, min(len(texts), round(len(texts) * ratio)))
+    picked = rng.sample(texts, k)
+    rng.shuffle(picked)
+    return picked
 
 
 # --------------------------------------------------------------------------

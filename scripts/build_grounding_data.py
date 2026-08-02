@@ -59,6 +59,7 @@ from pii_pipeline.train.dataset import (  # noqa: E402
     build_tile_sample,
     quantization_limit,
     roundtrip,
+    sample_query,
     scale_regions,
 )
 
@@ -288,6 +289,14 @@ def main(argv: list[str] | None = None) -> int:
         "빈 문자열이면 증강 없음",
     )
     ap.add_argument(
+        "--query-ratio",
+        default="0.25,1.0",
+        help="한 샘플에서 물을 값의 비율 구간 '최소,최대'. 매번 이 안에서 뽑는다. "
+        "**전부 묻지 않는 것이 중요하다** — 추론에서는 텍스트가 수십 줄이어도 "
+        "개인정보 몇 개만 답해야 하므로, 항상 전부를 물으면 모델이 "
+        "'보이는 것을 다 답한다' 를 배운다. '1.0,1.0' 이면 항상 전부",
+    )
+    ap.add_argument(
         "--read-ratio",
         type=float,
         default=0.0,
@@ -319,6 +328,8 @@ def main(argv: list[str] | None = None) -> int:
         (out_dir / "overlay").mkdir(exist_ok=True)
 
     scales = [float(s) for s in args.aug_scales.split(",") if s.strip()]
+    lo, _, hi = args.query_ratio.partition(",")
+    query_ratio = (float(lo), float(hi or lo))
     rng = random.Random(args.seed)
     ocr = PaddleOcrRunner(cfg.ocr)
 
@@ -364,13 +375,15 @@ def main(argv: list[str] | None = None) -> int:
                     #
                     # 기본은 locate 뿐이다. read 는 --read-ratio 로 켠다.
                     rows = []
-                    query = sample.query()
+                    # 전부 묻지 않는다 — 추론에서는 텍스트가 수십 줄이어도
+                    # 개인정보 몇 개만 답해야 한다 (sample_query 참조).
+                    query = sample_query(sample.query(), rng, query_ratio)
                     if query:
                         rows.append(
                             {
                                 "task": "locate",
                                 "query": query,
-                                "target": {"findings": sample.locate_items()},
+                                "target": {"findings": sample.locate_items(query)},
                             }
                         )
                     if sample.n_textless and rng.random() < args.read_ratio:
