@@ -74,8 +74,12 @@ vllm serve Qwen/Qwen3.5-9B \
   --gpu-memory-utilization 0.80 \
   --limit-mm-per-prompt image=1 \
   --enable-prefix-caching \
-  --guided-decoding-backend xgrammar
+  --guided-decoding-backend xgrammar \
+  --trust-remote-code
 ```
+
+`--trust-remote-code` 를 빼면 `Failed to load the tokenizer` 로 죽는다 —
+Qwen-VL 의 토크나이저·프로세서가 transformers 에 내장되지 않은 커스텀 코드다.
 
 `--max-model-len 8192` 를 **반드시** 넣는다. 기본값(262k)이면 KV 캐시가 80GB 를
 다 먹는다.

@@ -181,6 +181,91 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def require_cuda(dtype: str) -> None:
+    """GPU 를 못 쓰는 상태면 **모델을 올리기 전에** 죽는다.
+
+    확인을 안 하면 9B 가중치를 다 불러온 뒤 ``TrainingArguments`` 안에서
+    ``Your setup doesn't support bf16/gpu. You need to assign use_cpu ...`` 로
+    죽는다. 몇 분을 버리고, 메시지는 "CPU 로 돌리려면 use_cpu 를 켜라" 라고
+    해서 **원인과 다른 곳을 보게 만든다** — 진짜 원인은 대개 torch 휠과 드라이버의
+    CUDA 버전 불일치다.
+
+    Raises:
+        RuntimeError: CUDA 를 쓸 수 없을 때. 어느 버전이 안 맞는지 함께 적는다.
+    """
+    import torch  # type: ignore[import-not-found]
+
+    if torch.cuda.is_available():
+        log.info(
+            "GPU %s / torch %s (CUDA %s)",
+            torch.cuda.get_device_name(0),
+            torch.__version__,
+            torch.version.cuda,
+        )
+        return
+
+    # 드라이버가 지원하는 CUDA 버전. 12040 = 12.4
+    raw = 0
+    try:
+        raw = int(torch._C._cuda_getDriverVersion())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - 없는 빌드도 있다. 진단용일 뿐이다
+        pass
+    driver = f"{raw // 1000}.{raw % 1000 // 10}" if raw else "확인 불가"
+
+    raise RuntimeError(
+        "torch 가 GPU 를 보지 못합니다 (torch.cuda.is_available() == False).\n"
+        f"  torch {torch.__version__}  /  빌드된 CUDA {torch.version.cuda}\n"
+        f"  드라이버가 지원하는 CUDA {driver}\n"
+        "\n"
+        "카드가 있는데도 이렇게 되는 가장 흔한 원인은 **torch 휠이 드라이버보다\n"
+        "높은 CUDA 로 빌드된 것**입니다. 드라이버에 맞는 휠로 다시 까십시오:\n"
+        "    pip uninstall -y torch torchvision\n"
+        "    pip install torch --index-url https://download.pytorch.org/whl/cu121\n"
+        "    python -c \"import torch; print(torch.cuda.is_available())\"\n"
+        "\n"
+        f"(CPU 학습은 지원하지 않습니다. 9B 모델에 {dtype} 로는 의미가 없습니다.)"
+    )
+
+
+def check_servable(path: Path) -> None:
+    """머지한 디렉터리가 vLLM 으로 바로 올릴 수 있는 모양인지 본다.
+
+    빠진 파일이 있으면 vLLM 은 ``Failed to load the tokenizer`` 처럼 **원인과
+    다른 곳을 가리키는** 메시지로 죽는다. 저장 직후에 확인하는 편이 싸다.
+
+    고치지는 않는다 — 무엇이 없는지 알려주고 판단은 사람이 한다.
+    """
+    need = {
+        "config.json": "모델 설정",
+        "tokenizer_config.json": "토크나이저 설정",
+        "preprocessor_config.json": "이미지 프로세서 설정",
+    }
+    missing = [f"{name} ({why})" for name, why in need.items() if not (path / name).is_file()]
+    # 토크나이저 본체는 형식이 둘 중 하나다.
+    if not (path / "tokenizer.json").is_file() and not (path / "vocab.json").is_file():
+        missing.append("tokenizer.json 또는 vocab.json (토크나이저 본체)")
+
+    if missing:
+        log.warning(
+            "머지 디렉터리에 빠진 파일이 있습니다 — vLLM 이 뜨지 않을 수 있습니다:\n  %s\n"
+            "  베이스 모델에서 복사하거나, vLLM 에 --tokenizer <베이스모델> 로 따로 지정하세요.",
+            "\n  ".join(missing),
+        )
+        return
+
+    print(
+        f"\n서빙:\n"
+        f"    vllm serve {path} \\\n"
+        f"      --max-model-len 8192 --dtype bfloat16 \\\n"
+        f"      --limit-mm-per-prompt image=1 --enable-prefix-caching \\\n"
+        f"      --guided-decoding-backend xgrammar \\\n"
+        f"      --trust-remote-code\n"
+        f"  **--trust-remote-code 를 빼지 마십시오.** Qwen-VL 의 토크나이저·프로세서는\n"
+        f"  transformers 에 내장되지 않은 커스텀 코드라, 없으면 vLLM 이\n"
+        f"  'Failed to load the tokenizer' 로 죽습니다."
+    )
+
+
 def load_model(model_id: str, dtype: str, device_map: str | None = None) -> tuple[Any, Any]:
     """모델과 프로세서를 올린다.
 
@@ -431,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from transformers import Trainer, TrainingArguments  # type: ignore[import-not-found]
 
+    # 9B 를 다 불러온 뒤 TrainingArguments 안에서 죽지 않도록 먼저 본다.
+    require_cuda(tc.dtype)
+
     model, processor = load_model(tc.model, tc.dtype)
     model = attach_lora(model, tc)
 
@@ -493,7 +581,14 @@ def main(argv: list[str] | None = None) -> int:
         merged = model.merge_and_unload()
         merged.save_pretrained(args.merge)
         processor.save_pretrained(args.merge)
+        # 토크나이저를 한 번 더 명시적으로 쓴다. ProcessorMixin 이 하위
+        # 구성요소를 함께 저장하지만, 빠지면 vLLM 이 "Failed to load the
+        # tokenizer" 로 죽고 그 메시지는 원인을 가리키지 않는다. 중복 저장은
+        # 무해하다.
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.save_pretrained(args.merge)
         print(f"머지 저장 (서빙용): {args.merge}")
+        check_servable(Path(args.merge))
 
     print("\n다음 — 반드시 **두 축을 함께** 재라:")
     print("  좌표   python scripts/diagnose.py <평가 페이지들>")
