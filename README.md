@@ -147,22 +147,49 @@ python scripts/build_grounding_data.py <문서들> -o data/g -c config/default.y
 
 ### ② 학습
 
+**평범한 SFT 다.** 좌표 회귀 헤드도, 특별한 손실도 없다.
+
+```
+[system] + [타일 이미지] + [user]  →  모델이 정답 JSON 을 생성
+                                       ↑ 이 토큰들에만 cross-entropy
+```
+
+모델은 **이미 이 형식으로 답한다.** 숫자만 틀리니까 그 숫자를 정답으로 놓고
+next-token 예측을 돌리는 것이 전부다. 프롬프트 토큰은 손실에서 뺀다 — 안 빼면
+모델이 자기 지시문을 외운다.
+
 ```bash
-python scripts/train_grounding.py --data data/g/data.jsonl --dry-run          # 배선 확인
-python scripts/train_grounding.py --data data/g/data.jsonl -o out/s --max-samples 8   # 스모크
+python scripts/train_grounding.py --data data/g/data.jsonl --dry-run          # ① 배선 확인
+python scripts/train_grounding.py --data data/g/data.jsonl -o out/s --max-samples 8   # ② 스모크
 python scripts/train_grounding.py --data data/g/data.jsonl -o out/lora --merge out/merged
 ```
 
+**①을 건너뛰지 마라.** GPU 없이 돌고, 손실이 걸리는 문자열을 디코딩해 보여준다.
+거기 정답 JSON 만 나와야 한다. 지시문이 섞여 있거나 시작이 한 토큰 밀리면
+**학습 로그에는 아무 징후가 없고** "좌표가 안 좋아지네" 로만 나타난다.
+
+**어디를 여는가**
+
 | 부위 | 기본 | 왜 |
 |---|---|---|
-| LLM attention/MLP | LoRA | |
+| LLM attention/MLP | LoRA r=16 | |
 | **vision merger** | **전체 학습** | 패치 4개를 토큰 1개로 압축하는 자리. **32px 격자 아래 위치정보가 여기서 살아남느냐로 결정된다.** 선형층 두어 개라 통째로 열어도 싸다 |
 | ViT | 동결 | `--vision-blocks N` 으로 상위 N개 블록에 LoRA |
 
 ViT 를 기본으로 안 여는 건 **순서** 때문이다. merger 만 열고 먼저 재야 어디까지가
 merger 몫인지 안다 (`--no-merger` 로 A/B). 격자 아래로 못 내려가면 그때 켠다.
 
-`--merge` 로 저장한 가중치를 vLLM 에 올린다.
+**규모**
+
+| | |
+|---|---|
+| 하드웨어 | A100·H100 **1장** (9B bf16 + LoRA + grad checkpointing) |
+| 시간 | 수 시간 |
+| 데이터 | 페이지 500~2,000장이면 시작할 만하다 (장당 샘플 5개, 좌표 라벨 ~80개) |
+| 기본값 | lr 1e-4, batch 1 × accum 8, 1 epoch, bf16 |
+
+**서빙**은 `--merge` 로 베이스에 합친 체크포인트를 vLLM 에 올린다. LoRA 핫스왑은
+비전타워 쪽 보장이 애매한데, 어차피 모델 하나만 쓰므로 머지가 확실하다.
 
 ### ③ 평가 — **반드시 두 축을 함께**
 
