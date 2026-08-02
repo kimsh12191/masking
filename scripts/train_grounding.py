@@ -227,42 +227,53 @@ def require_cuda(dtype: str) -> None:
     )
 
 
-def check_servable(path: Path) -> None:
-    """머지한 디렉터리가 vLLM 으로 바로 올릴 수 있는 모양인지 본다.
+def check_servable(path: Path, base_model: str) -> None:
+    """머지한 디렉터리를 **실제로 불러 본다.**
 
-    빠진 파일이 있으면 vLLM 은 ``Failed to load the tokenizer`` 처럼 **원인과
-    다른 곳을 가리키는** 메시지로 죽는다. 저장 직후에 확인하는 편이 싸다.
+    파일이 있는지만 보는 검사로는 부족하다. 파일은 다 있는데 내용이 틀린 경우가
+    있고 (예: ``tokenizer_config.json`` 의 ``tokenizer_class`` 가 실재하지 않는
+    클래스), 그러면 vLLM 이 기동 중에 죽는다. 여기서 한 번 불러 보면 같은 실패를
+    **저장 직후, 원인이 보이는 자리에서** 만난다.
 
-    고치지는 않는다 — 무엇이 없는지 알려주고 판단은 사람이 한다.
+    고치지는 않는다 — 무엇이 안 되는지와 우회 방법을 알려주고 판단은 사람이 한다.
     """
-    need = {
-        "config.json": "모델 설정",
-        "tokenizer_config.json": "토크나이저 설정",
-        "preprocessor_config.json": "이미지 프로세서 설정",
-    }
-    missing = [f"{name} ({why})" for name, why in need.items() if not (path / name).is_file()]
-    # 토크나이저 본체는 형식이 둘 중 하나다.
-    if not (path / "tokenizer.json").is_file() and not (path / "vocab.json").is_file():
-        missing.append("tokenizer.json 또는 vocab.json (토크나이저 본체)")
+    from transformers import AutoProcessor, AutoTokenizer  # type: ignore[import-not-found]
 
-    if missing:
-        log.warning(
-            "머지 디렉터리에 빠진 파일이 있습니다 — vLLM 이 뜨지 않을 수 있습니다:\n  %s\n"
-            "  베이스 모델에서 복사하거나, vLLM 에 --tokenizer <베이스모델> 로 따로 지정하세요.",
-            "\n  ".join(missing),
+    problems: list[str] = []
+    for name, loader in (("토크나이저", AutoTokenizer), ("프로세서", AutoProcessor)):
+        try:
+            loader.from_pretrained(path, trust_remote_code=True)
+        except Exception as exc:  # noqa: BLE001 - 어떤 예외든 서빙이 안 된다는 뜻이다
+            problems.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    if problems:
+        log.error(
+            "머지 디렉터리를 불러올 수 없습니다 — vLLM 도 같은 이유로 죽습니다:\n  %s\n"
+            "\n"
+            "  베이스 모델의 것으로 다시 쓰면 대개 해결됩니다:\n"
+            "      python -c \"from transformers import AutoProcessor; \"\\\n"
+            "        \"AutoProcessor.from_pretrained('%s', trust_remote_code=True)\"\\\n"
+            "        \".save_pretrained('%s')\"\n"
+            "  또는 vLLM 에 토크나이저를 따로 지정하십시오:\n"
+            "      vllm serve %s --tokenizer %s --trust-remote-code ...",
+            "\n  ".join(problems),
+            base_model,
+            path,
+            path,
+            base_model,
         )
         return
 
     print(
-        f"\n서빙:\n"
+        f"\n불러오기 확인 OK (토크나이저·프로세서)\n"
+        f"서빙:\n"
         f"    vllm serve {path} \\\n"
         f"      --max-model-len 8192 --dtype bfloat16 \\\n"
         f"      --limit-mm-per-prompt image=1 --enable-prefix-caching \\\n"
         f"      --guided-decoding-backend xgrammar \\\n"
         f"      --trust-remote-code\n"
         f"  **--trust-remote-code 를 빼지 마십시오.** Qwen-VL 의 토크나이저·프로세서는\n"
-        f"  transformers 에 내장되지 않은 커스텀 코드라, 없으면 vLLM 이\n"
-        f"  'Failed to load the tokenizer' 로 죽습니다."
+        f"  transformers 에 내장되지 않은 커스텀 코드입니다."
     )
 
 
@@ -580,15 +591,18 @@ def main(argv: list[str] | None = None) -> int:
         # 올리면 그 문제가 없고, 어차피 모델 하나만 쓴다.
         merged = model.merge_and_unload()
         merged.save_pretrained(args.merge)
+        # **``processor.save_pretrained`` 만 부른다.** 이것이 토크나이저와 이미지
+        # 프로세서를 함께 저장한다.
+        #
+        # 여기에 ``processor.tokenizer.save_pretrained()`` 를 덧붙이면 안 된다.
+        # 무해한 중복처럼 보이지만 **방금 쓴 tokenizer_config.json 을 덮어쓴다.**
+        # transformers 버전에 따라 ``processor.tokenizer`` 가 실제 토크나이저가
+        # 아니라 래퍼(``TokenizerBackend`` 등)라서, 그 클래스 이름이
+        # ``tokenizer_class`` 로 기록되고 vLLM 이
+        # ``Tokenizer class TokenizerBackend does not exist`` 로 죽는다.
         processor.save_pretrained(args.merge)
-        # 토크나이저를 한 번 더 명시적으로 쓴다. ProcessorMixin 이 하위
-        # 구성요소를 함께 저장하지만, 빠지면 vLLM 이 "Failed to load the
-        # tokenizer" 로 죽고 그 메시지는 원인을 가리키지 않는다. 중복 저장은
-        # 무해하다.
-        if hasattr(processor, "tokenizer"):
-            processor.tokenizer.save_pretrained(args.merge)
         print(f"머지 저장 (서빙용): {args.merge}")
-        check_servable(Path(args.merge))
+        check_servable(Path(args.merge), tc.model)
 
     print("\n다음 — 반드시 **두 축을 함께** 재라:")
     print("  좌표   python scripts/diagnose.py <평가 페이지들>")
