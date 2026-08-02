@@ -290,10 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--read-ratio",
         type=float,
-        default=0.3,
+        default=0.0,
         help="빈 항목(도장·손글씨)이 있는 영역에서 'read' 과제도 낼 확률. "
-        "지목할 텍스트가 없는 영역은 이 과제로만 가르칠 수 있다. "
-        "0 이면 locate 만 만든다",
+        "**기본은 0 (locate 만)** — 좌표 능력은 내용과 무관해서 글자로 배운 것이 "
+        "도장에도 쓰이고, 서명 블록은 원래 커서 32px 오차의 비중이 작다. "
+        "과제를 둘로 늘리면 '가끔 text 를 빈 문자열로 낸다' 까지 배우는데 그게 "
+        "추론으로 새면 손해다. 학습 후 서명 좌표가 실제로 나쁘면 그때 켤 것",
     )
     ap.add_argument("--seed", type=int, default=0, help="증강 위치·과제 선택 난수 시드")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -360,8 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                     #   read    전부 읽고 위치까지. **지목할 텍스트가 없는**
                     #           도장·손글씨는 이쪽으로만 가르칠 수 있다
                     #
-                    # 텍스트가 있으면 locate, 그리고 빈 항목(도장·손글씨)이
-                    # 섞여 있으면 read 도 함께 낸다.
+                    # 기본은 locate 뿐이다. read 는 --read-ratio 로 켠다.
                     rows = []
                     query = sample.query()
                     if query:
