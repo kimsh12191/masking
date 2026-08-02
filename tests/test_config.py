@@ -436,3 +436,42 @@ class TestGridReport:
 
     def test_factor_one_disables_the_check(self) -> None:
         assert "격자 정렬을 쓰지 않는다" in grid_report(self._cfg(factor=1))
+
+
+class TestTrainingSections:
+    """학습 설정도 **같은 파일**에 있다.
+
+    학습 데이터를 서빙과 다른 캔버스·타일로 만들면 틀린 좌표를 학습시키는데
+    에러도 안 나고 결과만 나빠진다. 같은 파일에 있어야 그 결합이 보인다.
+    """
+
+    def test_defaults_exist_without_a_file(self, isolated: Path) -> None:
+        c = load_config()
+        assert c.grounding.query_ratio == (0.25, 1.0)
+        assert c.train.model == "Qwen/Qwen3.5-9B"
+        assert c.train.vision_blocks == 0  # ViT 는 기본 동결
+
+    def test_file_overrides_both_sections(self, isolated: Path) -> None:
+        path = write_yaml(
+            isolated / "c.yaml",
+            "grounding:\n  read_ratio: 0.5\n  aug_scales: [3.0]\n"
+            "train:\n  rank: 8\n  vision_blocks: 4\n",
+        )
+        c = load_config(path)
+        assert c.grounding.read_ratio == 0.5
+        assert c.grounding.aug_scales == [3.0]
+        assert c.train.rank == 8
+        assert c.train.vision_blocks == 4
+
+    def test_typo_still_raises(self, isolated: Path) -> None:
+        """폐쇄망에서 설정이 반영 안 된 채 도는 게 가장 찾기 어려운 실패다."""
+        path = write_yaml(isolated / "c.yaml", "train:\n  rnak: 8\n")
+        with pytest.raises(ValueError, match="rnak"):
+            load_config(path)
+
+    def test_training_sections_do_not_touch_the_pipeline(self, isolated: Path) -> None:
+        """추론 런타임은 pipeline 만 읽는다. 운영 서버에 부담이 없어야 한다."""
+        path = write_yaml(isolated / "c.yaml", "train:\n  rank: 8\n")
+        c = load_config(path)
+        assert not hasattr(c.pipeline, "rank")
+        assert c.pipeline.detect.tiles == 3

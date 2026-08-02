@@ -37,6 +37,7 @@ OCR 은 좌표를 정확히 준다. 그걸 그대로 정답으로 쓴다.
 다시 추론 경로로 통과시켜 원래 박스로 돌아오는지 검산한다.
 """
 
+from .config import TrainConfig
 from .dataset import (
     GroundingConfig,
     TileSample,
@@ -49,6 +50,7 @@ from .dataset import (
 
 __all__ = [
     "GroundingConfig",
+    "TrainConfig",
     "TileSample",
     "build_tile_sample",
     "roundtrip",
