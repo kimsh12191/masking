@@ -201,9 +201,44 @@ python scripts/measure.py  <평가 페이지들>    # 재현율
 **재현율이 떨어졌으면 좌표가 좋아졌어도 실패다.** 개인정보 판단 능력이 이
 프로젝트의 자산이고, 좌표 학습으로 그걸 잃으면 손해다.
 
-> 학습된 모델을 올릴 때 `llm/prompts.py` 의 `_BBOX_PRECISION_COARSE` 를
-> `_BBOX_PRECISION_TIGHT` 로 바꿔야 한다. 정밀하게 학습시켜 놓고 추론에서
-> "대충 잡아라" 라고 지시하면 학습한 것을 되돌린다.
+---
+
+## 반드시 맞춰야 하는 것
+
+### 추론 — 안 맞으면 안 돌거나 조용히 나빠진다
+
+| 설정 | 왜 |
+|---|---|
+| `llm.model` / `llm.base_url` | vLLM 이 서빙하는 것과 **정확히** 같아야 한다 |
+| `ocr.det_model_dir` / `rec_model_dir` / `cls_model_dir` | **폐쇄망 필수.** 없으면 첫 실행에서 자동 다운로드를 시도하다 죽는다 |
+| `detect.image_factor` | **모델을 바꾸면 반드시 같이.** Qwen3-VL `32` / Qwen2·2.5-VL `28`. 틀리면 좌표가 위치에 비례해 밀리는데, 에러는 안 난다 |
+| `pipeline.canvas` · `llm.image_max_side` | `image_factor` 의 **배수**. 아니면 서버가 조각을 다시 리샘플해 작은 글씨가 뭉개진다 = 미탐 |
+| `ocr.gpu_id` | vLLM 과 같은 카드면 메모리 경합. 카드가 여러 장이면 나눈다 |
+
+```bash
+python scripts/run.py --print-config     # 위 조합을 검산해준다
+```
+
+### 학습 — 추론과 **같아야** 한다
+
+| | 왜 |
+|---|---|
+| `build_grounding_data.py -c <서빙과 같은 config>` | **가장 중요.** 캔버스·타일이 다르면 **틀린 좌표를 학습시킨다.** 에러도 안 나고 결과만 나빠진다 |
+| `train_grounding.py --model <서빙할 베이스 모델>` | 다르면 어댑터가 안 맞는다 |
+| `--merger-module` | 못 찾으면 죽으면서 알려준다. `--list-modules` 로 실제 이름 확인 |
+
+### 학습 후에는 바꾸지 마라
+
+```
+pipeline.canvas   detect.tiles   detect.overlap   detect.image_factor   llm.image_max_side
+```
+
+모델이 그 기하로 좌표를 배웠다. 바꾸면 **본 적 없는 입력**이 되므로 `diagnose.py`
+로 다시 재야 한다. 학습 전에 확정해 두는 것이 안전하다.
+
+그리고 학습된 모델을 올릴 때 **프롬프트 한 곳**을 바꾼다 —
+`llm/prompts.py` 의 `_BBOX_PRECISION_COARSE` → `_BBOX_PRECISION_TIGHT`.
+정밀하게 학습시켜 놓고 추론에서 "대충 잡아라" 라고 지시하면 학습한 것을 되돌린다.
 
 ---
 
