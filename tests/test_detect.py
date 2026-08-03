@@ -755,7 +755,11 @@ class TestUniformTiles:
 
 
 class FakeAsyncClient:
-    """``complete_json_many`` 만 흉내낸다. 요청 순서대로 payload 를 돌려준다."""
+    """``complete_json_many`` 만 흉내낸다. 요청 순서대로 payload 를 돌려준다.
+
+    실제 클라이언트의 계약대로 ``meta["tag"]`` 를 되돌려준다 —
+    ``label_metas`` 가 그 태그로 짝을 검증한다.
+    """
 
     config = LlmConfig()
 
@@ -771,7 +775,10 @@ class FakeAsyncClient:
             n = len(self.requests)
             self.requests.append(request)
             out.append(
-                (self.payloads[n] if n < len(self.payloads) else {"findings": []}, {})
+                (
+                    self.payloads[n] if n < len(self.payloads) else {"findings": []},
+                    {"tag": request.tag},
+                )
             )
         return out
 
@@ -852,7 +859,7 @@ class TestDetectAsync:
         class Partial(FakeAsyncClient):
             async def complete_json_many(self, requests, concurrency=None, on_done=None):
                 out = await super().complete_json_many(requests, concurrency, on_done)
-                out[1] = ({}, {"error": "타임아웃"})
+                out[1] = ({}, {"error": "타임아웃", "tag": requests[1].tag})
                 return out
 
         warnings: list[str] = []

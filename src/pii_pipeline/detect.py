@@ -541,9 +541,26 @@ def label_metas(
 
     동기 경로가 호출 직후에 하던 일과 같다. 순서는 ``plan.calls`` 와 1:1 이다
     (``complete_json_many`` 가 제출 순서를 지킨다).
+
+    **응답에 태그가 있으면 짝이 맞는지 확인한다.** 여기서 어긋난 채로 넘어가면
+    타일 번호가 뒤바뀌고, ``_to_page`` 가 엉뚱한 rect 로 좌표를 환산한다.
+    그 결과는 예외도 경고도 없이 "박스가 엉뚱한 곳에 있다" 로만 보인다 —
+    올바른 좌표와 구분할 방법이 화면에 없으므로 여기서 멈춘다.
+
+    Raises:
+        RuntimeError: 응답의 태그가 기대한 ``(타일, 샘플)`` 과 다를 때.
+        ValueError: 응답 개수가 요청 개수와 다를 때 (``zip(strict=True)``).
     """
     metas: list[dict[str, Any]] = []
     for (tile_no, sample_no), (payload, meta) in zip(plan.calls, results, strict=True):
+        tag = meta.get("tag")
+        if isinstance(tag, tuple) and len(tag) >= 3:
+            if (tag[1], tag[2]) != (tile_no, sample_no):
+                raise RuntimeError(
+                    f"VLM 응답 짝이 어긋났습니다: 타일·샘플 "
+                    f"({tile_no}, {sample_no}) 자리에 태그 {tag} 가 왔습니다. "
+                    f"응답 순서가 요청 순서와 다릅니다"
+                )
         meta["tile"] = tile_no
         meta["sample"] = sample_no
         meta["rect"] = [round(v, 4) for v in plan.rects[tile_no]]

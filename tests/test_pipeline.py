@@ -380,6 +380,10 @@ class FakeAsyncClient:
 
     **동시에 몇 개가 떠 있었는지 기록한다** — 상한이 실제로 걸리는지 보려면
     반환값만으로는 알 수 없다.
+
+    실제 클라이언트의 계약대로 ``meta["tag"]`` 를 되돌려준다. 파이프라인이
+    응답을 페이지별로 되짚는 근거가 그 태그이므로, 이걸 빼면 fake 가 대역할
+    대상과 다른 물건이 된다.
     """
 
     config = LlmConfig()
@@ -411,7 +415,7 @@ class FakeAsyncClient:
                     self.payloads[n] if n < len(self.payloads) else {"findings": []}
                 )
                 self.in_flight -= 1
-                return payload, {}
+                return payload, {"tag": request.tag}
 
         return list(await asyncio.gather(*(one(r) for r in requests)))
 
@@ -567,3 +571,211 @@ class TestRunBatchAsync:
         assert results[1].width == 0  # 가운데가 실패한 자리다
         assert any("처리 실패" in w for w in results[1].warnings)
         assert not any("처리 실패" in w for w in results[0].warnings)
+
+
+class TagAsyncClient:
+    """**요청의 tag 로** payload 를 고른다.
+
+    호출 순서로 고르는 fake 로는 묶음 복원을 검증할 수 없다 — 동시 실행에서
+    호출 순서 자체가 보장되지 않으므로, 그 fake 가 통과해도 grouping 이 맞는지
+    알 수 없다. 여기서는 ``tag=(페이지, 타일, 샘플)`` 을 키로 쓴다.
+    """
+
+    config = LlmConfig()
+
+    def __init__(self, by_tag: dict[tuple[int, int], dict]) -> None:
+        self.by_tag = by_tag
+        self.seen: list[Any] = []
+
+    async def complete_json_many(
+        self, requests: list[Any], concurrency: int | None = None, on_done: Any = None
+    ):
+        import asyncio
+
+        async def one(request: Any):
+            # 완료 순서를 일부러 뒤섞는다 — 순서에 의존하는 코드를 드러낸다.
+            page, tile, _sample = request.tag
+            await asyncio.sleep(0.001 * ((tile + 1) % 3))
+            return self.by_tag.get((page, tile), {"findings": []}), {"tag": request.tag}
+
+        self.seen = list(requests)
+        return list(await asyncio.gather(*(one(r) for r in requests)))
+
+    async def aclose(self) -> None:
+        return None
+
+
+class TestWindowRegrouping:
+    """묶음 응답을 페이지별로 되쪼개는 부분을 정면으로 본다.
+
+    **기존 배치 테스트는 전부 tiles=1 이라 이 버그를 잡을 수 없었다** —
+    페이지당 요청이 1개면 offset 을 잘못 계산해도 우연히 맞는다.
+    여기서는 페이지마다 여러 타일을 두고 (페이지, 타일) 별로 다른 값을 넣어
+    섞였는지 확인한다.
+    """
+
+    @staticmethod
+    def marked(pages: int, tiles: int) -> dict[tuple[int, int], dict]:
+        """(페이지, 타일) 마다 유일한 값을 넣는다. 섞이면 즉시 드러난다."""
+        return {
+            (p, t): {
+                "findings": [
+                    vlm_item(
+                        f"p{p}t{t}",
+                        "NAME",
+                        # 타일 안에서 서로 다른 자리에 둔다 (중복 제거에 걸리지 않게)
+                        (100 + 50 * t, 100 + 50 * t, 300 + 50 * t, 150 + 50 * t),
+                    )
+                ]
+            }
+            for p in range(pages)
+            for t in range(tiles)
+        }
+
+    def run_pages(self, n_pages: int, tiles: int, window: int):
+        import asyncio
+
+        client = TagAsyncClient(self.marked(n_pages, tiles))
+        pipe = PiiPipeline(
+            PipelineConfig(
+                detect=DetectConfig(tiles=tiles, workers=1),
+                locate=LocateConfig(upscale=1.0),
+            )
+        )
+        pipe.async_llm = client  # type: ignore[assignment]
+        pipe.ocr = FakeOcr([])  # type: ignore[assignment]
+        pipe.config.batch.pages = window
+        paths = [f"p{i}.png" for i in range(n_pages)]
+        results = asyncio.run(pipe.run_batch_async(paths))
+        return results, client
+
+    def test_each_page_gets_only_its_own_tiles(self, no_preprocess: None) -> None:
+        results, _ = self.run_pages(n_pages=3, tiles=3, window=3)
+
+        assert len(results) == 3
+        for page, result in enumerate(results):
+            got = sorted(f.text for f in result.findings)
+            assert got == [f"p{page}t{t}" for t in range(3)], f"페이지 {page} 가 섞였다"
+
+    def test_offsets_are_not_confused_with_page_index(self, no_preprocess: None) -> None:
+        """``raw[index:index+count]`` 처럼 쓰면 2번째 페이지부터 어긋난다.
+
+        페이지당 타일이 1개면 index 와 offset 이 같아서 드러나지 않는다.
+        """
+        results, _ = self.run_pages(n_pages=2, tiles=3, window=2)
+        assert sorted(f.text for f in results[1].findings) == ["p1t0", "p1t1", "p1t2"]
+
+    def test_windows_do_not_leak_into_each_other(self, no_preprocess: None) -> None:
+        """묶음 경계에서 태그가 겹치면 두 번째 묶음이 첫 묶음 응답을 집어 간다.
+
+        실제로 그랬다 — tag 가 묶음 안에서만 유일했다. 페이지당 타일이 1개면
+        드러나지 않고, 묶음이 하나뿐이어도 드러나지 않는다.
+        """
+        results, _ = self.run_pages(n_pages=5, tiles=2, window=2)
+
+        assert len(results) == 5
+        for page, result in enumerate(results):
+            got = sorted(f.text for f in result.findings)
+            assert got == [f"p{page}t{t}" for t in range(2)], f"페이지 {page} 가 섞였다"
+
+    def test_tile_coordinates_land_in_the_right_band(self, no_preprocess: None) -> None:
+        """타일 번호가 섞이면 좌표가 페이지의 엉뚱한 띠로 간다.
+
+        값이 맞아도 좌표가 밀릴 수 있으므로 따로 본다 — ``_to_page`` 는
+        타일 번호로 rect 를 고른다.
+        """
+        results, _ = self.run_pages(n_pages=2, tiles=3, window=2)
+        for result in results:
+            by_text = {f.text: f for f in result.findings}
+            tops = [by_text[f"p{result.image_path[1]}t{t}"].bbox_norm[1] for t in range(3)]
+            # 타일 0 -> 1 -> 2 로 갈수록 페이지 아래쪽이어야 한다
+            assert tops == sorted(tops), f"타일 순서가 좌표에 반영되지 않았다: {tops}"
+
+    def test_every_request_is_submitted_once(self, no_preprocess: None) -> None:
+        _, client = self.run_pages(n_pages=3, tiles=3, window=3)
+        tags = [r.tag for r in client.seen]
+        assert len(tags) == 9
+        assert len(set(tags)) == 9  # 중복 제출이 없다
+
+
+class TestGroupByPage:
+    """묶기는 **순서가 아니라 태그**로 한다.
+
+    순서를 신뢰하면 그 계약이 깨진 순간 다른 페이지의 좌표를 이 페이지에 그려
+    넣는다. 예외도 경고도 없이 박스만 엉뚱해지므로 값을 지불하고 태그로 되짚는다.
+    """
+
+    @staticmethod
+    def entry(page: int, tile: int, sample: int = 0):
+        return {"findings": []}, {"tag": (page, tile, sample)}
+
+    def test_splits_by_page(self) -> None:
+        raw = [self.entry(0, 0), self.entry(1, 0), self.entry(0, 1), self.entry(1, 1)]
+        grouped = pipeline_mod._group_by_page(raw)
+        assert sorted(grouped) == [0, 1]
+        assert all(len(v) == 2 for v in grouped.values())
+
+    def test_restores_tile_order_within_a_page(self) -> None:
+        """응답이 뒤섞여 와도 페이지 안에서는 (타일, 샘플) 순서로 돌려준다.
+
+        ``TilePlan.calls`` 가 그 순서라서, 이 정렬이 label_metas 의 짝을 맞춘다.
+        """
+        raw = [self.entry(0, 2), self.entry(0, 0), self.entry(0, 1)]
+        grouped = pipeline_mod._group_by_page(raw)
+        assert [m["tag"][1] for _, m in grouped[0]] == [0, 1, 2]
+
+    def test_sorts_samples_within_a_tile(self) -> None:
+        raw = [self.entry(0, 1, 1), self.entry(0, 0, 1), self.entry(0, 0, 0)]
+        grouped = pipeline_mod._group_by_page(raw)
+        assert [(m["tag"][1], m["tag"][2]) for _, m in grouped[0]] == [(0, 0), (0, 1), (1, 1)]
+
+    def test_untagged_responses_are_not_silently_dropped(self) -> None:
+        """버리면 개수가 맞아 보일 수 있다 — 모아 두면 호출부가 불일치로 알아챈다."""
+        grouped = pipeline_mod._group_by_page([({"findings": []}, {})])
+        assert grouped == {-1: [({"findings": []}, {})]}
+
+
+class TestRegroupingFailsLoudly:
+    """묶기가 어긋나면 **멈춘다.** 진행하면 조용히 틀린 좌표를 낸다."""
+
+    def test_missing_responses_raise(self, no_preprocess: None) -> None:
+        import asyncio
+
+        class Short(TagAsyncClient):
+            async def complete_json_many(self, requests, concurrency=None, on_done=None):
+                out = await super().complete_json_many(requests, concurrency, on_done)
+                return out[:-1]  # 하나를 잃어버린다
+
+        pipe = PiiPipeline(
+            PipelineConfig(
+                detect=DetectConfig(tiles=2, workers=1),
+                locate=LocateConfig(upscale=1.0),
+            )
+        )
+        pipe.async_llm = Short({})  # type: ignore[assignment]
+        pipe.ocr = FakeOcr([])  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="묶기 실패"):
+            asyncio.run(pipe.run_batch_async(["a.png"]))
+
+    def test_shuffled_tile_tags_raise_in_label_metas(self) -> None:
+        """페이지는 맞는데 타일 짝이 어긋난 경우 — rect 가 뒤바뀐다."""
+        from pii_pipeline.detect import label_metas, plan_tiles
+
+        plan = plan_tiles(blank_page(), DetectConfig(tiles=2, workers=1), 1984, [])
+        bad = [
+            ({"findings": []}, {"tag": (0, 1, 0)}),  # 자리와 태그가 뒤바뀜
+            ({"findings": []}, {"tag": (0, 0, 0)}),
+        ]
+        with pytest.raises(RuntimeError, match="짝이 어긋났습니다"):
+            label_metas(bad, plan)
+
+    def test_matching_tags_pass(self) -> None:
+        from pii_pipeline.detect import label_metas, plan_tiles
+
+        plan = plan_tiles(blank_page(), DetectConfig(tiles=2, workers=1), 1984, [])
+        good = [
+            ({"findings": []}, {"tag": (0, 0, 0)}),
+            ({"findings": []}, {"tag": (0, 1, 0)}),
+        ]
+        assert [m["tile"] for m in label_metas(good, plan)] == [0, 1]

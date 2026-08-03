@@ -137,6 +137,44 @@ def _timed(timings: dict[str, float], key: str) -> Iterator[None]:
         timings[key] = time.perf_counter() - start
 
 
+def _group_by_page(
+    raw: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[int, list[tuple[dict[str, Any], dict[str, Any]]]]:
+    """묶음 응답을 **태그로** 페이지별로 나눈다.
+
+    순서로 자르지 않는 이유가 이 함수의 존재 이유다. ``complete_json_many`` 가
+    제출 순서를 지키는 것은 테스트로 지키지만, 그 계약이 깨지면 **다른 페이지의
+    좌표를 이 페이지에 그려 넣는다.** 예외도 로그도 없이 박스만 엉뚱해지므로
+    순서를 신뢰하는 대신 태그로 되짚는다.
+
+    페이지 안에서는 ``(타일, 샘플)`` 로 정렬한다. ``TilePlan.calls`` 가
+    ``[(t, s) for t in ... for s in ...]`` 로 만들어지므로 이 정렬이 그 순서를
+    정확히 재현하고, 따라서 ``label_metas`` 의 zip 이 짝을 맞춘다.
+
+    Args:
+        raw: ``complete_json_many`` 의 결과. 각 메타에 ``tag`` 가 있어야 한다.
+
+    Returns:
+        ``{페이지 번호: [(payload, meta), ...]}``. 태그가 없는 응답은 버리지
+        않고 ``-1`` 로 모아 호출부가 개수 불일치로 알아채게 한다.
+    """
+    out: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for payload, meta in raw:
+        tag = meta.get("tag")
+        page = tag[0] if isinstance(tag, tuple) and tag else -1
+        out.setdefault(page, []).append((payload, meta))
+    for items in out.values():
+        items.sort(key=lambda pm: _tile_sample(pm[1]))
+    return out
+
+
+def _tile_sample(meta: dict[str, Any]) -> tuple[int, int]:
+    tag = meta.get("tag")
+    if isinstance(tag, tuple) and len(tag) >= 3:
+        return int(tag[1]), int(tag[2])
+    return 0, 0
+
+
 def _chunked(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
     """제너레이터를 ``size`` 개씩 끊어 낸다. **미리 다 꺼내지 않는다.**
 
@@ -520,14 +558,17 @@ class PiiPipeline:
             self.page_units(image_paths, pages=pages, password=password),
             max(1, cfg.batch.pages),
         ):
-            n_seen += len(window)
             # **묶음 안의 순서를 지킨다.** 성공한 것만 모아 처리하고 나중에
             # 이어 붙이면 실패한 페이지가 앞으로 몰려 입력 순서가 깨진다.
             outs = await self._prepare_window(window)
             prepared = [o for o in outs if isinstance(o, tuple)]
 
             if prepared:
-                await self._detect_window(prepared)
+                # base 는 **지금까지 펼친 페이지 수**다. 묶음마다 len(window)
+                # 만큼 뛰므로 태그가 묶음 사이에서 겹치지 않는다. 겹치면 두 번째
+                # 묶음이 첫 묶음의 응답을 집어 간다.
+                await self._detect_window(prepared, base=n_seen)
+            n_seen += len(window)
 
             for out in outs:
                 result = out[0] if isinstance(out, tuple) else out
@@ -604,17 +645,20 @@ class PiiPipeline:
             )
 
     async def _detect_window(
-        self, prepared: list[tuple[PageResult, Any, int]]
+        self, prepared: list[tuple[PageResult, Any, int]], base: int
     ) -> None:
-        """묶음의 타일 요청을 **한 번에** 넣고, 페이지별로 조립·좌표확정까지 한다."""
+        """묶음의 타일 요청을 **한 번에** 넣고, 페이지별로 조립·좌표확정까지 한다.
+
+        Args:
+            prepared: ``(결과, 계획, 요청수)`` 목록.
+            base: 이 묶음의 첫 페이지에 붙일 **전역** 번호. 묶음마다 겹치지
+                않아야 태그가 페이지를 실제로 식별한다.
+        """
         cfg = self.config
 
         requests: list[Any] = []
-        offsets: list[int] = []
-        for index, (_, plan, count) in enumerate(prepared):
-            offsets.append(len(requests))
-            requests.extend(tile_requests(plan, tag=index))
-            assert count == len(plan.calls)
+        for index, (_, plan, _) in enumerate(prepared):
+            requests.extend(tile_requests(plan, tag=base + index))
 
         start = time.perf_counter()
         raw = await self.async_llm.complete_json_many(requests)
@@ -628,8 +672,19 @@ class PiiPipeline:
             cfg.llm.concurrency,
         )
 
+        grouped = _group_by_page(raw)
         for index, (result, plan, count) in enumerate(prepared):
-            chunk = raw[offsets[index] : offsets[index] + count]
+            chunk = grouped.pop(base + index, [])
+            if len(chunk) != count:
+                # 조각이 어긋난 채로 진행하면 **다른 페이지의 좌표를 이 페이지에
+                # 그려 넣는다.** 눈으로는 "박스가 엉뚱하다" 로만 보이므로
+                # 여기서 멈추고 무엇이 어긋났는지 적는다.
+                raise RuntimeError(
+                    f"VLM 응답 묶기 실패: 페이지 {base + index} "
+                    f"({result.image_path}) 는 요청 {count}개인데 응답 "
+                    f"{len(chunk)}개가 돌아왔습니다. 태그가 유일한지, "
+                    f"complete_json_many 가 요청마다 하나씩 돌려주는지 확인하십시오."
+                )
             metas = label_metas(chunk, plan)
             findings = collect_findings(metas, plan, cfg.detect, result.warnings)
             # 요청이 겹쳐 돌므로 페이지별 VLM 시간이라는 것이 없다.
@@ -637,3 +692,9 @@ class PiiPipeline:
             result.timings["detect"] = elapsed / len(prepared)
             result.timings["detect_window"] = elapsed
             self.finish_page(result, findings, metas)
+
+        if grouped:
+            raise RuntimeError(
+                f"VLM 응답 묶기 실패: 어느 페이지에도 속하지 않는 응답이 "
+                f"남았습니다 (태그 {sorted(grouped)}). 태그가 겹쳤을 수 있습니다."
+            )
