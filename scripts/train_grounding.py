@@ -69,12 +69,15 @@ from pii_pipeline.train.sft import (  # noqa: E402
     TOKEN_AXIS_KEYS,
     Example,
     build_messages,
-    check_uniform_image_size,
+    describe_sizes,
+    expected_tile_size,
     load_jsonl,
     mask_prompt,
     pad_fill_value,
+    resolve_image_size,
     select_vision_blocks,
     summarize,
+    tally_image_sizes,
 )
 
 log = logging.getLogger("train_grounding")
@@ -84,6 +87,27 @@ log = logging.getLogger("train_grounding")
 # --------------------------------------------------------------------------
 # 데이터셋 — 라이브러리 버전에 민감한 부분은 전부 여기 모아 둔다
 # --------------------------------------------------------------------------
+
+
+def resize_to(image: Any, size: tuple[int, int]) -> Any:
+    """PIL 이미지를 ``(폭, 높이)`` 로 맞춘다.
+
+    **좌표는 손대지 않는다.** 정답이 per-mille(0~1000 상대좌표)이라 이미지
+    크기에 불변이다. 이 성질이 없으면 강제 리사이즈는 라벨을 망가뜨리는 짓이
+    되므로, 여기서 좌표를 건드리지 않는 것이 우연이 아니라 전제다.
+
+    보간은 ``build_grounding_data.to_tile_size`` 의 방침을 따른다 — 줄일 때는
+    면적 평균에 가까운 LANCZOS, 늘릴 때는 BICUBIC. 작은 한글에서 이 선택이
+    무의미하지 않다.
+
+    이 함수를 타는 샘플은 **애초에 크기가 틀린 것들뿐이다.** 맞는 샘플은
+    호출되지 않으므로 보간이 한 번도 들어가지 않는다. 즉 정상 데이터의 픽셀은
+    추론 타일과 그대로 같고, 틀린 데이터만 보간 비용을 낸다.
+    """
+    from PIL import Image  # type: ignore[import-not-found]
+
+    shrinking = size[0] * size[1] < image.size[0] * image.size[1]
+    return image.resize(size, Image.LANCZOS if shrinking else Image.BICUBIC)
 
 
 class GroundingDataset:
@@ -98,10 +122,18 @@ class GroundingDataset:
     조용히 무의미해진다. 정확도 쪽에 값을 지불한다.
     """
 
-    def __init__(self, examples: list[Example], processor: Any, max_len: int) -> None:
+    def __init__(
+        self,
+        examples: list[Example],
+        processor: Any,
+        max_len: int,
+        image_size: tuple[int, int] | None = None,
+    ) -> None:
         self.examples = examples
         self.processor = processor
         self.max_len = max_len
+        #: 모든 입력을 강제로 맞출 ``(폭, 높이)``. ``None`` 이면 손대지 않는다.
+        self.image_size = image_size
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -112,6 +144,8 @@ class GroundingDataset:
         example = self.examples[index]
         messages, answer = build_messages(example)
         image = Image.open(example.image_path).convert("RGB")
+        if self.image_size is not None and image.size != self.image_size:
+            image = resize_to(image, self.image_size)
 
         prompt_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -177,18 +211,21 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
         # 이어 붙이는 축은 0 번뿐이고 **나머지 축은 전부 같아야 한다.** 다르면
         # torch 가 "Sizes of tensors must match except in dimension 0" 으로
         # 죽는데, 그 메시지에는 어느 키인지도 왜인지도 없다. DataLoader 워커
-        # 안에서 터져 traceback 이 두 겹이라 더 알아보기 어렵다. 여기서 먼저
-        # 잡아 원인을 적는다 — 원인은 거의 항상 하나다: 크기가 다른 이미지.
+        # 안에서 터져 traceback 이 두 겹이라 더 알아보기 어렵다.
+        #
+        # **여기는 백스톱이다.** ``GroundingDataset`` 이 모든 이미지를 추론 크기로
+        # 맞추므로 정상 경로에서는 걸리지 않는다. 그래도 남겨 두는 이유는, 걸린다면
+        # 그건 크기 맞추기가 새는 것이라는 뜻이고 그 사실이 메시지에 있어야 한다.
         tail = rows[0].shape[1:]
         for i, row in enumerate(rows[1:], 1):
             if row.shape[1:] != tail:
                 raise ValueError(
                     f"'{key}' 의 모양이 샘플마다 다릅니다: "
                     f"{tuple(rows[0].shape)} vs {tuple(row.shape)} (샘플 {i}).\n"
-                    "배치에 **크기가 다른 이미지**가 섞였습니다. 비전 텐서는 패딩이 "
-                    "아니라 이어 붙이는 대상이라 첫 축 말고는 모두 같아야 합니다.\n"
-                    "학습 데이터를 고정 크기로 다시 만들거나(pipeline.canvas), "
-                    "--batch 1 로 우회하세요."
+                    "비전 텐서는 패딩이 아니라 이어 붙이는 대상이라 첫 축 말고는 "
+                    "모두 같아야 합니다.\n"
+                    "입력 크기 맞추기가 동작하지 않았습니다 — GroundingDataset 이 "
+                    "image_size 를 받았는지 확인하세요 (시작 로그에 맞출 크기가 찍힙니다)."
                 )
         out[key] = torch.cat(rows, dim=0)
     return out
@@ -301,8 +338,19 @@ def attach_lora(model: Any, tc: TrainConfig) -> Any:
 # --------------------------------------------------------------------------
 
 
-def dry_run(examples: list[Example], model_id: str, index: int) -> int:
-    """데이터와 프롬프트를 확인한다. 가능하면 손실 마스킹까지."""
+def dry_run(
+    examples: list[Example],
+    model_id: str,
+    index: int,
+    image_size: tuple[int, int] | None = None,
+) -> int:
+    """데이터와 프롬프트를 확인한다. 가능하면 손실 마스킹까지.
+
+    Args:
+        image_size: 학습이 강제로 맞출 크기. **여기서도 맞춰야 한다** — 아래에
+            찍는 토큰 수가 비전 토큰을 포함하므로, 맞추지 않으면 실제 학습과
+            다른 숫자를 보고하고 max_len 판단이 어긋난다.
+    """
     print("=" * 68)
     print(" 데이터 요약")
     print("=" * 68)
@@ -335,6 +383,9 @@ def dry_run(examples: list[Example], model_id: str, index: int) -> int:
         return 0
 
     image = Image.open(example.image_path).convert("RGB")
+    if image_size is not None and image.size != image_size:
+        print(f"\n(이미지 {image.size[0]}x{image.size[1]} -> {image_size[0]}x{image_size[1]} 로 맞춤)")
+        image = resize_to(image, image_size)
     prompt_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -419,7 +470,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     # 설정 파일(train 섹션)이 기본, CLI 가 덮는다 (준 것만).
-    tc = load_config(args.config).train
+    # 전체 설정을 들고 있어야 한다 — 학습 입력 크기를 **추론 쪽 설정**
+    # (pipeline.canvas / detect.tiles / llm.image_max_side) 에서 끌어내기 때문이다.
+    cfg = load_config(args.config)
+    tc = cfg.train
     for name in (
         "model", "epochs", "lr", "batch", "grad_accum", "rank", "alpha", "dropout",
         "max_len", "dtype", "merger_module", "vision_blocks", "vision_prefix",
@@ -444,28 +498,46 @@ def main(argv: list[str] | None = None) -> int:
         print("학습 샘플이 없습니다.", file=sys.stderr)
         return 1
 
-    # 모델을 GPU 에 올리기 **전에** 데이터를 검사한다. 크기가 섞여 있으면
-    # 첫 에폭 중간에 collate 가 죽는데, 그때까지 9B 를 올리고 기다린 시간이
-    # 전부 낭비다.
-    sizes = check_uniform_image_size(examples, tc.batch)
-    if len(sizes) > 1:
-        (w, h), n = sizes.most_common(1)[0]
+    # 입력 크기를 하나로 고정한다. **추론에서 오는 크기가 기준이다** — 캔버스가
+    # 고정이라 추론 타일은 항상 한 가지 크기이고, 학습이 거기에 맞아야 모델이
+    # 상대할 기하가 하나로 유지된다.
+    #
+    # 모델을 GPU 에 올리기 전에 재는 이유: 크기가 섞여 있으면 예전에는 첫 에폭
+    # 중간에 collate 가 죽었는데, 그때까지 9B 를 올리고 기다린 시간이 전부
+    # 낭비였다. 지금은 죽지 않고 맞추지만, 무엇을 맞췄는지는 시작할 때 보여야 한다.
+    pipe = cfg.pipeline
+    expected = expected_tile_size(
+        pipe.canvas,
+        pipe.detect.tiles,
+        pipe.detect.overlap,
+        pipe.detect.image_factor,
+        pipe.llm.image_max_side,
+    )
+    sizes = tally_image_sizes(examples)
+    image_size = resolve_image_size(sizes, expected)
+    n_off = sum(n for wh, n in sizes.items() if wh != image_size)
+
+    if expected is None:
         log.warning(
-            "학습 이미지 크기가 %d종 섞여 있습니다 (최다 %dx%d, %d장). "
-            "batch=1 이라 학습은 돌지만, 같은 per-mille 좌표가 장마다 다른 "
-            "픽셀을 가리켜 모델이 그 변동까지 배웁니다 — pipeline.canvas 를 "
-            "고정하고 데이터를 다시 만드는 것을 권합니다.",
-            len(sizes),
-            w,
-            h,
-            n,
+            "pipeline.canvas 가 고정이 아니라 추론 입력 크기도 하나가 아닙니다. "
+            "데이터의 최다 크기(%dx%d)로 맞춥니다 — 임의의 선택입니다. "
+            "좌표 학습에는 canvas 를 고정하세요 (config/default.yaml 주석 참조).",
+            *image_size,
+        )
+    if n_off:
+        log.warning(
+            "학습 이미지 %d장이 추론 크기(%dx%d)와 달라 로드할 때 맞춥니다. "
+            "좌표는 per-mille 이라 그대로 유효합니다. 다만 보간이 한 번 더 들어가므로, "
+            "데이터를 그 크기로 다시 만드는 것이 낫습니다.\n분포:\n%s",
+            n_off,
+            *image_size,
+            describe_sizes(sizes),
         )
     else:
-        (w, h), n = next(iter(sizes.items()))
-        log.info("학습 이미지 %d장, 모두 %dx%d", n, w, h)
+        log.info("학습 이미지 %d장, 모두 %dx%d (추론과 같다)", len(examples), *image_size)
 
     if args.dry_run:
-        return dry_run(examples, tc.model, args.dry_run_index)
+        return dry_run(examples, tc.model, args.dry_run_index, image_size)
 
     from transformers import Trainer, TrainingArguments  # type: ignore[import-not-found]
 
@@ -479,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    dataset = GroundingDataset(examples, processor, tc.max_len)
+    dataset = GroundingDataset(examples, processor, tc.max_len, image_size)
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is None:
         pad_id = processor.tokenizer.eos_token_id

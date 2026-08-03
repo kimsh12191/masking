@@ -317,66 +317,80 @@ def tally_image_sizes(
     return Counter(read(e.image_path) for e in examples)
 
 
-def check_uniform_image_size(
-    examples: list[Example],
-    batch: int,
-    size_of: Callable[[Path], tuple[int, int]] | None = None,
-) -> Counter[tuple[int, int]]:
-    """학습 이미지가 **모두 같은 크기인지** 확인한다.
+def describe_sizes(sizes: Counter[tuple[int, int]], limit: int = 8) -> str:
+    """크기 분포를 사람이 읽을 줄로. 길면 자른다 (수십 종이면 화면을 덮는다)."""
+    lines = [f"  {w}x{h}  {n}장" for (w, h), n in sizes.most_common()[:limit]]
+    if len(sizes) > limit:
+        lines.append(f"  ... 그 밖에 {len(sizes) - limit}종")
+    return "\n".join(lines)
 
-    이 검사가 있는 이유는 실패가 늦고 메시지가 엉뚱하기 때문이다. 크기가 섞여
-    있으면 ``collate`` 가 비전 텐서를 이어 붙이다 죽는데, 그게 **첫 에폭 중간에**
-    ``RuntimeError: Sizes of tensors must match except in dimension 0`` 로
-    나타난다. DataLoader 워커 안에서 터지므로 traceback 도 두 겹이고, 데이터
-    문제라는 단서가 한 줄도 없다. 모델을 GPU 에 올린 뒤라 낭비도 크다.
 
-    ``batch`` 에 따라 세기가 다르다:
+def expected_tile_size(
+    canvas: tuple[int, int] | None,
+    tiles: int,
+    overlap: float,
+    image_factor: int,
+    image_max_side: int,
+) -> tuple[int, int] | None:
+    """**추론이 VLM 에 보내는 타일 한 장의 픽셀 크기.** ``(폭, 높이)``.
 
-    * ``batch >= 2``  **막는다.** 배치에 크기가 다른 두 장이 들어가는 순간
-      반드시 죽는다. 돌려 봐야 시간만 버린다.
-    * ``batch == 1``  **경고만 한다.** 이어 붙일 상대가 없어 실제로 돌아간다.
-      다만 좌표 학습으로서는 여전히 손해라 조용히 넘기지 않는다 —
-      ``pipeline.canvas`` 주석의 근거가 그대로 적용된다. 페이지마다 크기가
-      다르면 같은 per-mille 좌표가 장마다 다른 픽셀을 가리키고, 모델이 그
-      변동까지 함께 배워야 한다.
+    학습 입력을 이 크기로 강제하기 위한 것이다. 추론에서는 크기가 항상 이
+    하나이므로(캔버스 고정 -> 타일 고정), 학습도 여기에 맞춰야 모델이 상대할
+    기하가 하나로 유지된다.
+
+    계산은 ``build_grounding_data.py`` 와 **같은 경로**를 따른다. 그쪽이
+    ``tile_rects`` 의 첫 조각 크기를 쓰고 ``as_model_sees`` 로 ``image_max_side``
+    축소를 한 번 더 거는데, 여기서도 같은 두 단계를 밟는다. 한쪽만 바뀌면
+    빌더가 만든 크기와 학습이 기대하는 크기가 갈리므로 함수를 나란히 두지 않고
+    같은 원시 함수(``tile_rects`` / ``fit_max_side``)를 부른다.
 
     Args:
-        examples: 학습 샘플.
-        batch: ``--batch`` (디바이스당 배치 크기).
-        size_of: 크기를 읽는 함수 (테스트용 이음새).
+        canvas: ``pipeline.canvas``. ``None`` 이면 페이지 크기가 입력마다 달라
+            고정할 수 있는 크기가 **없다** — 그대로 ``None`` 을 돌려준다.
+        tiles: ``detect.tiles``.
+        overlap: ``detect.overlap``.
+        image_factor: ``detect.image_factor`` (패치 격자).
+        image_max_side: ``llm.image_max_side``.
 
     Returns:
-        크기 분포. 균일하면 항목이 하나다.
-
-    Raises:
-        ValueError: 크기가 섞여 있고 ``batch >= 2`` 일 때.
+        ``(폭, 높이)``, 또는 캔버스가 고정이 아니면 ``None``.
     """
-    sizes = tally_image_sizes(examples, size_of)
-    if len(sizes) <= 1:
-        return sizes
+    if canvas is None:
+        return None
 
-    lines = [
-        f"  {w}x{h}  {n}장" for (w, h), n in sizes.most_common()
-    ]
-    detail = "\n".join(lines[:8])
-    if len(sizes) > 8:
-        detail += f"\n  ... 그 밖에 {len(sizes) - 8}종"
+    # 지연 임포트 — 이 모듈은 torch 없이 임포트되는 것이 계약이고, 무거운 것을
+    # 위로 올리면 그 계약이 조용히 깨진다. 둘 다 순수 함수다.
+    from ..detect import tile_rects
+    from ..llm.client import fit_max_side
 
-    why = (
-        f"학습 이미지 크기가 균일하지 않습니다 ({len(sizes)}종):\n{detail}\n\n"
-        "흔한 원인:\n"
-        "  1. pipeline.canvas 가 null 이라 페이지 크기가 입력마다 다르다.\n"
-        "     canvas 를 고정하고 데이터를 다시 만들 것.\n"
-        "  2. 설정이 다른 두 번의 빌드 산출물이 한 디렉터리에 섞였다.\n"
-        "     출력 디렉터리를 비우고 다시 만들 것.\n"
-        "  3. pipeline.canvas / detect.tiles 를 바꾼 뒤 데이터를 다시 만들지 않았다."
-    )
-    if batch >= 2:
-        raise ValueError(
-            f"{why}\n\n"
-            f"batch={batch} 에서는 배치에 크기가 다른 두 장이 들어가는 순간 "
-            "비전 텐서를 이어 붙일 수 없어 collate 가 죽습니다.\n"
-            "데이터를 고쳐 다시 만들거나, --batch 1 로 우회하세요 "
-            "(실효 배치는 grad_accum 으로 맞출 수 있습니다)."
-        )
-    return sizes
+    page_w, page_h = int(canvas[0]), int(canvas[1])
+    x1, y1, x2, y2 = tile_rects(page_w, page_h, tiles, overlap, image_factor)[0]
+    tile_w = round((x2 - x1) * page_w)
+    tile_h = round((y2 - y1) * page_h)
+    new_h, new_w = fit_max_side(tile_h, tile_w, image_max_side)
+    return new_w, new_h
+
+
+def resolve_image_size(
+    sizes: Counter[tuple[int, int]],
+    expected: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """학습 입력을 **강제로 맞출** 크기를 정한다.
+
+    추론 크기(``expected``)가 있으면 무조건 그것이다. 데이터가 다른 크기로
+    만들어져 있어도 학습 쪽에서 맞춘다 — 데이터를 다시 만들지 않아도 되고,
+    빌더 설정과 학습 설정이 갈라져도 학습이 **추론 기하로 수렴한다.**
+
+    ``expected`` 가 없는 경우(``pipeline.canvas`` 가 null)에는 추론조차 크기가
+    고정이 아니어서 기준으로 삼을 값이 없다. 그때는 데이터의 **최다 크기**로
+    맞춘다 — 배치가 되게 하는 것이 우선이고, 그 선택이 임의라는 사실은 호출자가
+    경고로 알린다.
+
+    Returns:
+        ``(폭, 높이)``. 판단 근거가 아무것도 없으면(샘플 0개) ``None``.
+    """
+    if expected is not None:
+        return expected
+    if not sizes:
+        return None
+    return sizes.most_common(1)[0][0]

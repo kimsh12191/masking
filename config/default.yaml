@@ -258,6 +258,11 @@ pipeline:
 
   # canvas 가 null 일 때만 쓰는 옛 방식 — 긴 변만 맞추고 짧은 변은 종횡비대로.
   # 페이지 크기가 입력마다 달라지므로 좌표 학습에는 쓰지 마라.
+  #
+  # 참고: train_grounding.py 는 canvas·tiles·image_max_side 로 **추론 타일 크기**를
+  # 계산해 학습 입력을 전부 그 크기로 맞춘다. 데이터가 다른 크기로 만들어져 있어도
+  # 학습은 추론 기하로 수렴한다 (좌표는 per-mille 이라 리사이즈에 불변).
+  # canvas 가 null 이면 그 기준이 없어 데이터의 최다 크기로 맞추고 경고한다.
   target_long_side: 2464
   # 기울기 보정 (0.4~15도 구간에서만 적용)
   deskew: true

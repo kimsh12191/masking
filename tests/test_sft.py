@@ -28,10 +28,12 @@ from pii_pipeline.train.sft import (
     TOKEN_AXIS_KEYS,
     Example,
     build_messages,
-    check_uniform_image_size,
+    describe_sizes,
+    expected_tile_size,
     load_jsonl,
     mask_prompt,
     pad_fill_value,
+    resolve_image_size,
     select_vision_blocks,
     summarize,
     tally_image_sizes,
@@ -229,77 +231,88 @@ class TestSummarize:
         assert summarize([])["samples"] == 0
 
 
-class TestCheckUniformImageSize:
-    """크기가 섞인 학습 데이터를 **시작 전에** 잡는다.
-
-    막지 않으면 첫 에폭 중간에 ``collate`` 가 죽는다. 그 실패는 DataLoader
-    워커 안에서 나므로 traceback 이 두 겹이고, 메시지("Sizes of tensors must
-    match except in dimension 0")에는 어느 키인지도 데이터 문제라는 단서도
-    없다. 게다가 그때는 이미 9B 를 GPU 에 올린 뒤다.
+def sized(*sizes: tuple[int, int]):
+    """크기별 샘플과 ``경로 -> 크기`` 조회 함수를 함께 만든다.
 
     ``size_of`` 를 주입할 수 있게 만든 덕에 Pillow 없이 CPU 로 검증된다.
     """
+    examples: list[Example] = []
+    table: dict[Path, tuple[int, int]] = {}
+    for index, wh in enumerate(sizes):
+        path = Path(f"tiles/t{index}.png")
+        examples.append(
+            Example(image_path=path, target={"findings": []}, meta={}, query=[])
+        )
+        table[path] = wh
+    return examples, table.__getitem__
 
-    @staticmethod
-    def sized(*sizes: tuple[int, int]):
-        """크기별 샘플과 ``경로 -> 크기`` 조회 함수를 함께 만든다."""
-        examples: list[Example] = []
-        table: dict[Path, tuple[int, int]] = {}
-        for index, wh in enumerate(sizes):
-            path = Path(f"tiles/t{index}.png")
-            examples.append(
-                Example(image_path=path, target={"findings": []}, meta={}, query=[])
-            )
-            table[path] = wh
-        return examples, table.__getitem__
 
-    def test_uniform_data_passes(self) -> None:
-        examples, size_of = self.sized((1760, 896), (1760, 896), (1760, 896))
-        sizes = check_uniform_image_size(examples, batch=4, size_of=size_of)
-        assert sizes == Counter({(1760, 896): 3})
-
-    def test_mixed_sizes_are_blocked_when_batching(self) -> None:
-        examples, size_of = self.sized((1760, 896), (1760, 1056))
-        with pytest.raises(ValueError, match="균일하지 않습니다"):
-            check_uniform_image_size(examples, batch=2, size_of=size_of)
-
-    def test_error_names_the_causes_and_the_sizes(self) -> None:
-        """원인 없이 raise 하면 torch 에러와 다를 게 없다."""
-        examples, size_of = self.sized((1760, 896), (1760, 1056))
-        with pytest.raises(ValueError) as err:
-            check_uniform_image_size(examples, batch=8, size_of=size_of)
-        text = str(err.value)
-        assert "pipeline.canvas" in text
-        assert "--batch 1" in text
-        # 어떤 크기가 섞였는지 눈으로 봐야 어느 빌드가 섞였는지 짐작할 수 있다
-        assert "1760x896" in text
-        assert "1760x1056" in text
-
-    def test_batch_one_warns_instead_of_raising(self) -> None:
-        """이어 붙일 상대가 없어 실제로 돌아간다 — 막지 않는다.
-
-        좌표 학습으로서는 여전히 손해지만, 그 판단은 호출자 몫이다.
-        """
-        examples, size_of = self.sized((1760, 896), (1760, 1056))
-        sizes = check_uniform_image_size(examples, batch=1, size_of=size_of)
-        assert len(sizes) == 2
-
-    def test_long_size_lists_are_truncated(self) -> None:
-        """크기가 수십 종이면 메시지가 화면을 덮는다."""
-        examples, size_of = self.sized(*[(100 + i, 200) for i in range(12)])
-        with pytest.raises(ValueError) as err:
-            check_uniform_image_size(examples, batch=2, size_of=size_of)
-        assert "그 밖에 4종" in str(err.value)
-
-    def test_tally_counts_every_sample(self) -> None:
-        examples, size_of = self.sized((10, 20), (10, 20), (30, 40))
+class TestTallyImageSizes:
+    def test_counts_every_sample(self) -> None:
+        examples, size_of = sized((10, 20), (10, 20), (30, 40))
         assert tally_image_sizes(examples, size_of) == Counter(
             {(10, 20): 2, (30, 40): 1}
         )
 
-    def test_empty_dataset_is_not_an_error(self) -> None:
-        """샘플이 없다는 것은 여기서 낼 에러가 아니다 (main 이 따로 잡는다)."""
-        assert check_uniform_image_size([], batch=8) == Counter()
+    def test_empty_dataset_is_empty(self) -> None:
+        assert tally_image_sizes([], lambda p: (1, 1)) == Counter()
+
+
+class TestExpectedTileSize:
+    """학습 입력 크기는 **추론 설정에서 끌어낸다.**
+
+    추론은 캔버스가 고정이라 타일이 항상 한 크기다. 학습이 그 크기에 맞아야
+    모델이 상대할 기하가 하나로 유지된다. 그래서 여기서 손으로 나눈 값을
+    쓰지 않고 ``tile_rects`` 를 그대로 부른다 — 격자 스냅과 겹침까지 포함해
+    추론이 실제로 만드는 크기여야 한다.
+    """
+
+    def test_matches_the_inference_tile_of_the_default_config(self) -> None:
+        # config/default.yaml: canvas 1760x2464, tiles 3, overlap 0.08, factor 32
+        assert expected_tile_size((1760, 2464), 3, 0.08, 32, 1984) == (1760, 960)
+
+    def test_single_tile_is_the_whole_page(self) -> None:
+        assert expected_tile_size((1760, 2464), 1, 0.08, 32, 4096) == (1760, 2464)
+
+    def test_applies_the_image_max_side_shrink(self) -> None:
+        """추론은 보내기 직전에 긴 변을 한 번 더 줄인다. 그 단계를 빼면 갈린다."""
+        full = expected_tile_size((1760, 2464), 1, 0.08, 32, 4096)
+        shrunk = expected_tile_size((1760, 2464), 1, 0.08, 32, 1232)
+        assert full == (1760, 2464)
+        assert shrunk is not None and max(shrunk) == 1232
+
+    def test_returns_none_without_a_fixed_canvas(self) -> None:
+        """canvas 가 null 이면 추론조차 크기가 하나가 아니다 — 기준이 없다."""
+        assert expected_tile_size(None, 3, 0.08, 32, 1984) is None
+
+
+class TestResolveImageSize:
+    """맞출 크기를 정한다. **추론 크기가 있으면 무조건 그것이다.**"""
+
+    def test_inference_size_wins_over_the_data(self) -> None:
+        """데이터가 다른 크기로 만들어져 있어도 학습이 추론 기하로 수렴해야 한다."""
+        sizes = Counter({(900, 500): 400, (1760, 960): 1})
+        assert resolve_image_size(sizes, (1760, 960)) == (1760, 960)
+
+    def test_falls_back_to_the_most_common_size(self) -> None:
+        """canvas 가 null 이면 기준이 없다 — 배치가 되게 하는 것이 우선이다."""
+        sizes = Counter({(900, 500): 40, (1760, 960): 3})
+        assert resolve_image_size(sizes, None) == (900, 500)
+
+    def test_returns_none_when_there_is_nothing_to_go_on(self) -> None:
+        assert resolve_image_size(Counter(), None) is None
+
+
+class TestDescribeSizes:
+    def test_lists_sizes_with_counts_most_common_first(self) -> None:
+        text = describe_sizes(Counter({(1760, 960): 5, (1760, 896): 12}))
+        assert text.index("1760x896") < text.index("1760x960")
+        assert "12장" in text
+
+    def test_truncates_a_long_list(self) -> None:
+        """크기가 수십 종이면 메시지가 화면을 덮는다."""
+        text = describe_sizes(Counter({(100 + i, 200): 1 for i in range(12)}))
+        assert "그 밖에 4종" in text
 
 
 class TestSelectVisionBlocks:
