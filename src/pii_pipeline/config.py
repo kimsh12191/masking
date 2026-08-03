@@ -26,7 +26,7 @@ from .detect import DetectConfig
 from .llm.client import LlmConfig
 from .locate import LocateConfig
 from .ocr.paddle_runner import OcrConfig, parse_gpu_id
-from .pipeline import PipelineConfig
+from .pipeline import BatchConfig, PipelineConfig
 from .train.config import TrainConfig
 from .train.dataset import GroundingConfig
 from .verify import VerifyConfig
@@ -167,7 +167,7 @@ def read_yaml(path: Path) -> dict[str, Any]:
 #: ``PipelineConfig`` 안에 있지만, 설정 파일에서는 평평하게 두는 편이 읽기 쉬워
 #: 최상위로 뺀다. 섹션 이름이 파이프라인 단계 이름과 1:1 이다.
 SECTIONS = (
-    "pipeline", "ocr", "llm", "detect", "locate", "verify", "output",
+    "pipeline", "ocr", "llm", "detect", "locate", "verify", "batch", "output",
     # 추론에는 쓰이지 않는다. 학습 스크립트만 읽는다.
     "grounding", "train",
 )
@@ -194,6 +194,7 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             detect=DetectConfig(),
             locate=LocateConfig(),
             verify=VerifyConfig(),
+            batch=BatchConfig(),
         ),
         output=OutputConfig(),
         grounding=GroundingConfig(),
@@ -217,6 +218,7 @@ def load_config(path: str | Path | None = None, use_env: bool = True) -> AppConf
             "detect": config.pipeline.detect,
             "locate": config.pipeline.locate,
             "verify": config.pipeline.verify,
+            "batch": config.pipeline.batch,
             "output": config.output,
             "grounding": config.grounding,
             "train": config.train,
@@ -379,6 +381,17 @@ def describe(config: AppConfig) -> str:
             f"④ 검증      체크섬 교정={'ON' if pipe.verify.retype_on_checksum else 'OFF'}",
             f"전처리      {page_report}"
             f"  deskew={'ON' if pipe.deskew else 'OFF'}",
+            # 배치는 --async 일 때만 쓰이지만 **항상 보여준다.** 켜고 나서
+            # "왜 안 빨라지지" 로 헤매는 원인이 대개 아래 검산이다.
+            f"배치(--async) 묶음 {pipe.batch.pages}장"
+            f"  동시 요청 상한 {llm.concurrency}"
+            f"  묶음당 요청 {pipe.batch.pages * pipe.detect.tiles * max(1, pipe.detect.samples)}개"
+            + (
+                ""
+                if pipe.batch.pages * pipe.detect.tiles >= llm.concurrency
+                else " — 묶음당 요청이 동시 상한보다 적어 서버가 굶습니다"
+                " (batch.pages 를 올리거나 llm.concurrency 를 내릴 것)"
+            ),
             f"출력        {out.out_dir}  이미지={'ON' if out.write_image else 'OFF'}",
         ]
     )

@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from .llm.client import LlmClient, fit_max_side
+from .llm.client import AsyncLlmClient, LlmClient, Request, fit_max_side
 from .llm.prompts import SYSTEM_VLM, build_user
 from .normalize import canonical_text
 from .schema import VLM_SCHEMA, VlmFinding
@@ -417,44 +417,64 @@ def _dedup(findings: list[VlmFinding]) -> list[VlmFinding]:
 
 
 # --------------------------------------------------------------------------
-# 진입점
+# 타일 계획 — sync/async 가 공유한다
 # --------------------------------------------------------------------------
 
 
-def detect(
+@dataclass
+class TilePlan:
+    """한 페이지를 타일로 쪼갠 결과. **호출 전에 정해지는 것 전부.**
+
+    동기 경로와 비동기 경로가 갈리는 지점은 "요청을 어떻게 띄우는가" 하나이고,
+    타일을 어디서 자르는지·모델이 어떤 크기로 보는지는 같아야 한다. 그 공통부를
+    자료구조로 못박아 두면 두 경로가 다른 기하를 쓰는 일이 생기지 않는다.
+
+    Attributes:
+        rects: 타일별 정규화 사각형 (페이지 좌표 환산의 기준).
+        images: 타일 이미지 (BGR numpy).
+        seen: 타일별 ``(높이, 폭)`` — **모델이 실제로 보게 될 크기.**
+            절대 픽셀 좌표를 환산할 때 나눌 기준이 이것이다.
+        calls: ``(타일 번호, 샘플 번호)`` 목록. 순서를 고정해 두면 병렬로
+            돌려도 결과가 결정론적이다.
+        temperature: 이 호출들에 쓸 온도. ``None`` 이면 설정값(0).
+        user: user 메시지 (힌트가 반영된 것).
+    """
+
+    rects: list[tuple[float, float, float, float]]
+    images: list[Any]
+    seen: list[tuple[int, int]]
+    calls: list[tuple[int, int]]
+    temperature: float | None
+    user: str
+
+    @property
+    def samples(self) -> int:
+        return len(self.calls) // max(1, len(self.rects))
+
+
+def plan_tiles(
     image: Any,
-    client: LlmClient,
     config: DetectConfig | None = None,
+    image_max_side: int = 0,
     warnings: list[str] | None = None,
-) -> tuple[list[VlmFinding], list[dict[str, Any]]]:
-    """이미지에서 개인정보를 전사한다.
+) -> TilePlan:
+    """페이지를 타일로 쪼개고 모델이 볼 크기를 계산한다. **호출은 하지 않는다.**
 
     Args:
         image: 전처리된 BGR numpy 배열.
-        client: vLLM 클라이언트.
         config: 탐지 설정.
+        image_max_side: ``LlmConfig.image_max_side``. 클라이언트가 보내기 직전에
+            거는 축소를 여기서도 계산해야 좌표 환산 기준이 맞는다.
         warnings: 경고를 append 할 목록.
-
-    Returns:
-        ``(탐지 목록, 호출별 메타정보)``. 한 타일이 실패해도 나머지는 유지한다 —
-        페이지 하나를 통째로 버리는 것이 최악이다. 실패한 타일은 메타에
-        ``error`` 로 남고 ``warnings`` 에도 기록된다.
     """
     cfg = config or DetectConfig()
     warn = warnings if warnings is not None else []
     h, w = image.shape[:2]
 
     rects = tile_rects(w, h, cfg.tiles, cfg.overlap, cfg.image_factor)
-    user = build_user(cfg.hint)
     samples = max(1, cfg.samples)
-    # samples==1 이면 온도를 건드리지 않는다 — 기존의 결정론적 동작을 지킨다.
-    temp = None if samples == 1 else cfg.sample_temperature
+    images = [crop_norm(image, rect) if len(rects) > 1 else image for rect in rects]
 
-    # (타일, 샘플) 조합. 순서를 고정해 두면 병렬로 돌려도 결과가 결정론적이다.
-    calls = [(t, s) for t in range(len(rects)) for s in range(samples)]
-    tile_imgs = [
-        crop_norm(image, rect) if len(rects) > 1 else image for rect in rects
-    ]
     # 비전 인코더가 실제로 보게 될 크기. 좌표 환산의 기준이고, 축소가 일어나면
     # 작은 한글이 뭉개져 **미탐**으로 이어진다. 그래서 조용히 넘기지 않는다.
     #
@@ -463,13 +483,13 @@ def detect(
     # 계산하면 절대 픽셀 좌표가 그 비율만큼 어긋난다.
     seen = [
         smart_resize(
-            *fit_max_side(t.shape[0], t.shape[1], client.config.image_max_side),
+            *fit_max_side(t.shape[0], t.shape[1], image_max_side),
             cfg.image_factor,
             cfg.max_pixels,
         )
-        for t in tile_imgs
+        for t in images
     ]
-    for i, (tile, (sh, sw)) in enumerate(zip(tile_imgs, seen, strict=True)):
+    for i, (tile, (sh, sw)) in enumerate(zip(images, seen, strict=True)):
         th, tw = tile.shape[:2]
         if sh * sw < th * tw * 0.81:  # 한 변 10% 이상 줄어든다
             warn.append(
@@ -478,34 +498,79 @@ def detect(
                 f"detect.tiles 를 늘리거나 서버의 max_pixels 를 올릴 것"
             )
 
-    def one(job: tuple[int, int]) -> dict[str, Any]:
-        tile_no, sample_no = job
-        payload, meta = client.complete_json(
+    return TilePlan(
+        rects=rects,
+        images=images,
+        seen=seen,
+        calls=[(t, s) for t in range(len(rects)) for s in range(samples)],
+        # samples==1 이면 온도를 건드리지 않는다 — 기존의 결정론적 동작을 지킨다.
+        temperature=None if samples == 1 else cfg.sample_temperature,
+        user=build_user(cfg.hint),
+    )
+
+
+def tile_requests(plan: TilePlan, tag: Any = None) -> list[Request]:
+    """계획을 클라이언트 요청 목록으로 바꾼다.
+
+    Args:
+        plan: ``plan_tiles`` 의 결과.
+        tag: 페이지를 구분하는 표식. 여러 페이지를 **한 번에** 넣을 때
+            ``meta["tag"]`` 로 돌아오므로, 응답을 어느 페이지 것인지
+            순서에 의존하지 않고 되짚을 수 있다.
+
+    Returns:
+        ``plan.calls`` 와 같은 순서의 요청 목록.
+    """
+    return [
+        Request(
             system=SYSTEM_VLM,
-            user=user,
+            user=plan.user,
             schema=VLM_SCHEMA,
-            image=tile_imgs[tile_no],
-            temperature=temp,
+            image=plan.images[tile_no],
+            temperature=plan.temperature,
+            tag=(tag, tile_no, sample_no),
         )
+        for tile_no, sample_no in plan.calls
+    ]
+
+
+def label_metas(
+    results: list[tuple[dict[str, Any], dict[str, Any]]], plan: TilePlan
+) -> list[dict[str, Any]]:
+    """``complete_json_many`` 결과에 타일·샘플·rect 를 붙인다.
+
+    동기 경로가 호출 직후에 하던 일과 같다. 순서는 ``plan.calls`` 와 1:1 이다
+    (``complete_json_many`` 가 제출 순서를 지킨다).
+    """
+    metas: list[dict[str, Any]] = []
+    for (tile_no, sample_no), (payload, meta) in zip(plan.calls, results, strict=True):
         meta["tile"] = tile_no
         meta["sample"] = sample_no
-        meta["rect"] = [round(v, 4) for v in rects[tile_no]]
+        meta["rect"] = [round(v, 4) for v in plan.rects[tile_no]]
         meta["payload"] = payload
-        return meta
+        metas.append(meta)
+    return metas
 
-    if len(calls) == 1:
-        metas = [one(calls[0])]
-    else:
-        # 클라이언트를 미리 만들어 둔다 (지연 초기화가 스레드에서 겹치지 않게).
-        _ = client.client
-        n_workers = cfg.workers or min(len(calls), _MAX_WORKERS)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            metas = list(pool.map(one, calls))
+
+def collect_findings(
+    metas: list[dict[str, Any]],
+    plan: TilePlan,
+    config: DetectConfig | None = None,
+    warnings: list[str] | None = None,
+) -> list[VlmFinding]:
+    """응답 메타 목록을 ``VlmFinding`` 으로 조립한다 (중복 제거까지).
+
+    **좌표 규약 판정이 여기 있는 것이 요점이다.** 이 판단이 sync/async 로
+    갈리면 한쪽에서만 박스가 밀리는데, 그건 눈으로 구분되지 않는다.
+    """
+    cfg = config or DetectConfig()
+    warn = warnings if warnings is not None else []
+    samples = plan.samples
 
     findings: list[VlmFinding] = []
     for meta in metas:
         tile_no = meta["tile"]
-        rect = rects[tile_no]
+        rect = plan.rects[tile_no]
         where = f"타일 {tile_no}" + (
             f" 샘플 {meta['sample']}" if samples > 1 else ""
         )
@@ -524,7 +589,7 @@ def detect(
 
         # 좌표 규약을 먼저 정한다. 항목별로 판단하면 알 수 없다 (infer_scale).
         # 나눌 기준은 우리가 보낸 크기가 아니라 **모델이 본 크기**다.
-        seen_h, seen_w = seen[tile_no]
+        seen_h, seen_w = plan.seen[tile_no]
         scale_x, scale_y, convention = pick_scale(
             cfg.coord_convention,
             [i.get("bbox_2d") for i in raw_items],
@@ -564,7 +629,7 @@ def detect(
         log.debug("%s: %d건", where, len(findings) - n_before)
 
     if not cfg.dedup:
-        return findings, metas
+        return findings
 
     deduped = _dedup(findings)
     if len(deduped) < len(findings):
@@ -573,4 +638,80 @@ def detect(
             len(findings) - len(deduped),
             " + 다중 샘플" if samples > 1 else "",
         )
-    return deduped, metas
+    return deduped
+
+
+# --------------------------------------------------------------------------
+# 진입점
+# --------------------------------------------------------------------------
+
+
+def detect(
+    image: Any,
+    client: LlmClient,
+    config: DetectConfig | None = None,
+    warnings: list[str] | None = None,
+) -> tuple[list[VlmFinding], list[dict[str, Any]]]:
+    """이미지에서 개인정보를 전사한다 (동기 — 타일을 스레드로 병렬 호출).
+
+    Args:
+        image: 전처리된 BGR numpy 배열.
+        client: vLLM 클라이언트.
+        config: 탐지 설정.
+        warnings: 경고를 append 할 목록.
+
+    Returns:
+        ``(탐지 목록, 호출별 메타정보)``. 한 타일이 실패해도 나머지는 유지한다 —
+        페이지 하나를 통째로 버리는 것이 최악이다. 실패한 타일은 메타에
+        ``error`` 로 남고 ``warnings`` 에도 기록된다.
+    """
+    cfg = config or DetectConfig()
+    warn = warnings if warnings is not None else []
+    plan = plan_tiles(image, cfg, client.config.image_max_side, warn)
+
+    def one(job: tuple[int, int]) -> tuple[dict[str, Any], dict[str, Any]]:
+        tile_no, _ = job
+        return client.complete_json(
+            system=SYSTEM_VLM,
+            user=plan.user,
+            schema=VLM_SCHEMA,
+            image=plan.images[tile_no],
+            temperature=plan.temperature,
+        )
+
+    if len(plan.calls) == 1:
+        results = [one(plan.calls[0])]
+    else:
+        # 클라이언트를 미리 만들어 둔다 (지연 초기화가 스레드에서 겹치지 않게).
+        _ = client.client
+        n_workers = cfg.workers or min(len(plan.calls), _MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(one, plan.calls))
+
+    metas = label_metas(results, plan)
+    return collect_findings(metas, plan, cfg, warn), metas
+
+
+async def detect_async(
+    image: Any,
+    client: AsyncLlmClient,
+    config: DetectConfig | None = None,
+    warnings: list[str] | None = None,
+) -> tuple[list[VlmFinding], list[dict[str, Any]]]:
+    """``detect`` 와 같은 일을 비동기로 한다. 반환값도 같다.
+
+    **페이지 하나만 볼 때는 동기 경로와 처리량이 비슷하다.** 이 함수의 값은
+    호출부가 ``await`` 할 수 있다는 것 — 여러 페이지를 동시에 돌릴 때 GPU 가
+    페이지 사이에서 놀지 않는다.
+
+    페이지가 여러 장일 때 **최대 처리량**을 원하면 이 함수를 페이지마다 부르는
+    대신 ``plan_tiles`` + ``tile_requests`` 로 요청을 전부 모아 한 번의
+    ``complete_json_many`` 에 넣어라 (``PiiPipeline.run_batch_async`` 가 그렇게
+    한다). 그래야 동시 요청 상한이 페이지 단위가 아니라 전체에 걸린다.
+    """
+    cfg = config or DetectConfig()
+    warn = warnings if warnings is not None else []
+    plan = plan_tiles(image, cfg, client.config.image_max_side, warn)
+    results = await client.complete_json_many(tile_requests(plan))
+    metas = label_metas(results, plan)
+    return collect_findings(metas, plan, cfg, warn), metas

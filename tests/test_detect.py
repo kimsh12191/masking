@@ -747,3 +747,143 @@ class TestUniformTiles:
         rects = tile_rects(self.CANVAS_W, self.CANVAS_H, 3, 0.08, 32)
         for a, b in zip(rects[:-1], rects[1:], strict=True):
             assert b[1] < a[3]
+
+
+# --------------------------------------------------------------------------
+# 비동기 경로
+# --------------------------------------------------------------------------
+
+
+class FakeAsyncClient:
+    """``complete_json_many`` 만 흉내낸다. 요청 순서대로 payload 를 돌려준다."""
+
+    config = LlmConfig()
+
+    def __init__(self, payloads: list[dict[str, Any]]) -> None:
+        self.payloads = payloads
+        self.requests: list[Any] = []
+
+    async def complete_json_many(
+        self, requests: list[Any], concurrency: int | None = None, on_done: Any = None
+    ):
+        out = []
+        for request in requests:
+            n = len(self.requests)
+            self.requests.append(request)
+            out.append(
+                (self.payloads[n] if n < len(self.payloads) else {"findings": []}, {})
+            )
+        return out
+
+
+class TestDetectAsync:
+    """``detect_async`` 는 ``detect`` 와 **같은 것을 돌려줘야 한다.**
+
+    갈리는 지점은 요청을 띄우는 방식 하나뿐이다. 타일 자르기·좌표 규약 판정·
+    중복 제거는 ``plan_tiles`` / ``collect_findings`` 를 공유하므로 같아야 한다.
+    한쪽에서만 박스가 밀리면 눈으로는 구분되지 않는다.
+    """
+
+    @staticmethod
+    def payloads() -> list[dict[str, Any]]:
+        return [
+            {"findings": [item("김철수", bbox=(0.1, 0.1, 0.3, 0.2))]},
+            {"findings": [item("이영희", bbox=(0.5, 0.6, 0.7, 0.7))]},
+            {"findings": [item("박민수", bbox=(0.2, 0.8, 0.4, 0.9))]},
+        ]
+
+    def test_matches_the_sync_path(self) -> None:
+        import asyncio
+
+        from pii_pipeline.detect import detect_async
+
+        config = cfg(tiles=3)
+        page = blank_page()
+
+        sync_out, _ = detect(page, FakeClient(self.payloads()), config, [])
+        async_out, _ = asyncio.run(
+            detect_async(page, FakeAsyncClient(self.payloads()), config, [])
+        )
+
+        assert [(f.text, f.type) for f in async_out] == [
+            (f.text, f.type) for f in sync_out
+        ]
+        for got, want in zip(async_out, sync_out, strict=True):
+            assert got.bbox_norm == pytest.approx(want.bbox_norm)
+            assert got.tile == want.tile
+
+    def test_sends_one_request_per_call(self) -> None:
+        import asyncio
+
+        from pii_pipeline.detect import detect_async
+
+        client = FakeAsyncClient(self.payloads())
+        asyncio.run(detect_async(blank_page(), client, cfg(tiles=3), []))
+        assert len(client.requests) == 3
+
+    def test_requests_carry_the_tile_number(self) -> None:
+        """페이지를 여러 장 섞어 넣을 때 응답을 되짚는 근거가 이 표식이다."""
+        import asyncio
+
+        from pii_pipeline.detect import detect_async
+
+        client = FakeAsyncClient(self.payloads())
+        asyncio.run(detect_async(blank_page(), client, cfg(tiles=3), []))
+        assert [r.tag[1] for r in client.requests] == [0, 1, 2]
+
+    def test_multiple_samples_expand_the_request_list(self) -> None:
+        import asyncio
+
+        from pii_pipeline.detect import detect_async
+
+        client = FakeAsyncClient([])
+        asyncio.run(
+            detect_async(blank_page(), client, cfg(tiles=2, samples=3), [])
+        )
+        assert len(client.requests) == 6
+        # samples >= 2 면 온도를 올려야 샘플을 늘린 의미가 생긴다
+        assert all(r.temperature is not None for r in client.requests)
+
+    def test_a_failed_call_does_not_lose_the_other_tiles(self) -> None:
+        import asyncio
+
+        from pii_pipeline.detect import detect_async
+
+        class Partial(FakeAsyncClient):
+            async def complete_json_many(self, requests, concurrency=None, on_done=None):
+                out = await super().complete_json_many(requests, concurrency, on_done)
+                out[1] = ({}, {"error": "타임아웃"})
+                return out
+
+        warnings: list[str] = []
+        found, _ = asyncio.run(
+            detect_async(blank_page(), Partial(self.payloads()), cfg(tiles=3), warnings)
+        )
+        assert [f.text for f in found] == ["김철수", "박민수"]
+        assert any("타임아웃" in w for w in warnings)
+
+
+class TestTilePlanIsShared:
+    """계획을 자료구조로 못박아 두면 두 경로가 다른 기하를 쓸 수 없다."""
+
+    def test_plan_reports_the_sample_count(self) -> None:
+        from pii_pipeline.detect import plan_tiles
+
+        plan = plan_tiles(blank_page(), cfg(tiles=3, samples=2), 1984, [])
+        assert len(plan.rects) == 3
+        assert len(plan.calls) == 6
+        assert plan.samples == 2
+
+    def test_single_sample_keeps_temperature_unset(self) -> None:
+        """samples==1 이면 온도를 건드리지 않는다 — 결정론을 지킨다."""
+        from pii_pipeline.detect import plan_tiles
+
+        assert plan_tiles(blank_page(), cfg(tiles=2), 1984, []).temperature is None
+
+    def test_seen_size_accounts_for_image_max_side(self) -> None:
+        """모델이 본 크기가 좌표 환산의 기준이다. 축소를 빼면 좌표가 밀린다."""
+        from pii_pipeline.detect import plan_tiles
+
+        big = plan_tiles(blank_page(), cfg(tiles=1), 4096, [])
+        small = plan_tiles(blank_page(), cfg(tiles=1), 640, [])
+        assert max(small.seen[0]) < max(big.seen[0])

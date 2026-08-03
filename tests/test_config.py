@@ -475,3 +475,61 @@ class TestTrainingSections:
         c = load_config(path)
         assert not hasattr(c.pipeline, "rank")
         assert c.pipeline.detect.tiles == 3
+
+
+class TestBatchSection:
+    """배치 설정은 **추론 설정과 함께 봐야 하는 값**이라 같은 파일에 둔다.
+
+    batch.pages x detect.tiles 가 llm.concurrency 보다 작으면 서버가 굶는데,
+    두 값이 다른 파일에 있으면 그 관계가 눈에 보이지 않는다.
+    """
+
+    def test_defaults_are_loaded(self, isolated: Path) -> None:
+        config = load_config()
+        assert config.pipeline.batch.pages == 8
+        assert config.pipeline.batch.prefetch_workers == 0
+        assert config.pipeline.llm.concurrency == 8
+
+    def test_yaml_overrides_batch_and_concurrency(self, tmp_path: Path) -> None:
+        path = write_yaml(
+            tmp_path / "c.yaml",
+            "batch:\n  pages: 16\nllm:\n  concurrency: 32\n",
+        )
+        config = load_config(path)
+        assert config.pipeline.batch.pages == 16
+        assert config.pipeline.llm.concurrency == 32
+
+    def test_typo_in_the_batch_section_fails_loudly(self, tmp_path: Path) -> None:
+        """오타난 키를 조용히 무시하면 켠 줄 알고 측정하게 된다."""
+        path = write_yaml(tmp_path / "c.yaml", "batch:\n  page: 4\n")
+        with pytest.raises(ValueError, match="page"):
+            load_config(path)
+
+    def test_batch_is_a_known_section(self) -> None:
+        assert "batch" in SECTIONS
+
+    def test_describe_warns_when_the_server_would_starve(self, tmp_path: Path) -> None:
+        path = write_yaml(
+            tmp_path / "c.yaml",
+            "batch:\n  pages: 1\ndetect:\n  tiles: 1\nllm:\n  concurrency: 16\n",
+        )
+        assert "굶습니다" in describe(load_config(path))
+
+    def test_describe_is_quiet_when_the_numbers_fit(self, tmp_path: Path) -> None:
+        path = write_yaml(
+            tmp_path / "c.yaml",
+            "batch:\n  pages: 8\ndetect:\n  tiles: 3\nllm:\n  concurrency: 8\n",
+        )
+        assert "굶습니다" not in describe(load_config(path))
+
+    def test_async_flags_override(self, isolated: Path) -> None:
+        config = load_config()
+        args = parse(["x.png", "--async", "--concurrency", "24", "--batch-pages", "12"])
+        apply_cli_overrides(config, args)
+        assert args.use_async is True
+        assert config.pipeline.llm.concurrency == 24
+        assert config.pipeline.batch.pages == 12
+
+    def test_async_is_off_by_default(self, isolated: Path) -> None:
+        """기본 경로를 바꾸지 않는다 — 켜는 것은 명시적 선택이어야 한다."""
+        assert parse(["x.png"]).use_async is False

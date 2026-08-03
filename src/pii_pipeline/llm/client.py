@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -142,6 +143,21 @@ class LlmConfig:
             1748 이고 **축소가 아예 일어나지 않는다.** 타일 수를 줄이려면
             이 값을 함께 올려야 한다.
         max_retries: 스키마 위반/네트워크 오류 재시도 횟수.
+        concurrency: **동시에 서버에 떠 있을 요청 수의 상한**
+            (``AsyncLlmClient`` 만 본다).
+
+            vLLM 은 서버에서 continuous batching 을 한다. 즉 클라이언트가 요청을
+            모아 한 덩어리로 보낼 필요가 없고, **요청을 여러 개 띄워 놓기만
+            하면** 서버가 알아서 같은 forward pass 에 태운다. 그래서 이 값은
+            "배치 크기" 가 아니라 "동시에 떠 있는 수" 다.
+
+            올리면 GPU 이용률이 오르고 처리량이 늘지만, 무한정 올릴 수는 없다.
+            요청마다 KV 캐시가 필요하고, 서버의 ``--max-num-seqs`` 와
+            ``--gpu-memory-utilization`` 이 실제 상한을 정한다. 그 상한을
+            넘기면 서버가 요청을 큐에 쌓아 두므로 **지연시간만 늘고 처리량은
+            그대로다** — 클라이언트에서 막는 것이 낫다.
+
+            서버의 ``--max-num-seqs`` 이하로 두는 것이 기본이다.
     """
 
     base_url: str = "http://127.0.0.1:8000/v1"
@@ -156,7 +172,53 @@ class LlmConfig:
     enable_thinking: bool = False
     image_max_side: int = 1984
     max_retries: int = 2
+    concurrency: int = 8
     extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Request:
+    """호출 하나에 필요한 것 전부.
+
+    ``complete_json`` 의 인자를 그대로 묶은 것이다. 여러 요청을 한꺼번에 넣는
+    ``AsyncLlmClient.complete_json_many`` 가 목록으로 받기 위해 필요하다.
+
+    Attributes:
+        tag: 호출부가 결과를 되찾을 때 쓰는 표식 (타일 번호, 페이지 등).
+            **클라이언트는 읽지 않고 메타에 그대로 되돌려준다.** 응답이 입력
+            순서대로 오더라도 호출부가 순서에만 의존하지 않게 하려는 것이다.
+    """
+
+    system: str
+    user: str
+    schema: dict[str, Any]
+    image: Any | None = None
+    temperature: float | None = None
+    tag: Any = None
+
+
+@dataclass
+class Outcome:
+    """응답 하나를 해석한 결과.
+
+    **이 판단을 sync 와 async 가 공유하는 것이 이 자료구조의 목적이다.**
+    절단이냐 파싱 실패냐 복구 가능이냐에 따라 재시도 여부와 방법이 다른데,
+    그 분기를 두 곳에 적어 두면 한쪽만 고쳐져 갈라진다. 갈라진 것은 예외가
+    아니라 **탐지율 차이로만** 나타나서 눈에 띄지 않는다.
+
+    Attributes:
+        payload: 파싱된 dict. ``None`` 이면 실패다.
+        salvaged: ``salvage_json`` 으로 건져냈다면 그 이유 (프롬프트 점검 신호).
+        error: 실패 이유.
+        truncated: ``max_tokens`` 에서 잘렸다. **재시도 방법이 다르다** —
+            ``temperature=0`` + 같은 입력이면 같은 상한으로는 매번 같은 지점에서
+            잘리므로, 상한을 올려야만 벗어난다.
+    """
+
+    payload: dict[str, Any] | None = None
+    salvaged: str | None = None
+    error: str | None = None
+    truncated: bool = False
 
 
 def fit_max_side(height: int, width: int, max_side: int) -> tuple[int, int]:
@@ -182,29 +244,61 @@ def fit_max_side(height: int, width: int, max_side: int) -> tuple[int, int]:
     return (max(1, int(height * scale)), max(1, int(width * scale)))
 
 
-class LlmClient:
-    """구조화 JSON 응답을 강제하는 얇은 래퍼."""
+def interpret_response(
+    raw: str, finish_reason: str | None, root_key: str | None
+) -> Outcome:
+    """응답 본문 하나를 해석한다. **순수 함수 — sync/async 가 공유한다.**
+
+    절단을 먼저 본다. 잘린 JSON 은 파싱도 복구도 시도하지 않는다 — 뒤가 없는
+    배열에서 건져낸 항목은 "앞부분만 탐지" 라는 뜻이고, 그걸 정상 결과로
+    돌려주면 미탐이 무음으로 쌓인다. 상한을 올려 다시 받는 것이 맞다.
+
+    Args:
+        raw: 모델 원문.
+        finish_reason: OpenAI 응답의 종료 이유.
+        root_key: 복구할 때 감쌀 키 (``root_key_of`` 의 결과).
+
+    Returns:
+        해석 결과.
+    """
+    if finish_reason == "length":
+        return Outcome(truncated=True)
+    try:
+        return Outcome(payload=json.loads(raw))
+    except json.JSONDecodeError as exc:
+        recovered = salvage_json(raw, root_key)
+        if recovered is None:
+            return Outcome(error=f"JSON 파싱 실패: {exc}")
+        return Outcome(payload=recovered, salvaged=str(exc))
+
+
+def response_parts(resp: Any) -> tuple[str, str | None, dict[str, int] | None]:
+    """OpenAI 응답에서 필요한 것만 뽑는다 (``(원문, 종료이유, 토큰수)``).
+
+    sync 와 async SDK 의 응답 객체가 같은 모양이라 그대로 공유한다.
+    """
+    choice = resp.choices[0]
+    raw = (choice.message.content or "").strip()
+    usage = None
+    if getattr(resp, "usage", None):
+        usage = {
+            "prompt_tokens": resp.usage.prompt_tokens,
+            "completion_tokens": resp.usage.completion_tokens,
+        }
+    return raw, choice.finish_reason, usage
+
+
+class _ClientBase:
+    """sync/async 클라이언트의 공통부 — 설정, 이미지 인코딩, 요청 조립.
+
+    나누는 기준은 **await 가 필요한가**다. 요청을 만드는 일과 응답을 해석하는
+    일에는 I/O 가 없으므로 여기 있고, 실제 호출과 재시도 루프만 각 클래스에
+    있다. 그 둘도 ``interpret_response`` 를 공유하므로 판단은 한 곳뿐이다.
+    """
 
     def __init__(self, config: LlmConfig | None = None) -> None:
         self.config = config or LlmConfig()
         self._client: Any | None = None
-
-    @property
-    def client(self) -> Any:
-        if self._client is None:
-            try:
-                from openai import OpenAI  # type: ignore[import-not-found]
-            except ImportError as exc:  # pragma: no cover - 환경 의존
-                raise RuntimeError(
-                    "openai 패키지가 필요합니다 (vLLM OpenAI 호환 API 호출용). "
-                    "requirements.txt 를 참고하세요."
-                ) from exc
-            self._client = OpenAI(
-                base_url=self.config.base_url,
-                api_key=self.config.api_key,
-                timeout=self.config.timeout,
-            )
-        return self._client
 
     # ------------------------------------------------------------------
     # 이미지 인코딩
@@ -235,6 +329,94 @@ class LlmClient:
         return f"data:image/jpeg;base64,{b64}"
 
     # ------------------------------------------------------------------
+    # 요청 조립
+    # ------------------------------------------------------------------
+
+    def _messages(self, system: str, user: str, image_url: str | None) -> list[dict]:
+        content: Any = user
+        if image_url is not None:
+            content = [
+                {"type": "text", "text": user},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ]
+
+    def _extra_body(self, schema: dict[str, Any]) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "chat_template_kwargs": {"enable_thinking": self.config.enable_thinking},
+            **self.config.extra_body,
+        }
+        if self.config.guided:
+            body["guided_json"] = schema
+            body["guided_decoding_backend"] = self.config.guided_backend
+        return body
+
+    def _sampling(self, temperature: float | None) -> float:
+        return self.config.temperature if temperature is None else temperature
+
+    # ------------------------------------------------------------------
+    # 재시도 루프의 공통 판단
+    # ------------------------------------------------------------------
+
+    def _resolve(
+        self,
+        outcome: Outcome,
+        meta: dict[str, Any],
+        max_tokens: int,
+        attempt: int,
+    ) -> tuple[dict[str, Any] | None, str | None, int]:
+        """해석 결과를 보고 **돌려줄지 / 다시 할지**를 정한다.
+
+        Returns:
+            ``(반환할 payload 또는 None, 마지막 에러, 다음 시도의 max_tokens)``.
+        """
+        if outcome.truncated:
+            error = f"출력이 max_tokens({max_tokens}) 에서 잘렸습니다"
+            log.warning("%s (attempt %d)", error, attempt)
+            if max_tokens < self.config.max_tokens_on_truncation:
+                max_tokens = self.config.max_tokens_on_truncation
+                log.warning("max_tokens 를 %d 로 올려 재시도합니다", max_tokens)
+            return None, error, max_tokens
+
+        if outcome.payload is None:
+            log.warning("%s (attempt %d)", outcome.error, attempt)
+            return None, outcome.error, max_tokens
+
+        if outcome.salvaged:
+            meta["salvaged"] = outcome.salvaged
+            log.warning(
+                "JSON 형식 이탈을 복구했습니다 (%s) — 프롬프트/guided decoding "
+                "설정을 점검하십시오. 원문 앞부분: %.120s",
+                outcome.salvaged,
+                meta.get("raw", ""),
+            )
+        return outcome.payload, None, max_tokens
+
+
+class LlmClient(_ClientBase):
+    """구조화 JSON 응답을 강제하는 얇은 래퍼 (동기)."""
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import OpenAI  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - 환경 의존
+                raise RuntimeError(
+                    "openai 패키지가 필요합니다 (vLLM OpenAI 호환 API 호출용). "
+                    "requirements.txt 를 참고하세요."
+                ) from exc
+            self._client = OpenAI(
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                timeout=self.config.timeout,
+            )
+        return self._client
+
+    # ------------------------------------------------------------------
     # 호출
     # ------------------------------------------------------------------
 
@@ -262,92 +444,211 @@ class LlmClient:
             형식만 어긋난 응답을 ``salvage_json`` 으로 건져낸 경우 메타에
             ``salvaged`` 가 남는다 (프롬프트·guided decoding 점검 신호).
         """
-        content: Any = user
+        image_url: str | None = None
         if image is not None:
             # 인코딩 실패도 예외로 던지지 않는다. 이 함수가 예외를 던지면
             # 이미 계산된 규칙 레이어 결과까지 함께 날아간다.
             try:
-                content = [
-                    {"type": "text", "text": user},
-                    {"type": "image_url", "image_url": {"url": self.encode_image(image)}},
-                ]
+                image_url = self.encode_image(image)
             except Exception as exc:  # noqa: BLE001 - 페이지 전체를 잃지 않는다
                 error = f"이미지 인코딩 실패: {type(exc).__name__}: {exc}"
                 log.warning("%s", error)
                 return {}, {"error": error, "attempt": 0}
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ]
-
-        extra_body: dict[str, Any] = {
-            "chat_template_kwargs": {"enable_thinking": self.config.enable_thinking},
-            **self.config.extra_body,
-        }
-        if self.config.guided:
-            extra_body["guided_json"] = schema
-            extra_body["guided_decoding_backend"] = self.config.guided_backend
+        messages = self._messages(system, user, image_url)
+        extra_body = self._extra_body(schema)
+        root_key = root_key_of(schema)
 
         last_error: str | None = None
         max_tokens = self.config.max_tokens
-        root_key = root_key_of(schema)
         for attempt in range(self.config.max_retries + 1):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.config.model,
                     messages=messages,
-                    temperature=(
-                        self.config.temperature if temperature is None else temperature
-                    ),
+                    temperature=self._sampling(temperature),
                     max_tokens=max_tokens,
                     extra_body=extra_body,
                 )
-                raw = (resp.choices[0].message.content or "").strip()
-                meta = {
-                    "raw": raw,
-                    "attempt": attempt,
-                    "finish_reason": resp.choices[0].finish_reason,
-                    "max_tokens": max_tokens,
-                }
-                if getattr(resp, "usage", None):
-                    meta["usage"] = {
-                        "prompt_tokens": resp.usage.prompt_tokens,
-                        "completion_tokens": resp.usage.completion_tokens,
-                    }
-                if meta["finish_reason"] == "length":
-                    # max_tokens 에서 잘렸다면 JSON 이 불완전하다.
-                    # temperature=0 + 같은 입력이면 같은 상한으로는 매번 같은
-                    # 지점에서 잘린다. 상한을 올려야 재시도에 의미가 생긴다.
-                    last_error = (
-                        f"출력이 max_tokens({max_tokens}) 에서 잘렸습니다"
-                    )
-                    log.warning("%s (attempt %d)", last_error, attempt)
-                    if max_tokens < self.config.max_tokens_on_truncation:
-                        max_tokens = self.config.max_tokens_on_truncation
-                        log.warning("max_tokens 를 %d 로 올려 재시도합니다", max_tokens)
-                    continue
-                try:
-                    return json.loads(raw), meta
-                except json.JSONDecodeError as exc:
-                    # 재시도해도 temperature=0 이면 같은 응답이 온다. 형식만
-                    # 어긋난 것이라면 건져내는 편이 페이지를 버리는 것보다 낫다.
-                    recovered = salvage_json(raw, root_key)
-                    if recovered is None:
-                        raise
-                    meta["salvaged"] = str(exc)
-                    log.warning(
-                        "JSON 형식 이탈을 복구했습니다 (%s) — 프롬프트/guided "
-                        "decoding 설정을 점검하십시오. 원문 앞부분: %.120s",
-                        exc,
-                        raw,
-                    )
-                    return recovered, meta
-            except json.JSONDecodeError as exc:
-                last_error = f"JSON 파싱 실패: {exc}"
-                log.warning("%s (attempt %d)", last_error, attempt)
             except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
                 last_error = f"{type(exc).__name__}: {exc}"
                 log.warning("LLM 호출 실패: %s (attempt %d)", last_error, attempt)
+                continue
+
+            raw, finish_reason, usage = response_parts(resp)
+            meta: dict[str, Any] = {
+                "raw": raw,
+                "attempt": attempt,
+                "finish_reason": finish_reason,
+                "max_tokens": max_tokens,
+            }
+            if usage:
+                meta["usage"] = usage
+
+            payload, last_error, max_tokens = self._resolve(
+                interpret_response(raw, finish_reason, root_key), meta, max_tokens, attempt
+            )
+            if payload is not None:
+                return payload, meta
 
         return {}, {"error": last_error or "unknown", "attempt": self.config.max_retries}
+
+
+class AsyncLlmClient(_ClientBase):
+    """요청 여러 개를 **동시에 띄우는** 클라이언트.
+
+    왜 필요한가 — vLLM 은 서버에서 continuous batching 을 한다. 클라이언트가
+    요청을 모아 한 덩어리로 보내는 것이 아니라, **요청이 여러 개 떠 있으면**
+    서버가 알아서 같은 forward pass 에 태운다. 그래서 처리량을 올리는 방법은
+    "in-flight 요청 수를 늘리는 것" 하나다.
+
+    기존 동기 경로는 ``detect`` 가 스레드 풀로 **한 페이지의 타일**만 동시에
+    돌린다. 페이지 사이는 완전히 순차라서, 한 페이지의 크롭 OCR·전처리(CPU)가
+    도는 동안 vLLM 은 아무것도 받지 않고 논다. 페이지가 3타일이면 GPU 가 보는
+    동시 요청은 최대 3개뿐이다.
+
+    이 클래스는 그 상한을 걷어낸다 — 여러 페이지의 타일을 한꺼번에 띄우고,
+    ``LlmConfig.concurrency`` 로만 제한한다.
+
+    판단 로직은 동기 쪽과 **같은 함수**(``interpret_response`` / ``_resolve``)를
+    쓴다. 절단·복구 처리가 두 경로에서 갈리면 "async 로 돌렸더니 탐지가 조금
+    다르다" 가 되는데, 그건 원인을 찾기 어려운 종류의 차이다.
+    """
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import AsyncOpenAI  # type: ignore[import-not-found]
+            except ImportError as exc:  # pragma: no cover - 환경 의존
+                raise RuntimeError(
+                    "openai 패키지가 필요합니다 (vLLM OpenAI 호환 API 호출용). "
+                    "requirements.txt 를 참고하세요."
+                ) from exc
+            self._client = AsyncOpenAI(
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                timeout=self.config.timeout,
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        """HTTP 연결을 닫는다. 배치가 끝나면 부를 것."""
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+
+    async def complete_json(
+        self,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        image: Any | None = None,
+        temperature: float | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """스키마를 강제해 JSON 응답을 받는다 (비동기).
+
+        동기 ``LlmClient.complete_json`` 과 **같은 것을 돌려준다** —
+        ``(파싱된 dict, 메타)``. 실패해도 예외를 던지지 않는다.
+        """
+        image_url: str | None = None
+        if image is not None:
+            try:
+                # **별 스레드에서 인코딩한다.** JPEG 인코딩은 CPU 작업이고,
+                # 이벤트 루프에서 그대로 돌리면 그 시간만큼 다른 요청의
+                # 송수신이 멈춘다. 요청을 수십 개 띄우는 것이 목적인데
+                # 인코딩이 직렬화되면 그 목적이 사라진다.
+                image_url = await asyncio.to_thread(self.encode_image, image)
+            except Exception as exc:  # noqa: BLE001 - 페이지 전체를 잃지 않는다
+                error = f"이미지 인코딩 실패: {type(exc).__name__}: {exc}"
+                log.warning("%s", error)
+                return {}, {"error": error, "attempt": 0}
+
+        messages = self._messages(system, user, image_url)
+        extra_body = self._extra_body(schema)
+        root_key = root_key_of(schema)
+
+        last_error: str | None = None
+        max_tokens = self.config.max_tokens
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                resp = await self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=self._sampling(temperature),
+                    max_tokens=max_tokens,
+                    extra_body=extra_body,
+                )
+            except asyncio.CancelledError:
+                # 취소는 삼키지 않는다. 배치를 중단시키려는 신호이므로
+                # 여기서 "실패한 요청" 으로 바꿔 버리면 중단이 안 된다.
+                raise
+            except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
+                last_error = f"{type(exc).__name__}: {exc}"
+                log.warning("LLM 호출 실패: %s (attempt %d)", last_error, attempt)
+                continue
+
+            raw, finish_reason, usage = response_parts(resp)
+            meta: dict[str, Any] = {
+                "raw": raw,
+                "attempt": attempt,
+                "finish_reason": finish_reason,
+                "max_tokens": max_tokens,
+            }
+            if usage:
+                meta["usage"] = usage
+
+            payload, last_error, max_tokens = self._resolve(
+                interpret_response(raw, finish_reason, root_key), meta, max_tokens, attempt
+            )
+            if payload is not None:
+                return payload, meta
+
+        return {}, {"error": last_error or "unknown", "attempt": self.config.max_retries}
+
+    async def complete_json_many(
+        self,
+        requests: list[Request],
+        concurrency: int | None = None,
+        on_done: Any | None = None,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """요청 여러 개를 동시에 넣는다.
+
+        Args:
+            requests: 요청 목록.
+            concurrency: 동시 요청 상한. ``None`` 이면 ``LlmConfig.concurrency``.
+            on_done: 요청 하나가 끝날 때마다 부를 함수 ``(완료수, 전체수)``.
+                진행 표시용이고, **완료 순서로 불린다** (제출 순서가 아니다).
+
+        Returns:
+            ``(payload, meta)`` 목록. **입력과 같은 순서, 같은 길이다.**
+            실패한 요청도 자리를 지킨다 (``meta["error"]``) — 길이가 달라지면
+            호출부가 결과를 입력에 되짚을 수 없다. ``Request.tag`` 를 준
+            경우 ``meta["tag"]`` 로 되돌려주므로 순서에 의존하지 않아도 된다.
+        """
+        limit = max(1, concurrency or self.config.concurrency)
+        # 세마포어는 **부를 때마다 새로 만든다.** 인스턴스에 캐시해 두면 다른
+        # 이벤트 루프에서 재사용될 수 있고, 그때 조용히 오작동한다.
+        gate = asyncio.Semaphore(limit)
+        total = len(requests)
+        done = 0
+
+        async def one(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+            nonlocal done
+            async with gate:
+                payload, meta = await self.complete_json(
+                    system=request.system,
+                    user=request.user,
+                    schema=request.schema,
+                    image=request.image,
+                    temperature=request.temperature,
+                )
+            if request.tag is not None:
+                meta["tag"] = request.tag
+            done += 1
+            if on_done is not None:
+                on_done(done, total)
+            return payload, meta
+
+        # gather 는 **제출 순서대로** 결과를 돌려준다 (완료 순서가 아니다).
+        return list(await asyncio.gather(*(one(r) for r in requests)))

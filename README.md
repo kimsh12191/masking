@@ -93,6 +93,41 @@ python scripts/run.py data/*.png data/*.pdf -o out/
 `out/*.boxes.png` 를 열어 **좌표가 맞는지 눈으로 확인**하는 게 가장 빠르다.
 초록은 OCR 이 확정한 좌표, 빨강은 VLM 근사 좌표(검토 필수)다.
 
+### 여러 장을 빨리 — `--async`
+
+기본 경로는 페이지를 한 장씩 끝까지 처리한다. 그동안 vLLM 이 보는 동시 요청은
+많아야 `detect.tiles` 개이고, 전처리와 크롭 OCR 이 도는 시간에는 0개다.
+**GPU 가 페이지 사이마다 논다.**
+
+```bash
+python scripts/run.py data/*.pdf -o out/ --async
+python scripts/run.py data/*.png -o out/ --async --concurrency 16 --batch-pages 16
+```
+
+여러 페이지의 타일 요청을 한 묶음으로 모아 동시에 넣는다. **결과와 순서는 기본
+경로와 같다** — 요청을 넣는 방식만 다르다. 한 장만 처리할 때는 이득이 없다.
+
+두 손잡이가 있고 서로 맞물린다.
+
+| 설정 | 뜻 | 맞춰야 하는 것 |
+|---|---|---|
+| `llm.concurrency` | 동시에 서버에 **떠 있을** 요청 수 | 서버의 `--max-num-seqs` 이하 |
+| `batch.pages` | 한 묶음으로 준비할 페이지 수 | `pages × tiles` 가 `concurrency` 보다 커야 함 |
+
+`concurrency` 는 "배치 크기" 가 아니다. vLLM 은 서버에서 continuous batching 을
+하므로 요청을 모아 보낼 필요가 없고, **띄워 놓기만 하면** 서버가 같은 forward
+pass 에 태운다. 그래서 `--max-num-seqs` 를 넘겨 띄우면 큐에 쌓여 지연시간만 늘고
+처리량은 그대로다.
+
+`batch.pages` 는 메모리를 정한다 — 전처리된 A4 한 장이 약 13MB 다.
+
+```bash
+python scripts/run.py --print-config     # 두 값의 조합을 검산해준다
+```
+
+`묶음당 요청이 동시 상한보다 적어 서버가 굶습니다` 가 뜨면 `batch.pages` 를
+올리거나 `llm.concurrency` 를 내려라.
+
 ---
 
 ## 학습 — OCR 좌표를 VLM 에 이식

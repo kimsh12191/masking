@@ -11,8 +11,11 @@ from typing import Any
 import pytest
 
 from pii_pipeline.llm.client import (
+    AsyncLlmClient,
     LlmClient,
     LlmConfig,
+    Request,
+    interpret_response,
     root_key_of,
     salvage_json,
 )
@@ -263,3 +266,205 @@ class TestRequestShape:
         build, seen = captured
         build().complete_json(system="s", user="u", schema=VLM_SCHEMA)
         assert seen["messages"][1]["content"] == "u"
+
+
+# --------------------------------------------------------------------------
+# 응답 해석 — sync/async 가 공유하는 판단
+# --------------------------------------------------------------------------
+
+
+class TestInterpretResponse:
+    """이 함수가 sync/async 의 **유일한 공통 판단**이다.
+
+    절단이냐 파싱 실패냐 복구 가능이냐에 따라 재시도 방법이 다르고, 그 분기가
+    두 경로에서 갈리면 "async 로 돌렸더니 탐지가 조금 다르다" 가 된다.
+    """
+
+    def test_clean_json_passes_through(self) -> None:
+        out = interpret_response('{"findings":[]}', "stop", "findings")
+        assert out.payload == {"findings": []}
+        assert out.salvaged is None
+        assert not out.truncated
+
+    def test_truncation_is_not_salvaged(self) -> None:
+        """잘린 배열에서 건져내면 '앞부분만 탐지' 를 정상 결과로 돌려준다.
+
+        그건 미탐이 무음으로 쌓이는 길이다. 상한을 올려 다시 받아야 한다.
+        """
+        out = interpret_response('{"findings":[{"a":1}', "length", "findings")
+        assert out.truncated
+        assert out.payload is None
+
+    def test_recoverable_json_is_marked(self) -> None:
+        out = interpret_response('{"a":1}\n{"a":2}', "stop", "findings")
+        assert out.payload == {"findings": [{"a": 1}, {"a": 2}]}
+        assert out.salvaged is not None  # 프롬프트 점검 신호가 남아야 한다
+
+    def test_unrecoverable_json_is_an_error(self) -> None:
+        out = interpret_response("설명만 있고 JSON 이 없다", "stop", "findings")
+        assert out.payload is None
+        assert out.error is not None
+        assert not out.truncated
+
+
+# --------------------------------------------------------------------------
+# 비동기 클라이언트
+# --------------------------------------------------------------------------
+
+
+class FakeAsyncApi:
+    """동시에 몇 개가 떠 있었는지 기록하는 최소 AsyncOpenAI 대역."""
+
+    def __init__(self, content: str = '{"findings":[]}', delay: float = 0.01) -> None:
+        self.content = content
+        self.delay = delay
+        self.in_flight = 0
+        self.peak = 0
+        self.calls = 0
+        outer = self
+
+        class completions:  # noqa: N801
+            @staticmethod
+            async def create(**kwargs: Any) -> Any:
+                import asyncio
+
+                outer.in_flight += 1
+                outer.peak = max(outer.peak, outer.in_flight)
+                outer.calls += 1
+                try:
+                    await asyncio.sleep(outer.delay)
+                finally:
+                    outer.in_flight -= 1
+                return fake_response(outer.content)().chat.completions.create()
+
+        class chat:  # noqa: N801
+            pass
+
+        chat.completions = completions
+        self.chat = chat
+
+
+def async_client(api: Any, **cfg: Any) -> AsyncLlmClient:
+    client = AsyncLlmClient(LlmConfig(**cfg))
+    client._client = api  # noqa: SLF001 - 네트워크를 타지 않게 직접 꽂는다
+    return client
+
+
+class TestAsyncLlmClient:
+    def test_returns_the_same_shape_as_the_sync_client(self) -> None:
+        import asyncio
+
+        api = FakeAsyncApi('{"findings":[{"text":"x"}]}')
+        payload, meta = asyncio.run(
+            async_client(api).complete_json(system="s", user="u", schema=VLM_SCHEMA)
+        )
+        assert payload == {"findings": [{"text": "x"}]}
+        assert meta["attempt"] == 0
+        assert meta["finish_reason"] == "stop"
+
+    def test_api_failure_returns_error_not_raises(self) -> None:
+        import asyncio
+
+        class Boom:
+            class chat:  # noqa: N801
+                class completions:  # noqa: N801
+                    @staticmethod
+                    async def create(**kwargs: Any) -> Any:
+                        raise RuntimeError("연결 거부")
+
+        payload, meta = asyncio.run(
+            async_client(Boom, max_retries=1).complete_json(
+                system="s", user="u", schema=VLM_SCHEMA
+            )
+        )
+        assert payload == {}
+        assert "연결 거부" in meta["error"]
+
+    def test_many_preserves_input_order(self) -> None:
+        """순서가 흔들리면 호출부가 결과를 입력에 되짚을 수 없다."""
+        import asyncio
+
+        api = FakeAsyncApi()
+        requests = [
+            Request(system="s", user=f"u{i}", schema=VLM_SCHEMA, tag=i)
+            for i in range(6)
+        ]
+        out = asyncio.run(async_client(api).complete_json_many(requests))
+        assert [meta["tag"] for _, meta in out] == [0, 1, 2, 3, 4, 5]
+
+    def test_many_returns_one_result_per_request(self) -> None:
+        import asyncio
+
+        api = FakeAsyncApi()
+        requests = [Request(system="s", user="u", schema=VLM_SCHEMA) for _ in range(5)]
+        out = asyncio.run(async_client(api).complete_json_many(requests))
+        assert len(out) == len(requests)
+
+    def test_concurrency_cap_is_enforced(self) -> None:
+        """상한이 없으면 서버가 요청을 큐에 쌓아 지연시간만 늘어난다."""
+        import asyncio
+
+        api = FakeAsyncApi()
+        requests = [Request(system="s", user="u", schema=VLM_SCHEMA) for _ in range(12)]
+        asyncio.run(async_client(api, concurrency=3).complete_json_many(requests))
+        assert api.calls == 12
+        assert api.peak <= 3
+
+    def test_requests_actually_overlap(self) -> None:
+        """상한만 지키고 직렬로 돌면 이 기능의 목적이 사라진다."""
+        import asyncio
+
+        api = FakeAsyncApi()
+        requests = [Request(system="s", user="u", schema=VLM_SCHEMA) for _ in range(8)]
+        asyncio.run(async_client(api, concurrency=4).complete_json_many(requests))
+        assert api.peak > 1
+
+    def test_per_call_concurrency_overrides_the_config(self) -> None:
+        import asyncio
+
+        api = FakeAsyncApi()
+        requests = [Request(system="s", user="u", schema=VLM_SCHEMA) for _ in range(10)]
+        asyncio.run(
+            async_client(api, concurrency=8).complete_json_many(requests, concurrency=2)
+        )
+        assert api.peak <= 2
+
+    def test_progress_callback_counts_every_request(self) -> None:
+        import asyncio
+
+        api = FakeAsyncApi()
+        seen: list[tuple[int, int]] = []
+        requests = [Request(system="s", user="u", schema=VLM_SCHEMA) for _ in range(4)]
+        asyncio.run(
+            async_client(api).complete_json_many(
+                requests, on_done=lambda done, total: seen.append((done, total))
+            )
+        )
+        assert [d for d, _ in seen] == [1, 2, 3, 4]
+        assert {t for _, t in seen} == {4}
+
+    def test_a_failing_request_keeps_its_slot(self) -> None:
+        """실패해도 길이가 줄면 호출부가 결과를 입력에 되짚을 수 없다."""
+        import asyncio
+
+        class Flaky:
+            n = 0
+
+            class chat:  # noqa: N801
+                class completions:  # noqa: N801
+                    @staticmethod
+                    async def create(**kwargs: Any) -> Any:
+                        Flaky.n += 1
+                        if Flaky.n == 2:
+                            raise RuntimeError("한 개만 실패")
+                        return fake_response('{"findings":[]}')().chat.completions.create()
+
+        requests = [
+            Request(system="s", user="u", schema=VLM_SCHEMA, tag=i) for i in range(3)
+        ]
+        out = asyncio.run(
+            async_client(Flaky, max_retries=0, concurrency=1).complete_json_many(requests)
+        )
+        assert len(out) == 3
+        assert [meta["tag"] for _, meta in out] == [0, 1, 2]
+        assert sum(1 for _, meta in out if meta.get("error")) == 1

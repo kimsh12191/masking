@@ -368,3 +368,202 @@ class TestBatch:
         assert calls == ["a.png", "bad.png", "c.png"]
         assert len(results) == 3
         assert any("처리 실패" in w for r in results for w in r.warnings)
+
+
+# --------------------------------------------------------------------------
+# 비동기 배치
+# --------------------------------------------------------------------------
+
+
+class FakeAsyncClient:
+    """``complete_json_many`` 만 흉내낸다.
+
+    **동시에 몇 개가 떠 있었는지 기록한다** — 상한이 실제로 걸리는지 보려면
+    반환값만으로는 알 수 없다.
+    """
+
+    config = LlmConfig()
+
+    def __init__(self, payloads: list[dict], concurrency: int = 8) -> None:
+        self.payloads = payloads
+        self.concurrency = concurrency
+        self.calls = 0
+        self.in_flight = 0
+        self.peak = 0
+        self.seen_tags: list[Any] = []
+
+    async def complete_json_many(
+        self, requests: list[Any], concurrency: int | None = None, on_done: Any = None
+    ):
+        import asyncio
+
+        gate = asyncio.Semaphore(concurrency or self.concurrency)
+
+        async def one(request: Any):
+            async with gate:
+                self.in_flight += 1
+                self.peak = max(self.peak, self.in_flight)
+                await asyncio.sleep(0)  # 다른 요청에 실행 기회를 준다
+                n = self.calls
+                self.calls += 1
+                self.seen_tags.append(request.tag)
+                payload = (
+                    self.payloads[n] if n < len(self.payloads) else {"findings": []}
+                )
+                self.in_flight -= 1
+                return payload, {}
+
+        return list(await asyncio.gather(*(one(r) for r in requests)))
+
+    async def aclose(self) -> None:
+        return None
+
+
+def build_async(
+    payloads: list[dict],
+    ocr_results: list[list[OcrBox]],
+    **cfg_kw: Any,
+) -> PiiPipeline:
+    cfg_kw.setdefault("detect", DetectConfig(tiles=1, workers=1))
+    cfg_kw.setdefault("locate", LocateConfig(upscale=1.0))
+    pipe = PiiPipeline(PipelineConfig(**cfg_kw))
+    pipe.async_llm = FakeAsyncClient(payloads)  # type: ignore[assignment]
+    pipe.ocr = FakeOcr(ocr_results)  # type: ignore[assignment]
+    return pipe
+
+
+class TestRunBatchAsync:
+    """배치 경로는 동기 경로와 **같은 결과**를 내야 한다.
+
+    다른 것은 요청을 넣는 방식뿐이다. 결과가 갈리면 "async 로 돌렸더니 탐지가
+    조금 다르다" 가 되는데, 그건 원인을 찾기 어려운 종류의 차이다.
+    """
+
+    def test_matches_the_sync_path(self, no_preprocess: None) -> None:
+        import asyncio
+
+        payloads = [{"findings": [vlm_item(VALID_RRN, "RRN", (100, 200, 300, 240))]}]
+        ocr = [[box(VALID_RRN)]]
+
+        sync = build(list(payloads), [list(r) for r in ocr]).run("a.png")
+        batch = asyncio.run(
+            build_async(list(payloads), [list(r) for r in ocr]).run_batch_async(["a.png"])
+        )
+
+        assert len(batch) == 1
+        assert [r.type for r in batch[0].regions] == [r.type for r in sync.regions]
+        assert [r.bbox for r in batch[0].regions] == [r.bbox for r in sync.regions]
+        assert [r.text for r in batch[0].regions] == [r.text for r in sync.regions]
+
+    def test_submits_every_page_in_one_go(self, no_preprocess: None) -> None:
+        """묶음의 요청이 한 번에 들어가야 페이지 사이에서 GPU 가 놀지 않는다."""
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 4, [])
+        pipe.config.batch.pages = 4
+        results = asyncio.run(pipe.run_batch_async(["a.png", "b.png", "c.png", "d.png"]))
+
+        assert len(results) == 4
+        assert pipe.async_llm.calls == 4  # type: ignore[attr-defined]
+        # 4장이 동시에 떠 있었다 — 순차라면 1 이 최대다
+        assert pipe.async_llm.peak > 1  # type: ignore[attr-defined]
+
+    def test_tags_identify_the_page(self, no_preprocess: None) -> None:
+        """순서에만 의존하지 않도록 페이지 표식이 요청에 실려야 한다."""
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 3, [])
+        pipe.config.batch.pages = 3
+        asyncio.run(pipe.run_batch_async(["a.png", "b.png", "c.png"]))
+        pages = [tag[0] for tag in pipe.async_llm.seen_tags]  # type: ignore[attr-defined]
+        assert pages == [0, 1, 2]
+
+    def test_windows_do_not_lose_pages(self, no_preprocess: None) -> None:
+        """묶음 크기보다 페이지가 많으면 여러 묶음으로 나뉜다 — 하나도 빠지면 안 된다."""
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 5, [])
+        pipe.config.batch.pages = 2
+        results = asyncio.run(
+            pipe.run_batch_async(["a.png", "b.png", "c.png", "d.png", "e.png"])
+        )
+        assert len(results) == 5
+        assert pipe.async_llm.calls == 5  # type: ignore[attr-defined]
+
+    def test_reports_progress(self, no_preprocess: None) -> None:
+        import asyncio
+
+        seen: list[tuple[int, int]] = []
+        pipe = build_async([{"findings": []}] * 4, [])
+        pipe.config.batch.pages = 2
+        asyncio.run(
+            pipe.run_batch_async(
+                ["a.png", "b.png", "c.png", "d.png"],
+                on_progress=lambda done, total: seen.append((done, total)),
+            )
+        )
+        assert seen == [(2, 2), (4, 4)]
+
+    def test_records_both_shared_and_per_page_detect_time(
+        self, no_preprocess: None
+    ) -> None:
+        """페이지별 VLM 시간은 존재하지 않는다 — 그 사실이 숫자에 드러나야 한다."""
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 2, [])
+        pipe.config.batch.pages = 2
+        results = asyncio.run(pipe.run_batch_async(["a.png", "b.png"]))
+        for result in results:
+            assert result.timings["detect_window"] >= result.timings["detect"]
+        assert results[0].timings["detect_window"] == results[1].timings["detect_window"]
+
+    def test_a_failed_page_does_not_sink_the_batch(
+        self, no_preprocess: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """한 장이 죽어도 나머지는 처리하고, 죽은 장도 자리를 지킨다."""
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 3, [])
+        pipe.config.batch.pages = 3
+
+        real = pipe.preprocess_page
+        calls = {"n": 0}
+
+        def flaky(path: str, **kw: Any):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("깨진 이미지")
+            return real(path, **kw)
+
+        monkeypatch.setattr(pipe, "preprocess_page", flaky)
+        results = asyncio.run(pipe.run_batch_async(["a.png", "b.png", "c.png"]))
+
+        assert len(results) == 3
+        assert any("처리 실패" in w for r in results for w in r.warnings)
+
+    def test_a_failed_page_keeps_its_place(
+        self, no_preprocess: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """실패한 페이지가 앞으로 몰리면 입력과 결과를 짝지을 수 없다.
+
+        성공한 것만 모아 처리하고 나중에 이어 붙이면 정확히 그렇게 된다.
+        """
+        import asyncio
+
+        pipe = build_async([{"findings": []}] * 3, [])
+        pipe.config.batch.pages = 3
+
+        real = pipe.preprocess_page
+
+        def flaky(path: str, **kw: Any):
+            if path == "b.png":
+                raise RuntimeError("깨진 이미지")
+            return real(path, **kw)
+
+        monkeypatch.setattr(pipe, "preprocess_page", flaky)
+        results = asyncio.run(pipe.run_batch_async(["a.png", "b.png", "c.png"]))
+
+        assert [r.image_path for r in results] == ["a.png", "b.png", "c.png"]
+        assert results[1].width == 0  # 가운데가 실패한 자리다
+        assert any("처리 실패" in w for w in results[1].warnings)
+        assert not any("처리 실패" in w for w in results[0].warnings)

@@ -140,6 +140,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--image-max-side", type=int, default=None,
                    help="VLM 에 보낼 이미지 긴 변 길이. --tiles 와 함께 볼 것 "
                         "(--print-config 가 조합을 검산해준다)")
+
+    g = p.add_argument_group("비동기 배치 (여러 장을 처리할 때)")
+    g.add_argument("--async", dest="use_async", action="store_true",
+                   help="여러 페이지의 VLM 요청을 한꺼번에 넣는다. 결과와 순서는 "
+                        "기본 경로와 같고 요청을 넣는 방식만 다르다. "
+                        "**한 장만 처리할 때는 이득이 없다**")
+    g.add_argument("--concurrency", type=int, default=None,
+                   help="동시에 서버에 떠 있을 요청 수의 상한. "
+                        "서버의 --max-num-seqs 이하로 둘 것")
+    g.add_argument("--batch-pages", type=int, default=None,
+                   help="한 묶음으로 요청을 넣을 페이지 수. 전처리 이미지를 그만큼 "
+                        "메모리에 들고 있는다 (장당 약 13MB)")
     return p
 
 
@@ -161,7 +173,7 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
     """``None`` 이 아닌 CLI 인자만 설정에 덮어쓴다 (④ 단계)."""
     pipe = config.pipeline
     ocr, llm, out = pipe.ocr, pipe.llm, config.output
-    det, loc = pipe.detect, pipe.locate
+    det, loc, batch = pipe.detect, pipe.locate, pipe.batch
 
     for value, target, attr in (
         (args.out, out, "out_dir"),
@@ -186,12 +198,63 @@ def apply_cli_overrides(config, args: argparse.Namespace) -> None:
         (args.crop_pad, loc, "pad_ratio"),
         (args.crop_upscale, loc, "upscale"),
         (args.geometry_fallback, loc, "geometry_fallback"),
+        (args.concurrency, llm, "concurrency"),
+        (args.batch_pages, batch, "pages"),
     ):
         if value is not None:
             setattr(target, attr, value)
 
     if args.cpu:
         ocr.use_gpu = False
+
+
+def run_async(
+    pipeline: PiiPipeline,
+    args: argparse.Namespace,
+    out_dir: Path,
+    password: str | None,
+    save_kwargs: dict,
+) -> int:
+    """``--async`` 경로. 여러 페이지의 VLM 요청을 한꺼번에 넣는다.
+
+    동기 경로와 다른 점이 하나 더 있다 — **입력 전체를 한 배치로 넘긴다.**
+    동기 경로는 입력마다 ``run_any`` 를 부르므로 파일 사이에서도 순차인데,
+    여기서는 파일 경계와 무관하게 묶음이 짜인다 (그게 목적이다).
+    """
+    import asyncio
+
+    async def go() -> list:
+        try:
+            return await pipeline.run_batch_async(
+                args.inputs,
+                out_dir=str(out_dir),
+                pages=args.pages,
+                password=password,
+                on_progress=lambda done, seen: logging.info(
+                    "진행: %d/%d 페이지", done, seen
+                ),
+                **save_kwargs,
+            )
+        finally:
+            # 연결을 남기면 파이썬 종료 시 "Unclosed client session" 이 뜬다.
+            await pipeline.aclose()
+
+    try:
+        results = asyncio.run(go())
+    except Exception as exc:  # noqa: BLE001 - 요약은 남긴다
+        logging.exception("배치 처리 실패")
+        (out_dir / "batch.error.txt").write_text(
+            f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+        )
+        return 1
+
+    exit_code = 0
+    for result in results:
+        if any(w.startswith("처리 실패") for w in result.warnings):
+            exit_code = 1
+        print()
+        print(format_summary(result, written_paths(out_dir, result)))
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -230,6 +293,16 @@ def main(argv: list[str] | None = None) -> int:
 
     password = args.pdf_password or os.getenv("PII_PDF_PASSWORD")
 
+    save_kwargs = {
+        "write_image": config.output.write_image,
+        "include_ocr": config.output.include_ocr,
+        "font_path": config.output.font_path,
+        "show_ocr_boxes": config.output.show_ocr_boxes,
+    }
+
+    if args.use_async:
+        return run_async(pipeline, args, out_dir, password, save_kwargs)
+
     for input_path in args.inputs:
         try:
             results = pipeline.run_any(
@@ -237,10 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir=str(out_dir),
                 pages=args.pages,
                 password=password,
-                write_image=config.output.write_image,
-                include_ocr=config.output.include_ocr,
-                font_path=config.output.font_path,
-                show_ocr_boxes=config.output.show_ocr_boxes,
+                **save_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - 배치 중단 방지
             logging.exception("처리 실패: %s", input_path)
