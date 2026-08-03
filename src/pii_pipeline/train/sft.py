@@ -23,6 +23,8 @@ next-token 예측을 돌리는 것이 전부다.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -281,3 +283,100 @@ def summarize(examples: list[Example]) -> dict[str, Any]:
         "answer_chars_median": sorted(lengths)[len(lengths) // 2] if lengths else 0,
         "answer_chars_max": max(lengths, default=0),
     }
+
+
+# --------------------------------------------------------------------------
+# 입력 크기 균일성 검사
+# --------------------------------------------------------------------------
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    """이미지의 ``(폭, 높이)``.
+
+    **헤더만 읽는다** (``PIL.Image.open`` 은 지연 로딩이다). 픽셀을 디코드하지
+    않으므로 수천 장을 재도 싸고, 그래서 학습 시작 전에 전수 검사할 수 있다.
+    """
+    from PIL import Image  # type: ignore[import-not-found]
+
+    with Image.open(path) as im:
+        return im.size
+
+
+def tally_image_sizes(
+    examples: list[Example],
+    size_of: Callable[[Path], tuple[int, int]] | None = None,
+) -> Counter[tuple[int, int]]:
+    """학습 이미지의 크기 분포. ``{(폭, 높이): 장수}``.
+
+    Args:
+        examples: 학습 샘플.
+        size_of: 크기를 읽는 함수. 기본은 ``image_size``.
+            **테스트에서 Pillow 없이 돌리기 위한 이음새다.**
+    """
+    read = size_of or image_size
+    return Counter(read(e.image_path) for e in examples)
+
+
+def check_uniform_image_size(
+    examples: list[Example],
+    batch: int,
+    size_of: Callable[[Path], tuple[int, int]] | None = None,
+) -> Counter[tuple[int, int]]:
+    """학습 이미지가 **모두 같은 크기인지** 확인한다.
+
+    이 검사가 있는 이유는 실패가 늦고 메시지가 엉뚱하기 때문이다. 크기가 섞여
+    있으면 ``collate`` 가 비전 텐서를 이어 붙이다 죽는데, 그게 **첫 에폭 중간에**
+    ``RuntimeError: Sizes of tensors must match except in dimension 0`` 로
+    나타난다. DataLoader 워커 안에서 터지므로 traceback 도 두 겹이고, 데이터
+    문제라는 단서가 한 줄도 없다. 모델을 GPU 에 올린 뒤라 낭비도 크다.
+
+    ``batch`` 에 따라 세기가 다르다:
+
+    * ``batch >= 2``  **막는다.** 배치에 크기가 다른 두 장이 들어가는 순간
+      반드시 죽는다. 돌려 봐야 시간만 버린다.
+    * ``batch == 1``  **경고만 한다.** 이어 붙일 상대가 없어 실제로 돌아간다.
+      다만 좌표 학습으로서는 여전히 손해라 조용히 넘기지 않는다 —
+      ``pipeline.canvas`` 주석의 근거가 그대로 적용된다. 페이지마다 크기가
+      다르면 같은 per-mille 좌표가 장마다 다른 픽셀을 가리키고, 모델이 그
+      변동까지 함께 배워야 한다.
+
+    Args:
+        examples: 학습 샘플.
+        batch: ``--batch`` (디바이스당 배치 크기).
+        size_of: 크기를 읽는 함수 (테스트용 이음새).
+
+    Returns:
+        크기 분포. 균일하면 항목이 하나다.
+
+    Raises:
+        ValueError: 크기가 섞여 있고 ``batch >= 2`` 일 때.
+    """
+    sizes = tally_image_sizes(examples, size_of)
+    if len(sizes) <= 1:
+        return sizes
+
+    lines = [
+        f"  {w}x{h}  {n}장" for (w, h), n in sizes.most_common()
+    ]
+    detail = "\n".join(lines[:8])
+    if len(sizes) > 8:
+        detail += f"\n  ... 그 밖에 {len(sizes) - 8}종"
+
+    why = (
+        f"학습 이미지 크기가 균일하지 않습니다 ({len(sizes)}종):\n{detail}\n\n"
+        "흔한 원인:\n"
+        "  1. pipeline.canvas 가 null 이라 페이지 크기가 입력마다 다르다.\n"
+        "     canvas 를 고정하고 데이터를 다시 만들 것.\n"
+        "  2. 설정이 다른 두 번의 빌드 산출물이 한 디렉터리에 섞였다.\n"
+        "     출력 디렉터리를 비우고 다시 만들 것.\n"
+        "  3. pipeline.canvas / detect.tiles 를 바꾼 뒤 데이터를 다시 만들지 않았다."
+    )
+    if batch >= 2:
+        raise ValueError(
+            f"{why}\n\n"
+            f"batch={batch} 에서는 배치에 크기가 다른 두 장이 들어가는 순간 "
+            "비전 텐서를 이어 붙일 수 없어 collate 가 죽습니다.\n"
+            "데이터를 고쳐 다시 만들거나, --batch 1 로 우회하세요 "
+            "(실효 배치는 grad_accum 으로 맞출 수 있습니다)."
+        )
+    return sizes

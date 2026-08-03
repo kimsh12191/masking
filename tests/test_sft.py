@@ -13,6 +13,7 @@ GPU 없이 검증할 수 있는 것은 **손실 마스킹**과 **데이터 적�
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -27,11 +28,13 @@ from pii_pipeline.train.sft import (
     TOKEN_AXIS_KEYS,
     Example,
     build_messages,
+    check_uniform_image_size,
     load_jsonl,
     mask_prompt,
     pad_fill_value,
     select_vision_blocks,
     summarize,
+    tally_image_sizes,
 )
 
 
@@ -224,6 +227,79 @@ class TestSummarize:
 
     def test_handles_empty_input(self) -> None:
         assert summarize([])["samples"] == 0
+
+
+class TestCheckUniformImageSize:
+    """크기가 섞인 학습 데이터를 **시작 전에** 잡는다.
+
+    막지 않으면 첫 에폭 중간에 ``collate`` 가 죽는다. 그 실패는 DataLoader
+    워커 안에서 나므로 traceback 이 두 겹이고, 메시지("Sizes of tensors must
+    match except in dimension 0")에는 어느 키인지도 데이터 문제라는 단서도
+    없다. 게다가 그때는 이미 9B 를 GPU 에 올린 뒤다.
+
+    ``size_of`` 를 주입할 수 있게 만든 덕에 Pillow 없이 CPU 로 검증된다.
+    """
+
+    @staticmethod
+    def sized(*sizes: tuple[int, int]):
+        """크기별 샘플과 ``경로 -> 크기`` 조회 함수를 함께 만든다."""
+        examples: list[Example] = []
+        table: dict[Path, tuple[int, int]] = {}
+        for index, wh in enumerate(sizes):
+            path = Path(f"tiles/t{index}.png")
+            examples.append(
+                Example(image_path=path, target={"findings": []}, meta={}, query=[])
+            )
+            table[path] = wh
+        return examples, table.__getitem__
+
+    def test_uniform_data_passes(self) -> None:
+        examples, size_of = self.sized((1760, 896), (1760, 896), (1760, 896))
+        sizes = check_uniform_image_size(examples, batch=4, size_of=size_of)
+        assert sizes == Counter({(1760, 896): 3})
+
+    def test_mixed_sizes_are_blocked_when_batching(self) -> None:
+        examples, size_of = self.sized((1760, 896), (1760, 1056))
+        with pytest.raises(ValueError, match="균일하지 않습니다"):
+            check_uniform_image_size(examples, batch=2, size_of=size_of)
+
+    def test_error_names_the_causes_and_the_sizes(self) -> None:
+        """원인 없이 raise 하면 torch 에러와 다를 게 없다."""
+        examples, size_of = self.sized((1760, 896), (1760, 1056))
+        with pytest.raises(ValueError) as err:
+            check_uniform_image_size(examples, batch=8, size_of=size_of)
+        text = str(err.value)
+        assert "pipeline.canvas" in text
+        assert "--batch 1" in text
+        # 어떤 크기가 섞였는지 눈으로 봐야 어느 빌드가 섞였는지 짐작할 수 있다
+        assert "1760x896" in text
+        assert "1760x1056" in text
+
+    def test_batch_one_warns_instead_of_raising(self) -> None:
+        """이어 붙일 상대가 없어 실제로 돌아간다 — 막지 않는다.
+
+        좌표 학습으로서는 여전히 손해지만, 그 판단은 호출자 몫이다.
+        """
+        examples, size_of = self.sized((1760, 896), (1760, 1056))
+        sizes = check_uniform_image_size(examples, batch=1, size_of=size_of)
+        assert len(sizes) == 2
+
+    def test_long_size_lists_are_truncated(self) -> None:
+        """크기가 수십 종이면 메시지가 화면을 덮는다."""
+        examples, size_of = self.sized(*[(100 + i, 200) for i in range(12)])
+        with pytest.raises(ValueError) as err:
+            check_uniform_image_size(examples, batch=2, size_of=size_of)
+        assert "그 밖에 4종" in str(err.value)
+
+    def test_tally_counts_every_sample(self) -> None:
+        examples, size_of = self.sized((10, 20), (10, 20), (30, 40))
+        assert tally_image_sizes(examples, size_of) == Counter(
+            {(10, 20): 2, (30, 40): 1}
+        )
+
+    def test_empty_dataset_is_not_an_error(self) -> None:
+        """샘플이 없다는 것은 여기서 낼 에러가 아니다 (main 이 따로 잡는다)."""
+        assert check_uniform_image_size([], batch=8) == Counter()
 
 
 class TestSelectVisionBlocks:

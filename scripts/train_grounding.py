@@ -69,6 +69,7 @@ from pii_pipeline.train.sft import (  # noqa: E402
     TOKEN_AXIS_KEYS,
     Example,
     build_messages,
+    check_uniform_image_size,
     load_jsonl,
     mask_prompt,
     pad_fill_value,
@@ -172,7 +173,24 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, Any]:
         out[key] = torch.stack(rows)
 
     for key in batch[0].keys() - out.keys():
-        out[key] = torch.cat([item[key] for item in batch], dim=0)
+        rows = [item[key] for item in batch]
+        # 이어 붙이는 축은 0 번뿐이고 **나머지 축은 전부 같아야 한다.** 다르면
+        # torch 가 "Sizes of tensors must match except in dimension 0" 으로
+        # 죽는데, 그 메시지에는 어느 키인지도 왜인지도 없다. DataLoader 워커
+        # 안에서 터져 traceback 이 두 겹이라 더 알아보기 어렵다. 여기서 먼저
+        # 잡아 원인을 적는다 — 원인은 거의 항상 하나다: 크기가 다른 이미지.
+        tail = rows[0].shape[1:]
+        for i, row in enumerate(rows[1:], 1):
+            if row.shape[1:] != tail:
+                raise ValueError(
+                    f"'{key}' 의 모양이 샘플마다 다릅니다: "
+                    f"{tuple(rows[0].shape)} vs {tuple(row.shape)} (샘플 {i}).\n"
+                    "배치에 **크기가 다른 이미지**가 섞였습니다. 비전 텐서는 패딩이 "
+                    "아니라 이어 붙이는 대상이라 첫 축 말고는 모두 같아야 합니다.\n"
+                    "학습 데이터를 고정 크기로 다시 만들거나(pipeline.canvas), "
+                    "--batch 1 로 우회하세요."
+                )
+        out[key] = torch.cat(rows, dim=0)
     return out
 
 
@@ -425,6 +443,26 @@ def main(argv: list[str] | None = None) -> int:
     if not examples:
         print("학습 샘플이 없습니다.", file=sys.stderr)
         return 1
+
+    # 모델을 GPU 에 올리기 **전에** 데이터를 검사한다. 크기가 섞여 있으면
+    # 첫 에폭 중간에 collate 가 죽는데, 그때까지 9B 를 올리고 기다린 시간이
+    # 전부 낭비다.
+    sizes = check_uniform_image_size(examples, tc.batch)
+    if len(sizes) > 1:
+        (w, h), n = sizes.most_common(1)[0]
+        log.warning(
+            "학습 이미지 크기가 %d종 섞여 있습니다 (최다 %dx%d, %d장). "
+            "batch=1 이라 학습은 돌지만, 같은 per-mille 좌표가 장마다 다른 "
+            "픽셀을 가리켜 모델이 그 변동까지 배웁니다 — pipeline.canvas 를 "
+            "고정하고 데이터를 다시 만드는 것을 권합니다.",
+            len(sizes),
+            w,
+            h,
+            n,
+        )
+    else:
+        (w, h), n = next(iter(sizes.items()))
+        log.info("학습 이미지 %d장, 모두 %dx%d", n, w, h)
 
     if args.dry_run:
         return dry_run(examples, tc.model, args.dry_run_index)
