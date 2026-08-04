@@ -239,7 +239,7 @@ class TestDedup:
         """한 칸에 이름과 번호가 같이 있는 서식이 흔하다."""
         out = _dedup([
             self._f("홍길동", (0.1, 0.1, 0.5, 0.15), label="NAME"),
-            self._f("홍길동", (0.1, 0.1, 0.5, 0.15), label="OTHER"),
+            self._f("홍길동", (0.1, 0.1, 0.5, 0.15), label="BIRTH"),
         ])
         assert len(out) == 2
 
@@ -357,14 +357,20 @@ class TestDetect:
         findings, _ = detect(blank_page(), client, cfg(tiles=1))
         assert findings == []
 
-    def test_empty_text_survives_for_signature(self) -> None:
-        """서명·인영은 읽을 글자가 없다. 버리면 도장 영역을 놓친다."""
+    def test_empty_text_survives(self) -> None:
+        """값을 못 읽은 항목도 버리지 않는다.
+
+        10종은 모두 읽을 글자가 있는 값이므로 빈 ``text`` 는 정상이 아니다. 그래도
+        여기서 버리면 **미탐이 확정되고 결과 JSON 에 흔적도 남지 않는다.** VLM 이
+        위치를 짚었다는 정보는 남기고, ``locate.py`` 가 ``needs_review`` 로 넘긴다.
+        """
         client = FakeClient([
-            {"findings": [item("", label="SIGNATURE", bbox=(0.6, 0.8, 0.8, 0.9))]}
+            {"findings": [item("", label="NAME", bbox=(0.6, 0.8, 0.8, 0.9))]}
         ])
         findings, _ = detect(blank_page(), client, cfg(tiles=1))
         assert len(findings) == 1
-        assert findings[0].type == "SIGNATURE"
+        assert findings[0].type == "NAME"
+        assert findings[0].text == ""
 
     def test_dedup_can_be_disabled(self) -> None:
         payload = {"findings": [item("홍길동", bbox=(0.1, 0.1, 0.3, 0.2))]}

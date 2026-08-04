@@ -24,7 +24,6 @@ from .output import save_result
 from .pipeline import PiiPipeline, PipelineConfig
 from .schema import (
     PII_LABELS,
-    TEXTLESS_LABELS,
     Agreement,
     OcrBox,
     OcrStatus,
@@ -53,7 +52,6 @@ __all__ = [
     "Source",
     "Agreement",
     "PII_LABELS",
-    "TEXTLESS_LABELS",
 ]
 
 __version__ = "0.2.0"

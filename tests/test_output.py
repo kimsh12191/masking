@@ -37,7 +37,7 @@ def sample_result(with_image: bool = True) -> PageResult:
         ocr_boxes=[OcrBox(index=0, bbox=(20, 20, 180, 50), text="성명")],
         findings=[
             VlmFinding(text="홍길동", type="NAME", bbox_norm=(0.5, 0.04, 0.9, 0.1)),
-            VlmFinding(text="", type="SIGNATURE", bbox_norm=(0.5, 0.6, 0.95, 0.74)),
+            VlmFinding(text="M12345678", type="PASSPORT", bbox_norm=(0.5, 0.6, 0.95, 0.74)),
         ],
         regions=[
             PiiRegion(
@@ -46,7 +46,7 @@ def sample_result(with_image: bool = True) -> PageResult:
                 vlm_text="홍길동", member_index=[0], agreement=Agreement.EXACT,
             ),
             PiiRegion(
-                id="r002", type="SIGNATURE", bbox=(200, 300, 380, 370),
+                id="r002", type="PASSPORT", bbox=(200, 300, 380, 370),
                 source=Source.VLM_COARSE, confidence=0.7,
                 coarse=True, needs_review=True, ocr_status=OcrStatus.FAILED,
             ),
@@ -83,7 +83,7 @@ class TestSaveResult:
         written = save_result(sample_result(), tmp_path)
         data = json.loads(written["json"].read_text(encoding="utf-8"))
         assert data["page"] == {"width": PAGE_W, "height": PAGE_H}
-        assert [r["type"] for r in data["regions"]] == ["NAME", "SIGNATURE"]
+        assert [r["type"] for r in data["regions"]] == ["NAME", "PASSPORT"]
         assert data["regions"][0]["bbox"] == [200, 20, 360, 50]
 
     def test_json_excludes_transient_image(self, tmp_path: Path) -> None:

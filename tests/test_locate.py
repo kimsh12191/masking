@@ -410,19 +410,25 @@ class TestLocate:
         locate([finding("홍길동")], blank_page(), ocr)
         assert ocr.batches == [1]
 
-    def test_signature_is_not_retried(self) -> None:
-        """읽을 글자가 없는 항목을 두 번 OCR 하는 것은 낭비다."""
+    def test_empty_text_is_not_retried(self) -> None:
+        """찾을 문자열이 없으면 크롭을 넓혀도 매칭될 수 없다. OCR 만 두 번 돈다."""
         ocr = FakeOcr([[]])
-        locate([finding("", label="SIGNATURE")], blank_page(), ocr)
+        locate([finding("", label="NAME")], blank_page(), ocr)
         assert ocr.batches == [1]
 
-    def test_signature_coarse_is_not_flagged_for_review(self) -> None:
-        """검토 큐가 서명으로 가득 차면 정작 위험한 불일치가 묻힌다."""
-        regions, _ = locate([finding("", label="SIGNATURE")], blank_page(), FakeOcr([[]]))
+    def test_empty_text_coarse_is_flagged_for_review(self) -> None:
+        """탐지 대상 10종은 모두 읽을 글자가 있는 값이다.
+
+        ``SIGNATURE`` 가 라벨셋에 있던 동안에는 빈 ``text`` 가 정상이었고, 그
+        건들을 검토에서 빼야 검토 큐가 서명으로 가득 차지 않았다. 서명이 빠진
+        뒤로 빈 ``text`` 는 정상이 아니라 **VLM 이 값을 못 읽었다는 신호**이므로
+        사람이 봐야 한다.
+        """
+        regions, _ = locate([finding("", label="NAME")], blank_page(), FakeOcr([[]]))
         r = regions[0]
         assert r.source is Source.VLM_COARSE
-        assert r.needs_review is False
-        assert "서명" in (r.reason or "")
+        assert r.needs_review is True
+        assert "값을 읽지 못했다" in (r.reason or "")
 
     def test_unreadable_crop_reports_detection_failure(self) -> None:
         """크롭에 박스가 하나도 없다 = OCR 검출 문제. 처방이 다르다."""

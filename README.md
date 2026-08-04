@@ -313,15 +313,42 @@ pipeline.canvas   detect.tiles   detect.overlap   detect.image_factor   llm.imag
 
 ---
 
-## 개인정보 라벨 (18종)
+## 개인정보 라벨 (10종)
 
-`NAME` `RRN` `ADDRESS` `EMAIL` `IP` `ACCOUNT_NO` `CARD_NO` `PHONE` `PASSPORT`
-`FOREIGN_ID` `DRIVER_LICENSE` `BIZ_NO` `CORP_NO` `BIRTH` `ORG` `TITLE`
-`SIGNATURE` `OTHER`
+`NAME` `RRN` `ADDRESS` `EMAIL` `IP` `ACCOUNT_NO` `CARD_NO` `PHONE` `PASSPORT` `BIRTH`
 
-탐지는 전부 VLM 이 한다. 체크섬이 있는 라벨(`RRN` `BIZ_NO` `CARD_NO` 등)만
+**닫힌 집합이다. 여기 없는 것은 탐지하지 않는다.** guided decoding 의 enum 이
+이 목록에서 나오므로 모델이 다른 라벨을 낼 수 없다.
+
+탐지는 전부 VLM 이 한다. 체크섬이 있는 라벨(`RRN` `CARD_NO`)만
 `rules/checksums.py` 가 **검증**한다 — 규칙은 탐지기가 아니라 검증기다.
 라벨을 바꾸려면 `schema.py` 의 `PII_LABELS` 만 고치면 프롬프트와 스키마가 따라온다.
+
+### 범위 밖으로 뺀 것
+
+한때 18종이었다. 위 10종에 `FOREIGN_ID` `DRIVER_LICENSE` `BIZ_NO` `CORP_NO`
+`ORG` `TITLE` `SIGNATURE` `OTHER` 가 더 있었다. 마스킹 결과가 달라지는 부분:
+
+| 이제 마스킹되지 않는 것 | 비고 |
+|---|---|
+| 운전면허번호, 사업자등록번호, 법인등록번호 | 프롬프트가 자리수로 식별해 **의도적으로 넘긴다** |
+| 소속·직장명, 지점명, 부서명, 기관명 (`ORG`) | 그 줄의 전화번호·주소는 여전히 잡는다 |
+| 직위·직책 (`TITLE`) | 옆의 사람 이름은 여전히 `NAME` 이다 |
+| 서명·인영·도장 (`SIGNATURE`) | 읽을 글자가 없는 영역은 보고하지 않는다 |
+| 생년월일이 아닌 날짜, 사번·고객번호 등 관리번호 (`OTHER`) | |
+
+두 가지는 **의도적으로 10종 안으로 넘긴다**:
+
+* **외국인등록번호 → `RRN`.** 13자리 6-7 로 형태가 주민등록번호와 같다.
+  성별코드(5~8)로 갈라내게 하면 OCR 이 그 한 자리를 흘렸을 때 값이 사라진다.
+* **기관의 전화번호·주소·이메일 → `PHONE` / `ADDRESS` / `EMAIL`.**
+  개인 것과 형태가 같고, 소유자를 가려내는 판단은 모델이 자주 틀린다.
+
+`OTHER` 를 없앤 대가는 프롬프트에 있다. 도피 라벨이 없으므로 "해당 없으면 보고하지
+마라" 를 말해야 하는데, 그 문장은 **범위 안에서 종류가 애매한 값**까지 데려가기
+쉽다 (모델은 "확실치 않으면 넘겨라" 로 읽는다). 그래서 프롬프트가 둘을 매번
+갈라 놓는다 — 범위 밖은 버리고, 범위 안에서 애매한 것은 conf 를 낮춰 남긴다.
+제외 목록을 늘릴 때 그 문장이 살아 있는지 확인할 것 (`tests/test_prompts.py`).
 
 ---
 

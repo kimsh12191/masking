@@ -26,8 +26,6 @@ from make_synthetic import (  # noqa: E402
 )
 
 from pii_pipeline.rules.checksums import (  # noqa: E402
-    validate_biz_no,
-    validate_foreign_id,
     validate_luhn,
     validate_rrn,
 )
@@ -44,13 +42,24 @@ class TestGeneratedNumbersAreValid:
         assert len(value.replace("-", "")) == 13
         assert validate_rrn(value) is True
 
-    def test_foreign_id_valid(self, seed: int) -> None:
+    def test_foreign_registration_number_is_accepted_as_an_rrn(self, seed: int) -> None:
+        """외국인등록번호는 형태가 같으므로 ``RRN`` 으로 보고된다.
+
+        전용 라벨과 전용 검증기가 없어졌으니, 합성기가 만든 값이
+        ``validate_rrn`` 을 통과해야 검증 단계에서 체크섬 실패로 떨어지지 않는다.
+        """
         value = gen_rrn(random.Random(seed), foreign=True)
-        assert validate_foreign_id(value) is True
+        assert validate_rrn(value) is True
         assert value.replace("-", "")[6] in "5678"
 
-    def test_biz_no_valid(self, seed: int) -> None:
-        assert validate_biz_no(gen_biz_no(random.Random(seed))) is True
+    def test_biz_no_is_shaped_like_one_but_is_not_ground_truth(self, seed: int) -> None:
+        """사업자등록번호는 탐지 대상에서 빠졌다 — 과검 측정용으로만 인쇄된다.
+
+        체크섬을 맞추지 않는다 (검산할 코드 경로가 없다). 형태만 지킨다.
+        """
+        value = gen_biz_no(random.Random(seed))
+        assert len(value.replace("-", "")) == 10
+        assert [len(part) for part in value.split("-")] == [3, 2, 5]
 
     def test_card_valid_luhn(self, seed: int) -> None:
         value = gen_card(random.Random(seed))
@@ -111,12 +120,6 @@ class TestVerifierAcceptsGeneratedValues:
         assert region.needs_review is False
 
     @pytest.mark.parametrize("seed", SEEDS[:10])
-    def test_biz_no_passes_checksum(self, seed: int) -> None:
-        region = self._region("BIZ_NO", gen_biz_no(random.Random(seed)))
-        verify_regions([region])
-        assert region.checksum == "ok"
-
-    @pytest.mark.parametrize("seed", SEEDS[:10])
     def test_card_passes_checksum(self, seed: int) -> None:
         region = self._region("CARD_NO", gen_card(random.Random(seed)))
         verify_regions([region])
@@ -149,8 +152,8 @@ class TestVerifierAcceptsGeneratedValues:
 
     @pytest.mark.parametrize("seed", SEEDS[:10])
     def test_generated_rrn_would_survive_a_mislabel(self, seed: int) -> None:
-        """옛 버그 회귀: 주민등록번호가 면허번호로 잘못 라벨링돼도 교정된다."""
-        region = self._region("DRIVER_LICENSE", gen_rrn(random.Random(seed)))
+        """옛 버그 회귀: 주민등록번호가 다른 숫자 라벨로 잘못 붙어도 교정된다."""
+        region = self._region("ACCOUNT_NO", gen_rrn(random.Random(seed)))
         verify_regions([region])
         assert region.type == "RRN"
 
@@ -179,8 +182,18 @@ class TestDifficultyCoverage:
 
     def test_keeps_ocr_failure_cases(self, tmp_path) -> None:
         kinds = [t.get("difficulty") for t in self._truth(tmp_path)]
-        for kind in ("handwriting", "stamp_overlap", "signature"):
+        for kind in ("handwriting", "stamp_overlap"):
             assert kind in kinds
+
+    def test_signature_is_drawn_but_is_not_ground_truth(self, tmp_path) -> None:
+        """서명·인영은 탐지 대상 10종에서 빠졌다.
+
+        그래도 페이지에는 그린다 — 정답이 없어야 "읽을 글자가 없는 것을 억지로
+        이름으로 보고했다" 를 과검으로 셀 수 있다. 정답에 다시 들어오면
+        그 측정이 조용히 사라진다.
+        """
+        kinds = [t.get("difficulty") for t in self._truth(tmp_path)]
+        assert "signature" not in kinds
 
     def test_inline_label_text_excludes_the_label(self, tmp_path) -> None:
         """text 는 개인정보 값만 담는다 (bbox 는 라벨을 포함한 박스 전체)."""

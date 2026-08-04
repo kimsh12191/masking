@@ -6,16 +6,17 @@
 
     정규식이 탐지기였을 때:  12자리 숫자열 -> "체크섬 통과한 운전면허번호,
                             confidence 1.00, 검토 불필요"
-                            (``DRIVER_LICENSE`` 는 체크섬이 아예 없는데도
-                             통과로 취급됐고, 문맥 키워드 검사도 건너뛰었다.
-                             하이픈을 흘린 주민등록번호가 여기로 빨려 들어가
-                             확정 라벨을 받고 두 LLM pass 에서 제외됐다.)
+                            (당시 라벨셋에 있던 운전면허번호는 체크섬이 아예
+                             없는데도 통과로 취급됐고, 문맥 키워드 검사도
+                             건너뛰었다. 하이픈을 흘린 주민등록번호가 여기로
+                             빨려 들어가 확정 라벨을 받고 두 LLM pass 에서
+                             제외됐다.)
 
     체크섬이 검증기일 때:    VLM 이 "RRN: 901112-2846261" 이라고 했다
                             -> 자리수를 센다 (13 ✓)
                             -> 체크섬을 돈다 (통과 -> verified)
-                            같은 값을 DRIVER_LICENSE 라고 했다면
-                            -> 13자리인데 면허번호는 12자리다 -> 경고 + 교정
+                            같은 값을 CARD_NO 라고 했다면
+                            -> 13자리인데 카드번호는 15~16자리다 -> 경고 + 교정
 
 **검증기는 틀린 답을 만들 수 없다.** 최악의 경우 "모르겠다" 를 낼 뿐이다.
 탐지기였을 때는 틀린 답을 확신을 담아 만들어냈다.
@@ -36,18 +37,13 @@ log = logging.getLogger(__name__)
 #:
 #: 자리수는 **탐지 조건이 아니라 검사 항목**이다. 어긋나면 버리지 않고
 #: ``needs_review`` 를 세운다 — VLM 이 맞고 OCR 이 한 자리 흘렸을 수도 있다.
+#: 자리수가 고정된 라벨은 10종 중 둘뿐이다. 나머지(이름·주소·전화·계좌·여권·
+#: 생년월일·IP)는 자리수가 값마다 달라 검사 대상이 아니다 — ``_check_digits`` 가
+#: 표에 없는 라벨을 그냥 통과시킨다.
 DIGIT_LENGTHS: dict[str, tuple[int, ...]] = {
     "RRN": (13,),
-    "FOREIGN_ID": (13,),
-    "CORP_NO": (13,),
-    "DRIVER_LICENSE": (12,),
-    "BIZ_NO": (10,),
     "CARD_NO": (15, 16),
 }
-
-#: 13자리 6-7 형태를 가질 수 있는 라벨. 이 안에서의 혼동은 흔하고 경미하다
-#: (셋 다 마스킹 대상이다). 이 밖으로 나가는 혼동이 위험하다.
-_THIRTEEN_FAMILY: frozenset[str] = frozenset({"RRN", "FOREIGN_ID", "CORP_NO"})
 
 #: 항목명(라벨) 텍스트. 값이 아니라 필드명이므로 개인정보가 아니다.
 #:
@@ -79,7 +75,12 @@ class VerifyConfig:
             13자리이고 주민등록번호 체크섬을 통과했는데 VLM 이 다른 종류라고
             했다면, 그건 주민등록번호다. 체크섬 통과는 우연히 일어나지 않는다
             (11분의 1이 아니라, 자리수까지 맞아야 하므로 훨씬 낮다).
-            끄면 교정 대신 ``needs_review`` 만 세운다.
+            끄면 교정 대신 ``needs_review`` 와 사유를 남긴다 — **끈다고 신호를
+            버리는 것은 아니다.** 이 구분을 코드로 지켜야 하는 이유가 있다:
+            라벨셋이 10종으로 좁아지면서 ``DIGIT_LENGTHS`` 에 남은 라벨이 둘뿐이
+            되어, 자리수 검사가 이 오분류를 우연히 잡아 주던 경로가 없어졌다.
+            (예전에는 면허·사업자·법인번호에 자리수가 다 걸려 있어서 13자리
+            값이 어느 라벨에 붙어도 "자리수 불일치" 가 떴다.)
         dedup_iou: 같은 라벨끼리 이 비율 이상 겹치면 중복으로 본다.
     """
 
@@ -173,20 +174,26 @@ def _run_checksum(region: PiiRegion, texts: list[str]) -> tuple[str | None, str]
     return "failed", "체크섬 미통과 (OCR 오독 또는 형식 오류 가능)"
 
 
-def _retype(region: PiiRegion, texts: list[str]) -> str | None:
-    """체크섬으로 종류가 증명되면 라벨을 고친다. 고쳤으면 사유 문구를 반환.
+def _is_rrn_mislabel(region: PiiRegion, texts: list[str]) -> bool:
+    """다른 라벨이 붙은 이 값이 주민등록번호임을 체크섬이 증명하는가.
+
+    **판정만 한다.** 고칠지 검토로 넘길지는 ``VerifyConfig.retype_on_checksum``
+    이 정한다. 판정과 조치를 나눠 둔 것은, 교정을 껐을 때 이 신호가 조용히
+    사라졌던 적이 있기 때문이다 (자리수 검사가 우연히 대신 잡아 주고 있었고,
+    라벨셋이 좁아지면서 그 우연이 없어졌다).
 
     주민등록번호 체크섬만 이 자격이 있다 — 13자리 + 가중치 검증을 우연히
-    통과하기는 어렵다. 사업자·법인번호 체크섬은 자리수가 짧아 우연 통과 확률이
-    높으므로 교정 근거로 쓰지 않는다.
+    통과하기는 어렵다 (11분의 1이 아니라, 자리수와 MMDD 까지 맞아야 한다).
+
+    **라벨셋이 10종으로 좁아진 뒤 다루는 범위가 넓어졌다.** 예전에는
+    ``RRN``/``FOREIGN_ID``/``CORP_NO`` 를 한 가족으로 묶어 그 안의 혼동은
+    건드리지 않았다 (셋 다 마스킹 대상이라 경미했다). 이제 13자리 6-7 을 담을
+    라벨이 ``RRN`` 하나뿐이므로 그 예외가 필요 없다 — 다른 라벨이 주민등록번호
+    체크섬을 통과하는 13자리 값을 들고 있으면 그것은 그냥 오분류다.
     """
-    if region.type in _THIRTEEN_FAMILY:
-        return None
-    if not any(len(digits_only(t)) == 13 and validate_rrn(t) for t in texts):
-        return None
-    old = region.type
-    region.type = "RRN"
-    return f"type 교정: {old} -> RRN (13자리 + 주민등록번호 체크섬 통과)"
+    if region.type == "RRN":
+        return False
+    return any(len(digits_only(t)) == 13 and validate_rrn(t) for t in texts)
 
 
 def verify_regions(
@@ -210,10 +217,26 @@ def verify_regions(
     for region in regions:
         texts = _candidate_texts(region)
         notes: list[str] = []
+        #: 오분류를 발견했으나 교정이 꺼져 있어 그대로 둔 상태.
+        #: 아래 "검토 큐 비우기" 가 이 신호를 지워버리면 안 된다.
+        unresolved_mislabel = False
 
-        if cfg.retype_on_checksum and (note := _retype(region, texts)):
-            notes.append(note)
-            warn.append(f"{note} (값 '{(region.text or region.vlm_text or '')[:20]}')")
+        if _is_rrn_mislabel(region, texts):
+            if cfg.retype_on_checksum:
+                note = (
+                    f"type 교정: {region.type} -> RRN "
+                    f"(13자리 + 주민등록번호 체크섬 통과)"
+                )
+                region.type = "RRN"
+                notes.append(note)
+                warn.append(f"{note} (값 '{(region.text or region.vlm_text or '')[:20]}')")
+            else:
+                unresolved_mislabel = True
+                region.needs_review = True
+                notes.append(
+                    f"type 의심: {region.type} 인데 13자리 + 주민등록번호 체크섬을 "
+                    f"통과한다 (교정이 꺼져 있어 라벨은 그대로 둔다)"
+                )
 
         digit_problem = _check_digits(region, texts)
         if digit_problem:
@@ -230,7 +253,13 @@ def verify_regions(
 
         # 체크섬 통과 + 두 엔진 완전일치면 사람이 볼 이유가 없다.
         # 검토 큐를 이 조건으로 비워야 정작 위험한 건이 눈에 띈다.
-        if region.verified and region.agreement is Agreement.EXACT:
+        # 단 라벨이 의심스러운 건은 예외다 — 값이 실재한다는 것과 라벨이 맞다는
+        # 것은 다른 문제이고, 여기서 비우면 그게 유일한 신호였다.
+        if (
+            region.verified
+            and region.agreement is Agreement.EXACT
+            and not unresolved_mislabel
+        ):
             region.confidence = 1.0
             region.needs_review = False
 

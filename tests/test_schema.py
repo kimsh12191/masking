@@ -9,7 +9,6 @@ from __future__ import annotations
 from pii_pipeline.llm.prompts import SYSTEM_VLM
 from pii_pipeline.schema import (
     PII_LABELS,
-    TEXTLESS_LABELS,
     VLM_SCHEMA,
     Agreement,
     OcrStatus,
@@ -19,14 +18,20 @@ from pii_pipeline.schema import (
     VlmFinding,
 )
 
-#: 사용자가 확정한 탐지 대상. 순서까지 고정한다.
+#: 사용자가 확정한 탐지 대상 10종. 순서까지 고정한다.
 EXPECTED_LABELS = (
-    # 핵심 9종
     "NAME", "RRN", "ADDRESS", "EMAIL", "IP",
-    "ACCOUNT_NO", "CARD_NO", "PHONE", "PASSPORT",
-    # 추가 9종
+    "ACCOUNT_NO", "CARD_NO", "PHONE", "PASSPORT", "BIRTH",
+)
+
+#: 라벨셋에서 **빼기로 결정한** 것들. 되돌아오면 이 테스트가 깨진다.
+#:
+#: 이름만 지우고 프롬프트 문장을 남기면 모델이 쓸 수 없는 라벨을 요구받는 상태가
+#: 된다 (guided decoding 이 막으므로 그 자리에 엉뚱한 라벨이 들어간다). 그래서
+#: 스키마와 프롬프트 양쪽에서 사라졌는지를 같이 지킨다.
+REMOVED_LABELS = (
     "FOREIGN_ID", "DRIVER_LICENSE", "BIZ_NO", "CORP_NO",
-    "BIRTH", "ORG", "TITLE", "SIGNATURE", "OTHER",
+    "ORG", "TITLE", "SIGNATURE", "OTHER",
 )
 
 
@@ -43,16 +48,30 @@ class TestLabelSet:
     def test_exact_labels_and_order(self) -> None:
         assert PII_LABELS == EXPECTED_LABELS
 
+    def test_is_exactly_ten(self) -> None:
+        assert len(PII_LABELS) == 10
+
     def test_no_duplicates(self) -> None:
         assert len(set(PII_LABELS)) == len(PII_LABELS)
-
-    def test_textless_is_subset(self) -> None:
-        assert set(PII_LABELS) >= TEXTLESS_LABELS
 
     def test_prompt_lists_every_label(self) -> None:
         """모델이 쓸 수 없는 라벨이 스키마에만 있으면 guided decoding 이 막는다."""
         for label in PII_LABELS:
             assert label in SYSTEM_VLM, label
+
+    def test_removed_labels_are_gone_from_the_schema(self) -> None:
+        for label in REMOVED_LABELS:
+            assert label not in PII_LABELS, label
+
+    def test_removed_labels_are_gone_from_the_prompt(self) -> None:
+        """제외 대상은 **한국어 산문으로만** 말한다 ("운전면허번호를 보고하지 마라").
+
+        라벨 토큰(``DRIVER_LICENSE``)을 프롬프트에 남기면 모델이 그 토큰을 쓰려
+        하는데 스키마가 막으므로, 그 값이 엉뚱한 라벨로 밀려 들어간다. ``OTHER``
+        가 특히 위험하다 — 도피 라벨이라 애매한 값 전부가 그리로 향한다.
+        """
+        for label in REMOVED_LABELS:
+            assert label not in SYSTEM_VLM, label
 
 
 class TestVlmSchema:
@@ -125,13 +144,13 @@ class TestPageResultStats:
             findings=[
                 VlmFinding(text="a", type="NAME"),
                 VlmFinding(text="b", type="RRN"),
-                VlmFinding(text="c", type="SIGNATURE"),
+                VlmFinding(text="c", type="PASSPORT"),
             ],
             regions=[
                 region(type="NAME", agreement=Agreement.EXACT),
                 region(type="RRN", agreement=Agreement.EXACT, checksum="failed"),
                 region(
-                    type="SIGNATURE", source=Source.VLM_COARSE, coarse=True,
+                    type="PASSPORT", source=Source.VLM_COARSE, coarse=True,
                     agreement=Agreement.NONE, needs_review=True,
                 ),
             ],

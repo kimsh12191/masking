@@ -184,9 +184,14 @@ class TestHappyPath:
 class TestOldBugRegressions:
     """이전 구조에서 스크린샷으로 관측된 오류들."""
 
-    def test_rrn_mislabelled_as_license_is_corrected(self, no_preprocess: None) -> None:
+    def test_rrn_mislabelled_as_another_number_is_corrected(
+        self, no_preprocess: None
+    ) -> None:
+        """옛 관측은 주민등록번호가 면허번호로 확정된 것이었다. 그 라벨이 없어진
+        뒤 같은 오독은 다른 숫자 라벨로 나타나고, 교정 경로는 그대로다.
+        """
         pipe = build(
-            [{"findings": [vlm_item(VALID_RRN, "DRIVER_LICENSE", (0.1, 0.2, 0.5, 0.24))]}],
+            [{"findings": [vlm_item(VALID_RRN, "ACCOUNT_NO", (0.1, 0.2, 0.5, 0.24))]}],
             [[box(VALID_RRN)]],
         )
         region = pipe.run("x.png", image=blank_page()).regions[0]
