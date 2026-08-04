@@ -37,7 +37,7 @@ def sample_result() -> PageResult:
             VlmFinding(text="901231-1234563", type="RRN", bbox_norm=(0.06, 0.12, 0.5, 0.17)),
             VlmFinding(text="홍길동", type="NAME", bbox_norm=(0.36, 0.05, 0.63, 0.09)),
             VlmFinding(text="김철수", type="NAME", bbox_norm=(0.36, 0.37, 0.63, 0.42)),
-            VlmFinding(text="", type="SIGNATURE", bbox_norm=(0.36, 0.62, 0.76, 0.71)),
+            VlmFinding(text="M12345678", type="PASSPORT", bbox_norm=(0.36, 0.62, 0.76, 0.71)),
         ],
         regions=[
             # 체크섬 통과 + 두 엔진 일치 — 검수자가 넘겨도 되는 건
@@ -61,11 +61,12 @@ def sample_result() -> PageResult:
                 ocr_status=OcrStatus.LOW_CONF, agreement=Agreement.NONE,
                 needs_review=True,
             ),
-            # 좌표 근사 (서명·인영)
+            # 좌표 근사 (크롭에서 OCR 박스가 안 나왔다 — 손글씨 추정)
             PiiRegion(
-                id="r004", type="SIGNATURE", bbox=(220, 500, 460, 570),
+                id="r004", type="PASSPORT", bbox=(220, 500, 460, 570),
                 source=Source.VLM_COARSE, confidence=0.61,
-                coarse=True, agreement=Agreement.NONE,
+                vlm_text="M12345678", coarse=True, needs_review=True,
+                agreement=Agreement.NONE,
             ),
             # 체크섬 미통과 — 오독 의심
             PiiRegion(

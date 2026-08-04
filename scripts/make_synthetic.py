@@ -12,6 +12,9 @@
 * 다단 컬럼 — 읽기 순서 정렬을 검증한다
 * **인라인 라벨** ("담당자: 조민석") — 라벨과 값이 한 OCR 박스에 섞인 형태.
   실제 문서에 흔하지만 라벨/값이 분리된 서식만 만들면 이 케이스를 놓친다.
+* **정답이 아닌 항목** — 탐지 대상 10종에서 빠진 것들(기관명·직위·서명·
+  사업자등록번호·약정일자·금액)을 일부러 인쇄한다. 정답에 없으므로 이것들을
+  보고하면 과검으로 잡힌다. 안 그리면 "보고하지 말아야 할 것" 을 셀 수 없다.
 
 사용 예:
 
@@ -32,10 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from pii_pipeline.rules.checksums import (  # noqa: E402
-    _BIZ_WEIGHTS,
-    _RRN_WEIGHTS,
-)
+from pii_pipeline.rules.checksums import _RRN_WEIGHTS  # noqa: E402
 
 PAGE_W, PAGE_H = 1748, 2480  # A4 210dpi
 
@@ -83,12 +83,14 @@ def gen_rrn(rng: random.Random, foreign: bool = False) -> str:
 
 
 def gen_biz_no(rng: random.Random) -> str:
-    # 형식은 3-2-5 (총 10자리)이고 마지막 1자리가 체크디짓이므로 앞 9자리를 만든다.
-    d9 = f"{rng.randint(100, 999)}{rng.randint(10, 99)}{rng.randint(0, 9999):04d}"
-    total = sum(int(c) * w for c, w in zip(d9, _BIZ_WEIGHTS, strict=True))
-    total += (int(d9[8]) * 5) // 10
-    d10 = d9 + str((10 - total % 10) % 10)
-    return f"{d10[:3]}-{d10[3:5]}-{d10[5:]}"
+    """사업자등록번호 형태의 10자리 (3-2-5).
+
+    **정답에 넣지 않는다 — 과검 측정용이다.** 사업자등록번호는 탐지 대상 10종에서
+    빠졌으므로, 이 값은 "숫자 덩어리인데 보고하면 안 되는 것" 의 대표 사례로
+    페이지에 인쇄된다. 체크섬을 맞추지 않는 이유도 같다: 이 값을 검산하는
+    코드 경로가 이제 없다 (``VALIDATORS`` 에 ``BIZ_NO`` 가 없다).
+    """
+    return f"{rng.randint(100, 999)}-{rng.randint(10, 99)}-{rng.randint(0, 99999):05d}"
 
 
 def gen_card(rng: random.Random) -> str:
@@ -183,14 +185,17 @@ def make_page(
     left_x, value_x, y = 130, 520, 240
     step = 78
 
+    # 세 번째 칸이 ``None`` 인 행은 **인쇄되지만 정답이 아니다** — 탐지 대상 10종에서
+    # 빠진 항목들이고, 여기서 과검을 측정한다. 그냥 안 그리면 "보고하지 말아야 하는
+    # 것을 보고했다" 를 셀 수 없다.
     rows: list[tuple[str, str, str | None]] = [
         ("성명", name, "NAME"),
         ("주민등록번호", gen_rrn(rng), "RRN"),
         ("연락처", gen_phone(rng), "PHONE"),
         ("전자우편", gen_email(rng, name_ascii), "EMAIL"),
-        ("직장명", f"{rng.choice(BANKS)} {rng.choice(DEPTS)}", "ORG"),
-        ("직위", rng.choice(TITLES), "TITLE"),
-        ("사업자등록번호", gen_biz_no(rng), "BIZ_NO"),
+        ("직장명", f"{rng.choice(BANKS)} {rng.choice(DEPTS)}", None),
+        ("직위", rng.choice(TITLES), None),
+        ("사업자등록번호", gen_biz_no(rng), None),
         ("여권번호", gen_passport(rng), "PASSPORT"),
         ("결제카드번호", gen_card(rng), "CARD_NO"),
         ("입금계좌번호", f"{rng.choice(BANKS)} {gen_account(rng)}", "ACCOUNT_NO"),
@@ -276,7 +281,10 @@ def make_page(
     truth[-1]["difficulty"] = "stamp_overlap"
     y += 150
 
-    # 자필 서명
+    # 자필 서명 — **정답에 넣지 않는다.** 서명·인영은 탐지 대상 10종에서 빠졌다.
+    # 그래도 그리는 이유는 두 가지다: (1) OCR det 가 여기에 박스를 만들어 옆 칸
+    # 매칭을 흐트러뜨리는지 보고, (2) 모델이 "읽을 글자가 없는 것" 을 억지로
+    # 이름으로 보고하지 않는지 본다. 둘 다 정답이 없어야 측정되는 성질이다.
     put(left_x, y, "신청인 서명", f_label, fill=(70, 70, 70))
     sig_x, sig_y = value_x, y + 10
     pts = [
@@ -284,14 +292,6 @@ def make_page(
         for i in range(11)
     ]
     draw.line(pts, fill=(20, 20, 90), width=4, joint="curve")
-    truth.append(
-        {
-            "type": "SIGNATURE",
-            "bbox": [sig_x - 5, sig_y, sig_x + 235, sig_y + 65],
-            "text": None,
-            "difficulty": "signature",
-        }
-    )
 
     # 증명문 블록 — 라벨과 값이 **한 줄(= 한 OCR 박스)** 에 섞인 형태.
     # 실제 행정/금융 문서에 흔하다. 라벨/값이 분리된 서식만 만들면

@@ -112,12 +112,12 @@ class TestSame:
     def test_different_type_at_the_same_place_is_a_different_item(self) -> None:
         """유형 오분류를 합집합에서 지워버리면 그 실패가 안 보인다."""
         item = Item(key="9012311234567", bbox=(100, 100, 300, 140), type="RRN")
-        assert not _same(item, "9012311234567", (100, 100, 300, 140), "DRIVER_LICENSE")
+        assert not _same(item, "9012311234567", (100, 100, 300, 140), "ACCOUNT_NO")
 
     def test_empty_value_falls_back_to_position(self) -> None:
-        """서명·도장은 읽을 값이 없다. 위치와 종류로만 대조한다."""
-        item = Item(key="", bbox=(600, 800, 700, 900), type="SIGNATURE")
-        assert _same(item, "", (605, 805, 695, 895), "SIGNATURE")
+        """VLM 이 위치는 짚었으나 값을 못 읽은 건. 위치와 종류로만 대조한다."""
+        item = Item(key="", bbox=(600, 800, 700, 900), type="NAME")
+        assert _same(item, "", (605, 805, 695, 895), "NAME")
 
     def test_one_side_missing_the_value_still_matches(self) -> None:
         """한 설정은 값을 읽고 다른 설정은 못 읽은 경우 (손글씨).

@@ -13,9 +13,6 @@
 from .checksums import (
     VALIDATORS,
     digits_only,
-    validate_biz_no,
-    validate_corp_no,
-    validate_foreign_id,
     validate_luhn,
     validate_rrn,
 )
@@ -24,8 +21,5 @@ __all__ = [
     "VALIDATORS",
     "digits_only",
     "validate_rrn",
-    "validate_foreign_id",
-    "validate_biz_no",
-    "validate_corp_no",
     "validate_luhn",
 ]

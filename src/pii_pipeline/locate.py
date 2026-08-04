@@ -69,7 +69,6 @@ from .normalize import canonicalize
 from .ocr.layout import denorm_bbox, pad_bbox, union_bbox
 from .ocr.paddle_runner import PaddleOcrRunner
 from .schema import (
-    TEXTLESS_LABELS,
     Agreement,
     BBox,
     OcrBox,
@@ -540,13 +539,9 @@ def locate(
     rects: list[BBox] = list(tight_rects)
 
     # ── ② 텍스트 매칭 실패분만 크롭을 넓혀 재시도 ─────────────
-    retry = [
-        i
-        for i in range(n)
-        if matches[i] is None
-        and findings[i].type not in TEXTLESS_LABELS
-        and findings[i].text.strip()
-    ]
+    # 값이 빈 항목은 재시도하지 않는다 — 찾을 문자열이 없으므로 크롭을 넓혀도
+    # 매칭될 수 없고, OCR 을 한 번 더 도는 값만 늘어난다.
+    retry = [i for i in range(n) if matches[i] is None and findings[i].text.strip()]
     if retry:
         log.debug("텍스트 매칭 재시도 %d건 (크롭 확대)", len(retry))
         wide, wide_rects = _crop_and_ocr(
@@ -731,20 +726,29 @@ def _coarse_region(
     근접 선택(③)이 들어온 뒤로 이 경로에 남는 것은 **둘뿐이다.** 크롭에 OCR 박스가
     하나라도 있으면 ③이 받아낸다.
 
-    ===========================  ===========================================
-    서명·인영                     정상. 읽을 글자가 없다. 검토 플래그 없음
-    크롭에 박스가 하나도 없다      OCR **검출** 문제. det 임계값·업샘플을 본다
-    ===========================  ===========================================
+    ==========================  ============================================
+    VLM 의 text 가 비어 있다     VLM 이 위치는 짚었으나 값을 못 읽었다
+    크롭에 박스가 하나도 없다     OCR **검출** 문제. det 임계값·업샘플을 본다
+    ==========================  ============================================
 
     그래서 이 건수가 많다는 것은 이제 **OCR 쪽 신호다** — 예전에는 VLM 좌표
     문제와 섞여 있어서 구분이 안 됐다. VLM 좌표가 밀린 건은 ③으로 가고
     ``needs_review`` 와 경고 문구에 따로 집계된다.
+
+    **빈 ``text`` 는 이제 전부 검토 대상이다.** 라벨셋이 10종으로 좁아지기 전에는
+    ``SIGNATURE`` (서명·인영)가 있어서 "읽을 글자가 없는 것이 정상인 항목" 이
+    존재했고, 그 건들을 검토에서 빼야 검토 큐가 서명으로 가득 차지 않았다. 서명이
+    라벨셋에서 빠진 뒤로 10종은 모두 읽을 글자가 있는 값이므로, 빈 ``text`` 는
+    정상이 아니라 **VLM 이 값을 못 읽었다는 신호**다.
     """
-    textless = finding.type in TEXTLESS_LABELS or not finding.text.strip()
+    no_text = not finding.text.strip()
     read = " ".join(b.text for b in boxes if b.text.strip())
 
-    if textless:
-        reason = "읽을 텍스트가 없는 항목 (서명·인영). VLM 좌표 사용"
+    if no_text:
+        reason = (
+            "VLM 이 위치는 짚었으나 값을 읽지 못했다 (text 가 비어 있다). "
+            "VLM 좌표 사용"
+        )
     elif not boxes:
         reason = (
             "크롭에서 OCR 박스가 검출되지 않았다 (손글씨/도장/저대비 추정). "
@@ -771,9 +775,9 @@ def _coarse_region(
         member_index=[],
         ocr_status=OcrStatus.FAILED,
         coarse=True,
-        # 서명·인영은 원래 읽을 글자가 없다. 이걸 검토 대상에 넣으면 검토
-        # 큐가 서명으로 가득 차서 정작 봐야 할 불일치 건이 묻힌다.
-        needs_review=not textless,
+        # 이 경로로 온 건은 전부 사람이 봐야 한다. 좌표가 근사치이거나
+        # (OCR 이 확정하지 못했다) 값이 없거나 (VLM 이 읽지 못했다) 둘 중 하나다.
+        needs_review=True,
         low_confidence=finding.conf < LOW_CONF_THRESHOLD,
         agreement=Agreement.NONE,
         reason=reason,
